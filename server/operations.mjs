@@ -1,0 +1,71 @@
+import {readFile,writeFile,rename,mkdir,stat} from 'node:fs/promises';
+import {join} from 'node:path';
+import {pathToFileURL} from 'node:url';
+import {randomUUID} from 'node:crypto';
+import {credentialExpiry} from './credential-expiry.mjs';
+import {createDiscovery} from './discovery.mjs';
+import {createEventRouter,validateEventSettings} from './events.mjs';
+import {buildForecast,captureBalanceHistory} from './forecast.mjs';
+import {createUpdateMonitor,releaseSource} from './updates.mjs';
+import {PLUGIN_VERSION,hubError,requireWithin,publicValue,createHandleMaps} from './contracts.mjs';
+export const operationDefaults={discovery:{enabled:true,intervalSeconds:60,autoEnableRoutes:true,fetchModels:true},updates:{enabled:true,intervalHours:1,includePrerelease:false},events:{enabled:true,credentialWarnDays:7,balanceThreshold:{percent:10,credits:100},cooldownSeconds:3600,mappings:{'checkin.failed':['native'],'credential.expiring':['native'],'balance.low':['native'],'relay.triggered':['native'],'request.failure_streak':['native'],'update.available':['native']},sinks:{native:{kind:'native',enabled:true}}},forecast:{safetyMultiplier:1.25,maxBalanceAgeHours:24}};
+const object=v=>!!v&&typeof v==='object'&&!Array.isArray(v);
+export function validateOperationSettings(input,descriptor={}){
+ if(!object(input)||Object.keys(input).some(k=>!Object.hasOwn(operationDefaults,k)))throw hubError('invalid_operations_settings','Unknown operations setting');
+ const next=structuredClone(operationDefaults);for(const [key,value]of Object.entries(input)){if(!object(value))throw hubError('invalid_operations_settings',key+' must be an object');next[key]={...next[key],...value};}
+ const d=next.discovery;if(typeof d.enabled!=='boolean'||typeof d.autoEnableRoutes!=='boolean'||typeof d.fetchModels!=='boolean'||!Number.isInteger(d.intervalSeconds)||d.intervalSeconds<10||d.intervalSeconds>86400)throw hubError('invalid_discovery_settings','Discovery interval must be 10–86400 seconds with boolean toggles');
+ const u=next.updates;if(typeof u.enabled!=='boolean'||!Number.isFinite(u.intervalHours)||u.intervalHours<.25||u.intervalHours>168||typeof u.includePrerelease!=='boolean'||u.allowLocalTest!==undefined)throw hubError('invalid_update_settings','Update check interval must be 0.25–168 hours');releaseSource(u,descriptor);
+ const e=next.events;if(typeof e.enabled!=='boolean'||!Number.isFinite(e.credentialWarnDays)||e.credentialWarnDays<0||e.credentialWarnDays>90||!Number.isFinite(e.cooldownSeconds)||e.cooldownSeconds<0||e.cooldownSeconds>604800)throw hubError('invalid_event_settings','Invalid event threshold or cooldown');
+ if(!Number.isFinite(next.forecast.safetyMultiplier)||next.forecast.safetyMultiplier<1||next.forecast.safetyMultiplier>5||!Number.isFinite(next.forecast.maxBalanceAgeHours)||next.forecast.maxBalanceAgeHours<.1||next.forecast.maxBalanceAgeHours>168)throw hubError('invalid_forecast_settings','Invalid forecast margin or balance age');
+ if(next.forecast.renewAtByAccount!==undefined&&(!object(next.forecast.renewAtByAccount)||Object.entries(next.forecast.renewAtByAccount).some(([key,value])=>!/^account-[a-f0-9]{12}$/.test(key)||(value!==null&&(typeof value!=='string'||!Number.isFinite(Date.parse(value)))))))throw hubError('invalid_forecast_settings','Invalid account replenishment date');
+ return next;
+}
+export async function createHubOperations({service,options,descriptor={},hostEnvironment={}}){
+ const file=requireWithin(options.taskRoot,join(options.stateRoot,'hub-settings.json'),'hub settings');
+ let settings=structuredClone(operationDefaults);try{settings=validateOperationSettings(JSON.parse(await readFile(file,'utf8')),descriptor);}catch(error){if(error.code!=='ENOENT')throw error;}
+ const memory=new Map(),ledger={get:key=>service.ledger.get?.(key)??memory.get(key),set(key,value){if(service.ledger.set)service.ledger.set(key,value);else memory.set(key,structuredClone(value));}};
+ let mutation;try{mutation=(await import(pathToFileURL(join(options.engineRoot,'src/model-directory.mjs')).href)).withConfigMutation;}catch{}let configFlight=Promise.resolve();
+ const withMutation=operation=>mutation?mutation(service,operation):(configFlight=configFlight.catch(()=>{}).then(operation));
+ const updateConfig=mutator=>withMutation(async()=>{await service.config.load?.();const value=structuredClone(service.config.value);const result=await mutator(value);if(result!==false)await service.config.save(value);return result;});
+ const inboxKey='credit-hub:native-inbox:v1',nativeInbox=ledger.get(inboxKey)??[];
+ const persistInbox=()=>ledger.set(inboxKey,nativeInbox),ackWaiters=new Map();
+ const onNativeEvent=async(event,{deliveryId})=>{let item=nativeInbox.find(e=>e.deliveryId===deliveryId);if(!item){item={deliveryId,event,queuedAt:new Date().toISOString(),displayedAt:null};nativeInbox.push(item);if(nativeInbox.length>200)nativeInbox.splice(0,nativeInbox.length-200);persistInbox();}if(item.displayedAt)return {ack:true};return new Promise(resolve=>{const timer=setTimeout(()=>{ackWaiters.delete(deliveryId);resolve({ack:false});},4500);timer.unref?.();ackWaiters.set(deliveryId,{resolve,timer});});};
+ const events=createEventRouter({ledger,settings:settings.events,onNativeEvent});
+ const updates=createUpdateMonitor({ledger,version:PLUGIN_VERSION,descriptor,settings:settings.updates,onEvent:event=>events.emit({...event,id:event.key,data:{latestVersion:event.version,currentVersion:PLUGIN_VERSION}})});
+ const discovery=createDiscovery({service,options,hostEnvironment,settings:()=>settings.discovery,updateConfig,onEvent:event=>{if(event?.type)events.emit(event);},...(options.discoveryCandidates?{extraCandidates:options.discoveryCandidates}:{})});
+ let forecast={accounts:[],window:{hours:168},assumptions:[]},timer,refreshFlight,settingsFlight=Promise.resolve(),closed=false,lastError=null;
+ const balances=()=>service.balanceCache instanceof Map?[...service.balanceCache].map(([accountId,value])=>({accountId,...value})):[];
+ function usage7d(){const from=new Date(Date.now()-7*86400000).toISOString(),rows=[];let cursor=0,total=0,more=null;for(let n=0;n<40;n++){const part=service.ledger.usage?.({from,limit:500,beforeId:cursor})??{records:[]};rows.push(...(part.records??[]));total=part.total??rows.length;more=part.nextBeforeId;if(!more)break;cursor=more;}
+ const earliest=rows.length?Math.min(...rows.map(r=>Date.parse(r.startedAt??r.started_at)).filter(Number.isFinite)):Date.now();const firstObserved=ledger.get('credit-hub:observations-started-at')??Date.now();ledger.set('credit-hub:observations-started-at',firstObserved);
+ return {records:rows,total,nextBeforeId:more,coverage:{from:new Date(Math.max(Date.now()-7*86400000,Math.min(firstObserved,earliest))).toISOString(),to:new Date().toISOString(),complete:!more&&rows.length===total}};}
+ async function credentialMetadata(){const result=new Map();const add=row=>{if(Number.isFinite(row.expiresAtMs)&&(!result.has(row.accountId)||(row.observedAtMs??0)>=(result.get(row.accountId).observedAtMs??0)))result.set(row.accountId,row);};for(const row of discovery.credentialMetadata?.()??[])add(row);for(const row of Object.values(ledger.get('credit-hub:credential-expiry:v1')??{}))add(row);for(const account of service.config.value.accounts??[]){if(account.credentials?.file&&account.credentials.file!=='auto'){try{const path=requireWithin(options.taskRoot,service.config.path(account.credentials.file),'credential metadata'),info=await stat(path);if(info.size>2*1024*1024)continue;const expiresAtMs=credentialExpiry(JSON.parse(await readFile(path,'utf8')));if(expiresAtMs)add({accountId:account.id,expiresAtMs,observedAtMs:info.mtimeMs});}catch{}}}return [...result.values()];}
+ async function refresh(){if(refreshFlight)return refreshFlight;if(closed)return;refreshFlight=(async()=>{try{const cached=balances(),usage=usage7d(),schedule=service.scheduler.status?.()??{plan:[]};const history=captureBalanceHistory({ledger,balances:cached});
+ const nextByAccount=service.scheduler.nextReplenishment?.()??{};
+ const handles=createHandleMaps(service.config.value);for(const account of service.config.value.accounts??[]){const value=settings.forecast.renewAtByAccount?.[handles.accounts.get(account.id)];if(value&&Number.isFinite(Date.parse(value))&&Date.parse(value)>Date.now()&&(!nextByAccount[account.id]||Date.parse(value)<Date.parse(nextByAccount[account.id])))nextByAccount[account.id]=value;}
+ forecast=buildForecast({usage,balances:cached,accounts:service.config.value.accounts??[],schedule:{...service.config.value.scheduler,...settings.forecast,nextByAccount},history});
+ events.evaluate({accounts:service.config.value.accounts??[],balances:cached,records:service.ledger.records?.({limit:1000})??[],credentials:await credentialMetadata(),usage});lastError=null;
+ }catch{lastError='operations_observation_failed';}})().finally(()=>{refreshFlight=null;});return refreshFlight;}
+ const publicSettings=()=>({...settings,updates:{...settings.updates,feedUrl:undefined,repository:settings.updates.repository??descriptor.repository?.url??descriptor.repository??'',sourceConfigured:updates.status().configured},events:{...events.status(),nativeDelivery:'durable_inbox_then_client_display_ack'}});
+ const snapshot=()=>({discovery:discovery.status(),updates:updates.status(),events:{...events.status(),nativePending:nativeInbox.filter(e=>!e.displayedAt).length},forecast,settings:publicSettings(),monitorError:lastError});
+ async function configure(body){const previousDiscoveryInterval=settings.discovery.intervalSeconds,raw=structuredClone(settings);for(const [key,value]of Object.entries(body)){if(!Object.hasOwn(operationDefaults,key)||!object(value))throw hubError('invalid_operations_settings','Invalid settings section');raw[key]={...raw[key],...value};if(key==='events'){if(value.sinks)raw.events.sinks=Object.fromEntries([...new Set([...Object.keys(settings.events.sinks??{}),...Object.keys(value.sinks)])].map(id=>[id,{...(settings.events.sinks?.[id]??{}),...(value.sinks[id]??{})}]));if(value.mappings)raw.events.mappings={...settings.events.mappings,...value.mappings};if(value.balanceThreshold)raw.events.balanceThreshold={...settings.events.balanceThreshold,...value.balanceThreshold};}}
+ if(body.forecast?.renewAtByAccount)raw.forecast.renewAtByAccount={...settings.forecast.renewAtByAccount,...body.forecast.renewAtByAccount};const next=validateOperationSettings(raw,descriptor);validateEventSettings(next.events);await mkdir(options.stateRoot,{recursive:true});const tmp=file+'.'+randomUUID()+'.tmp';await writeFile(tmp,JSON.stringify(next,null,2)+'\n',{mode:0o600});await rename(tmp,file);settings=next;events.configure(next.events);updates.configure(next.updates);
+ if(options.enableBackgroundOperations){if(settings.discovery.enabled){if(previousDiscoveryInterval!==settings.discovery.intervalSeconds)await discovery.stop();discovery.start();}else await discovery.stop();}await refresh();return {saved:true,settings:publicSettings()};}
+ async function request(request){const body=request.body??{};switch(request.pathname){
+  case '/hub/operations':if(request.method==='POST'){settingsFlight=settingsFlight.catch(()=>{}).then(()=>configure(body));return settingsFlight;}await refresh();return snapshot();
+  case '/hub/discovery':return request.method==='POST'?discovery.scan({connect:body.connect!==false}):discovery.status();
+  case '/hub/updates':return request.method==='POST'?updates.check({force:true}):updates.status();
+  case '/hub/events':return events.status();
+  case '/hub/events/pending':return {items:nativeInbox.filter(e=>!e.displayedAt).slice(-30)};
+  case '/hub/events/ack':if(!Array.isArray(body.deliveryIds)||body.deliveryIds.length>100)throw hubError('invalid_notification_ack','Choose notification delivery IDs');for(const id of body.deliveryIds){const item=nativeInbox.find(e=>e.deliveryId===id);if(item)item.displayedAt=new Date().toISOString();const waiter=ackWaiters.get(id);if(waiter){clearTimeout(waiter.timer);waiter.resolve({ack:true});ackWaiters.delete(id);}}persistInbox();return {saved:true};
+  case '/hub/events/test':return events.emit({type:'checkin.failed',id:'test-'+randomUUID(),accountLabel:'通知测试',platform:'SAMPLE',force:true,data:{reason:'用户手动测试通知通道'}});
+  case '/hub/forecast':await refresh();return forecast;
+  case '/hub/scheduler-status':return service.scheduler.status?.()??{todayMissing:[],todayAttempted:[],plan:[]};
+  case '/hub/scheduler/manual':if(!service.scheduler.manual)throw hubError('scheduler_queue_unavailable','The isolated engine needs its queued scheduler',424);return service.scheduler.manual({...body,missingOnly:body.missingOnly!==false});
+  default:throw hubError('unknown_operation','Unknown operations endpoint',404);
+ }}
+ // Capture edges soon after local ledger writes, without awaiting sink delivery.
+ const originals=[];if(typeof service.credentials?.read==='function'){const original=service.credentials.read;service.credentials.read=async function(account,...args){const value=await original.call(this,account,...args);try{const expiresAtMs=credentialExpiry(value);if(expiresAtMs){const prior=ledger.get('credit-hub:credential-expiry:v1')??{};prior[account.id]={accountId:account.id,expiresAtMs,observedAtMs:Date.now()};ledger.set('credit-hub:credential-expiry:v1',prior);}}catch{}return value;};originals.push(()=>{service.credentials.read=original;});}for(const method of ['record','finishUsage'])if(typeof service.ledger[method]==='function'){const original=service.ledger[method];service.ledger[method]=function(...args){const result=original.apply(this,args);queueMicrotask(()=>{if(!closed)void refresh();});return result;};originals.push(()=>{service.ledger[method]=original;});}
+ await refresh();
+ return {snapshot,request,refresh,withMutation,updateConfig,start(){if(timer)return;if(options.enableBackgroundOperations){discovery.start();updates.start();}timer=setInterval(()=>void refresh(),30000);timer.unref?.();},async close(){closed=true;clearInterval(timer);await discovery.stop();await updates.close();await refreshFlight;for(const {resolve,timer}of ackWaiters.values()){clearTimeout(timer);resolve({ack:false});}ackWaiters.clear();await events.close();for(const reset of originals)reset();}};
+}
+

@@ -1,0 +1,59 @@
+name: Plugin CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-node22:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build tools and pinned development SDK
+        shell: pwsh
+        run: |
+          npm ci --legacy-peer-deps
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run sdk:install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pip install cryptography==50.0.2 wasmtime==49.0.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "CREDIT_HUB_TEST_PYTHON=$((Get-Command python).Source)" >> $env:GITHUB_ENV
+      - name: Build precompiled native plugin
+        run: npm run build
+      - name: Plugin regressions and fresh-profile boot
+        shell: pwsh
+        run: |
+          npm test 2>&1 | Tee-Object plugin-tests.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Engine regressions
+        shell: pwsh
+        run: |
+          npm run test:engine 2>&1 | Tee-Object engine-tests.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify native bundle and pack
+        shell: pwsh
+        run: |
+          npm run verify
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm pack --ignore-scripts
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-node22-evidence
+          path: |
+            plugin-tests.log
+            engine-tests.log
+            dsh-credit-hub-*.tgz
+

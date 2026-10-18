@@ -1,0 +1,9 @@
+node_modules/
+work/
+runtime/
+.test-workspace/
+*.local.json
+*.log
+.impeccable/
+__pycache__/
+*.pyc

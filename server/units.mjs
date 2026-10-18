@@ -1,0 +1,1 @@
+export function normalizeBalanceUnit(unit){if(typeof unit!=='string')return unit;const value=unit.trim(),lower=value.toLowerCase();return value==='积分'||['credit','credits'].includes(lower)?'credits':value==='元'||lower==='cny'?'CNY':lower==='usd'?'USD':['token','tokens'].includes(lower)?'tokens':value;}
