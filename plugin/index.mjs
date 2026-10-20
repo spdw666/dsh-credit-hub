@@ -40,5 +40,5 @@ export function apply(ctx,config={}) {
     }});
     hub.compatibility=compatibility.status;
     ctx.logger.info(`积分中枢 ${PLUGIN_VERSION} 已就绪：独立引擎、原生管理页、调度默认关闭。`);
-  }).catch(e=>ctx.logger.error('积分中枢启动失败：'+String(e.code??e.message??'startup_error')));
+  }).catch(e=>ctx.logger.error('积分中枢启动失败：'+[e.code??'startup_error',e.message].filter(Boolean).join(' · ')));
 }

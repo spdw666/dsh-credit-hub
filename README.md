@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前发布版 **0.2.1**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前发布版 **0.2.2**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -25,9 +25,9 @@ dsh plugin add github:spdw666/dsh-credit-hub
 ### 运行条件
 
 - 宿主提供官方 `@deepseek-ai/*` 与 React，不打包或替换一份 DSH。
-- 独立 worker 需要 **Node >=22.23.3 且支持 `node:sqlite`**。优先使用显式配置，其后检测现有 task runtime、DSH 自带独立 Node、PATH。每个候选会真实执行 SQLite 内存查询，Electron 命令包装器不当作独立 Node。
+- 独立 worker 需要 **Node >=22.23.3 且支持 `node:sqlite`**；`package.json` 的 `engines.node` 已是 `>=22.23.3`，更低的 Node 会在安装阶段被拒绝，而不是装好后起不来。优先使用显式配置，其后检测现有 task runtime、DSH 自带独立 Node、PATH。每个候选会真实执行 SQLite 内存查询，Electron 命令包装器不当作独立 Node；没有合格候选时，错误信息会列出探测过的候选及其 Node 版本。
 - 默认数据位于 DSH 用户目录的 `plugins/credit-hub`。可通过插件配置指定 `taskRoot`、`configFile`、`nodeExecutable`、`allowScheduler`。
-- 部分平台另需其登录态、原生身份或独立运行资产。千问办公的特定编码链需要 Python、cryptography、wasmtime；缺少这些平台条件不影响其他平台管理。
+- 部分平台另需其登录态、原生身份或独立运行资产。千问办公的特定编码链额外需要 **Python + cryptography + wasmtime**（可选）；缺少这些条件只影响该平台的编码能力，其他平台管理与其他账号不受影响。
 
 ## 使用入口
 

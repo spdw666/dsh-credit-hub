@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Raise `engines.node` to `>=22.23.3`: Node 22.19–22.22 could install the package but the worker then failed with `worker_node_unavailable`, because it requires `node:sqlite`.
+- Name the detected Node version and `node:sqlite` probe result when no worker runtime qualifies, instead of returning a bare error code.
+- State the worker runtime requirement and the optional Qwen Office Python dependencies in the README and the market entry description.
+
 ## 0.2.1
 
 - First public GitHub/marketplace submission, with prebuilt native DSH client and independent engine.

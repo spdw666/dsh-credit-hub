@@ -1,11 +1,11 @@
 {
   "name": "dsh-credit-hub",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "DSH 原生多平台账号、模型路由、签到任务与请求记录管理插件",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": ">=22.23.3"
   },
   "main": "./lib/index.mjs",
   "exports": {

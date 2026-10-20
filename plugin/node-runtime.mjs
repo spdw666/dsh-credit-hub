@@ -27,7 +27,7 @@ export async function probeWorkerNode(executable,{env=process.env,timeoutMs=6000
     env:cleanEnv,timeout:timeoutMs,windowsHide:true,maxBuffer:16384,encoding:'utf8',
   });
   let result;try{result=JSON.parse(stdout.trim())}catch{throw failure('worker_node_invalid_probe','The candidate did not return a valid standalone Node capability probe')}
-  if(result.protocol!=='credit-hub-node-probe-v1'||!isSupportedWorkerProbe(result))throw failure('worker_node_unsupported','A standalone Node >=22.23.3 with working node:sqlite is required');
+  if(result.protocol!=='credit-hub-node-probe-v1'||!isSupportedWorkerProbe(result))throw failure('worker_node_unsupported',`A standalone Node >=${MINIMUM_WORKER_NODE} with working node:sqlite is required (found Node ${result.version??'unknown'}, node:sqlite ${result.sqlite===true?'available':'unavailable'})`,{version:result.version??null,sqlite:result.sqlite===true});
   return result;
 }
 
@@ -78,8 +78,9 @@ export async function resolveWorkerNode({
     try{
       const result=await probe(file,{env});
       if(isSupportedWorkerProbe(result))return file;
-      attempts.push({source,result:'unsupported'});
-    }catch(error){attempts.push({source,result:error.code??'probe_failed'})}
+      attempts.push({source,result:'unsupported',version:result.version??null});
+    }catch(error){attempts.push({source,result:error.code??'probe_failed',...(error.details?.version?{version:error.details.version}:{})})}
   }
-  throw failure('worker_node_unavailable','No standalone Node >=22.23.3 with working node:sqlite was found; set nodeExecutable or DSH_CREDIT_HUB_NODE',{attempts});
+  const detected=attempts.length?attempts.map(a=>`${a.source}=${a.version??a.result}`).join(', '):'no candidates';
+  throw failure('worker_node_unavailable',`No standalone Node >=${MINIMUM_WORKER_NODE} with working node:sqlite was found (${detected}); set nodeExecutable or DSH_CREDIT_HUB_NODE`,{attempts,minimum:MINIMUM_WORKER_NODE});
 }
