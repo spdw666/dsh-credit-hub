@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前发布版 **0.2.2**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前发布版 **0.2.3**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -76,7 +76,9 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 
 ### 版本提醒
 
-默认每小时检测发布包 `repository` 对应的 GitHub `package.json.version`，也支持 HTTPS 清单/npm 元数据。发现更高版本进入事件出口，不后台覆盖运行代码。正式市场用户通过市场更新；`link:` 开发安装可收到版本提醒，但不伪装成市场安装。仅改代码而不递增包版本不算新发布。
+默认每小时检测 `repository` 对应的 GitHub `package.json.version`，也支持 HTTPS 清单/npm 元数据。发现更高版本进入事件出口，不后台覆盖运行代码；仓库版本提示本身不证明 Release 安装包已经就绪，也不证明市场已收录。
+
+正式更新需要递增版本、构建并发布带有同名 `dsh-credit-hub.tgz` 的完整 GitHub Release，稳定 latest 链接随后供新安装或显式重新安装取得新包。市场的更新徽标取决于市场客户端对安装来源的支持，不与本插件的版本提醒混为一谈；当前 dshmarket 的 tarball URL 安装不走 GitHub Release 自动版本比较。`link:` 开发安装由本地源码控制，不冒充市场安装。仅 push 同版本代码不等于发版。
 
 ## 界面示例
 
@@ -93,6 +95,16 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 这不是 32 个完整历史桌面安装验收。完整桌面实际验收宿主为 0.2.1-rc.2；未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
 
 ## 开发
+
+### 后台守护（0.2.3）
+
+插件加载后由 DSH 宿主启动并守护独立 worker；最初一次 worker 启动失败也会重试。宿主每 5 秒发送一次本地 IPC 心跳，单次期限 3 秒，连续 3 次失败后回收旧进程并重建；进程退出或 IPC 断开也会进入恢复。心跳不调用上游模型或签到接口，只证明本地事件循环与 IPC 有响应。
+
+重启采用 0.5–30 秒指数退避与 20% 抖动；5 分钟内达到 5 次重启后冷却 60 秒再试。恢复时先确认旧进程退出，同一宿主控制器不重叠启动；宿主从长暂停恢复时有 15 秒观察宽限。正常关闭 DSH、禁用插件时停止守护并退出子进程，不额外安装系统服务。
+
+每次新的生成调用先等待后台就绪（最多 10 秒，可取消）；新 generation 会刷新模型目录、回环地址、私有密钥与请求策略，旧代迟到目录不覆盖新状态。旧 prepared call 返回可识别的 503，调用方重新准备；已经发出的生成、已输出部分内容的流或管理动作不自动重放。上游 429、额度不足与普通业务请求超时不触发健康后台重启。
+
+宿主快照中的 `worker.status/generation/restarts/heartbeatMisses/lastHeartbeatAt/nextRetryAt` 提供恢复状态。该机制适用于 DSH 宿主仍运行时；DSH 宿主退出、系统休眠或上游平台自身故障有各自的生命周期，不宣称无间断连接。GitHub Release 与插件市场收录是独立状态；更新已有安装需要版本递增和完整的新 Release，单纯 push 不等于发版。
 
 ```sh
 npm ci --legacy-peer-deps

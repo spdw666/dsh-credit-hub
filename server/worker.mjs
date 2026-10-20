@@ -13,7 +13,7 @@ const options=normalizeOptions(incoming,incoming.taskRoot);
 // Set before dynamic import: model-audit captures this value at module load.
 process.env.AI_CREDIT_MEMORY=options.memoryRoot;
 delete process.env.ELECTRON_RUN_AS_NODE;delete process.env.NODE_OPTIONS;delete process.env.DSH_DESKTOP_NODE_EXECUTABLE;
-let service,listener,closing=false,coreVersion,buildActivityContext,privateAdminKey,stopMemory,operations;
+let service,listener,closing=false,workerReady=false,coreVersion,buildActivityContext,privateAdminKey,stopMemory,operations,cleanupFlight=Promise.resolve();
 const maps=()=>createHandleMaps(service.config.value);
 const publish=value=>boundedPublic(translateIds(value,maps()));
 const send=message=>{if(process.connected)process.send?.(message);};
@@ -67,28 +67,49 @@ async function managementRequest(request){
   if(exporting&&response.status===200)return engineAccountExportResponse(result,request);
   return {status:response.status,body:publish(result)};
 }
-async function close(code=0){if(closing)return;closing=true;try{await stopMemory?.();await operations?.close();await listener?.close();await service?.close();process.exitCode=code;}catch{process.exitCode=1;}finally{process.disconnect?.();}}
+const assertStarting=()=>{if(closing)throw hubError('worker_stopped','Plugin worker stopped during startup',503);};
+function cleanupResources(){
+  // A factory awaited during startup can finish after shutdown began. Drain
+  // again when that factory returns, without closing any resource twice.
+  cleanupFlight=cleanupFlight.catch(()=>{}).then(async()=>{
+    let failure;const finish=async operation=>{try{await operation?.();}catch(error){failure??=error;}};
+    const memory=stopMemory;stopMemory=null;await finish(memory);
+    const ops=operations;operations=null;await finish(ops?()=>ops.close():null);
+    const server=listener;listener=null;await finish(server?()=>server.close():null);
+    const core=service;service=null;await finish(core?()=>core.close():null);
+    if(failure)throw failure;
+  });
+  return cleanupFlight;
+}
+async function close(code=0){if(closing)return;closing=true;workerReady=false;try{await cleanupResources();process.exitCode=code;}catch{process.exitCode=1;}finally{if(process.connected)process.disconnect?.();}}
 process.on('disconnect',()=>void close());process.on('SIGTERM',()=>void close());
 process.on('message',message=>{
   if(message?.type==='shutdown'){void close();return;}
+  // The host watchdog probes only this local event loop. Do not touch account
+  // state or any upstream, and never echo arbitrary IPC fields or credentials.
+  if(message?.type==='heartbeat'){
+    const id=message.id,validId=typeof id==='string'&&id.length>0&&id.length<=128||Number.isSafeInteger(id)&&id>=0;
+    if(workerReady&&service&&listener&&!closing&&validId)send({type:'heartbeat',id,ready:true});
+    return;
+  }
   if(message?.type!=='request'||!service||closing)return;
   void(async()=>{try{const result=message.operation==='snapshot'?snapshot():message.operation==='models'?publish(await service.router.models()):message.operation==='managementRequest'?await managementRequest(message.request):await localRequest(message.request);send({type:'response',id:message.id,result});}catch(error){send({type:'response',id:message.id,error:boundedPublic(problem(error))});}})();
 });
 try{
-  await validateEngineRoot(options.engineRoot);
-  await Promise.all([mkdir(options.stateRoot,{recursive:true}),mkdir(options.memoryRoot,{recursive:true}),mkdir(options.logRoot,{recursive:true}),mkdir(dirname(options.configFile),{recursive:true})]);
-  let raw;try{raw=JSON.parse(await readFile(options.configFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;raw=defaultConfig();await writeFile(options.configFile,JSON.stringify(raw,null,2)+'\n',{flag:'wx',mode:0o600});}
+  await validateEngineRoot(options.engineRoot);assertStarting();
+  await Promise.all([mkdir(options.stateRoot,{recursive:true}),mkdir(options.memoryRoot,{recursive:true}),mkdir(options.logRoot,{recursive:true}),mkdir(dirname(options.configFile),{recursive:true})]);assertStarting();
+  let raw;try{raw=JSON.parse(await readFile(options.configFile,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;assertStarting();raw=defaultConfig();await writeFile(options.configFile,JSON.stringify(raw,null,2)+'\n',{flag:'wx',mode:0o600});}assertStarting();
   assertIsolatedConfig(raw,options);
-  let environment={};try{environment=JSON.parse(await readFile(join(options.stateRoot,'environment.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+  let environment={};try{environment=JSON.parse(await readFile(join(options.stateRoot,'environment.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}assertStarting();
   for(const [key,fallback] of [['APPDATA',join(options.stateRoot,'appdata','roaming')],['LOCALAPPDATA',join(options.stateRoot,'appdata','local')]]){
-    const directory=requireWithin(options.taskRoot,environment[key]??fallback,key);await mkdir(directory,{recursive:true});process.env[key]=directory;
+    const directory=requireWithin(options.taskRoot,environment[key]??fallback,key);await mkdir(directory,{recursive:true});assertStarting();process.env[key]=directory;
   }
   if(environment.QWENWORK_PYTHON)process.env.QWENWORK_PYTHON=requireWithin(options.taskRoot,environment.QWENWORK_PYTHON,'QWENWORK_PYTHON');
   process.env.PYTHONDONTWRITEBYTECODE='1';
   const modulePath=name=>pathToFileURL(join(options.engineRoot,'src',name)).href;
-  const [{createService},{startServer},activity]=await Promise.all([import(modulePath('service.mjs')),import(modulePath('server.mjs')),import(modulePath('activity-context.mjs'))]);buildActivityContext=activity.buildActivityContext;
-  coreVersion=JSON.parse(await readFile(join(options.engineRoot,'package.json'),'utf8')).version;
-  service=await createService(options.configFile,{schedule:false});
+  const [{createService},{startServer},activity]=await Promise.all([import(modulePath('service.mjs')),import(modulePath('server.mjs')),import(modulePath('activity-context.mjs'))]);assertStarting();buildActivityContext=activity.buildActivityContext;
+  coreVersion=JSON.parse(await readFile(join(options.engineRoot,'package.json'),'utf8')).version;assertStarting();
+  service=await createService(options.configFile,{schedule:false});assertStarting();
   const save=service.config.save.bind(service.config);service.config.save=async value=>save(assertIsolatedConfig(value,options));
   const guardKind=kind=>{if((service.config.value.pluginIsolation?.blockedUpstreamKinds??['antigravity','opencode']).includes(kind))throw hubError('isolated_upstream_setup_required','This upstream needs independent plugin setup before use',409);};
   const guardAccount=id=>{const account=service.credentials.account(id);guardKind(account?.platform);assertCredentialIsolation(account,service.config,options.taskRoot);return account;};
@@ -100,13 +121,18 @@ try{
   // identifier is translated. Messages, tools and tool results remain untouched.
   if(typeof service.router.chat==='function'){const chat=service.router.chat.bind(service.router);service.router.chat=async function*(input,...args){const current=maps(),original=current.reverse.get(input.model)??input.model;for await(const chunk of chat({...input,model:original},...args))yield {...chunk,...(chunk.model?{model:current.routes.get(chunk.model)??chunk.model}:{})};};}
   privateAdminKey=randomBytes(32).toString('hex');
-  listener=await startServer(service,{host:'127.0.0.1',port:0,key:randomBytes(32).toString('hex'),adminKey:privateAdminKey,admin:true});
-  let descriptor={};try{descriptor=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));}catch{}
-  operations=await createHubOperations({service,options,descriptor,hostEnvironment:options.hostEnvironment??{}});
+  listener=await startServer(service,{host:'127.0.0.1',port:0,key:randomBytes(32).toString('hex'),adminKey:privateAdminKey,admin:true});assertStarting();
+  let descriptor={};try{descriptor=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));}catch{}assertStarting();
+  operations=await createHubOperations({service,options,descriptor,hostEnvironment:options.hostEnvironment??{}});assertStarting();
   operations.start();
   // The independent plugin owns its scheduler. Installation remains idle.
   if(options.allowScheduler&&service.config.value.scheduler.enabled)service.scheduler.start();
-  stopMemory=await attachRuntimeMemory({taskRoot:options.taskRoot,memoryRoot:options.memoryRoot,configFile:options.configFile,summary:()=>{const s=snapshot();return {pluginVersion:PLUGIN_VERSION,coreVersion,counts:s.counts,schedulerRunning:s.schedulerRunning,workerPid:process.pid}}});
-  send({type:'ready',baseUrl:listener.baseUrl,key:listener.key,adminKey:privateAdminKey,coreVersion,pluginVersion:PLUGIN_VERSION,pid:process.pid,nodeVersion:process.version});
+  stopMemory=await attachRuntimeMemory({taskRoot:options.taskRoot,memoryRoot:options.memoryRoot,configFile:options.configFile,summary:()=>{const s=snapshot();return {pluginVersion:PLUGIN_VERSION,coreVersion,counts:s.counts,schedulerRunning:s.schedulerRunning,workerPid:process.pid}}});assertStarting();
+  // A shutdown received during asynchronous startup must not advertise a new
+  // ready generation or answer a heartbeat after its closing transition.
+  if(!closing){workerReady=true;send({type:'ready',baseUrl:listener.baseUrl,key:listener.key,adminKey:privateAdminKey,coreVersion,pluginVersion:PLUGIN_VERSION,pid:process.pid,nodeVersion:process.version});}
   // startServer's provided admin key is distinct from persisted service keys.
-}catch(error){send({type:'error',error:boundedPublic(problem(error))});console.error(JSON.stringify(problem(error)));await close(1);}
+}catch(error){
+  if(closing){try{await cleanupResources();}catch{process.exitCode=1;}}
+  else{send({type:'error',error:boundedPublic(problem(error))});console.error(JSON.stringify(problem(error)));await close(1);}
+}

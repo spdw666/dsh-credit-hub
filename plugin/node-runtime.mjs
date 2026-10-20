@@ -20,11 +20,11 @@ export function isSupportedWorkerProbe(result){
 }
 
 /** Execute the candidate itself: a version label or Electron Node-mode shim is insufficient. */
-export async function probeWorkerNode(executable,{env=process.env,timeoutMs=6000}={}){
+export async function probeWorkerNode(executable,{env=process.env,timeoutMs=6000,signal}={}){
   const cleanEnv={...env};
   for(const key of ['ELECTRON_RUN_AS_NODE','NODE_OPTIONS','DSH_DESKTOP_NODE_EXECUTABLE'])delete cleanEnv[key];
   const {stdout}=await execute(executable,['--input-type=module','-e',probeSource],{
-    env:cleanEnv,timeout:timeoutMs,windowsHide:true,maxBuffer:16384,encoding:'utf8',
+    env:cleanEnv,timeout:timeoutMs,signal,windowsHide:true,maxBuffer:16384,encoding:'utf8',
   });
   let result;try{result=JSON.parse(stdout.trim())}catch{throw failure('worker_node_invalid_probe','The candidate did not return a valid standalone Node capability probe')}
   if(result.protocol!=='credit-hub-node-probe-v1'||!isSupportedWorkerProbe(result))throw failure('worker_node_unsupported',`A standalone Node >=${MINIMUM_WORKER_NODE} with working node:sqlite is required (found Node ${result.version??'unknown'}, node:sqlite ${result.sqlite===true?'available':'unavailable'})`,{version:result.version??null,sqlite:result.sqlite===true});
@@ -34,7 +34,7 @@ export async function probeWorkerNode(executable,{env=process.env,timeoutMs=6000
 /** No downloads or installation writes. Explicit configuration errors never fall through. */
 export async function resolveWorkerNode({
   explicit,env=process.env,execPath=process.execPath,taskRoot,
-  platform=process.platform,cwd=process.cwd(),resourcesPath,probe=probeWorkerNode,
+  platform=process.platform,cwd=process.cwd(),resourcesPath,probe=probeWorkerNode,signal,
 }={}){
   const path=pathsFor(platform),name=platform==='win32'?'node.exe':'node';
   const absolute=value=>path.resolve(cwd,String(value));
@@ -43,10 +43,10 @@ export async function resolveWorkerNode({
     const file=absolute(value.trim());
     if(!executableName(file,platform))throw failure('worker_node_configuration_invalid',`${source} must name ${name}, not an Electron executable or command shim`);
     try{
-      const result=await probe(file,{env});
+      signal?.throwIfAborted();const result=await probe(file,{env,signal});
       if(!isSupportedWorkerProbe(result))throw failure('worker_node_unsupported','The configured Node version or SQLite capability is unsupported');
       return file;
-    }catch(error){throw failure('worker_node_configuration_invalid',`${source} failed its standalone Node >=22.23.3 / node:sqlite probe`,{source,cause:error.code??'probe_failed'})}
+    }catch(error){signal?.throwIfAborted();throw failure('worker_node_configuration_invalid',`${source} failed its standalone Node >=22.23.3 / node:sqlite probe`,{source,cause:error.code??'probe_failed'})}
   }
   if(explicit!==undefined&&explicit!==null&&explicit!=='')return configured(explicit,'nodeExecutable');
   if(env.DSH_CREDIT_HUB_NODE!==undefined&&env.DSH_CREDIT_HUB_NODE!=='')return configured(env.DSH_CREDIT_HUB_NODE,'DSH_CREDIT_HUB_NODE');
@@ -72,14 +72,15 @@ export async function resolveWorkerNode({
   }
   const seen=new Set(),attempts=[];
   for(const {file,source} of candidates){
+    signal?.throwIfAborted();
     const key=platform==='win32'?file.toLowerCase():file;
     if(seen.has(key)||!executableName(file,platform))continue;
     seen.add(key);
     try{
-      const result=await probe(file,{env});
+      const result=await probe(file,{env,signal});
       if(isSupportedWorkerProbe(result))return file;
       attempts.push({source,result:'unsupported',version:result.version??null});
-    }catch(error){attempts.push({source,result:error.code??'probe_failed',...(error.details?.version?{version:error.details.version}:{})})}
+    }catch(error){signal?.throwIfAborted();attempts.push({source,result:error.code??'probe_failed',...(error.details?.version?{version:error.details.version}:{})})}
   }
   const detected=attempts.length?attempts.map(a=>`${a.source}=${a.version??a.result}`).join(', '):'no candidates';
   throw failure('worker_node_unavailable',`No standalone Node >=${MINIMUM_WORKER_NODE} with working node:sqlite was found (${detected}); set nodeExecutable or DSH_CREDIT_HUB_NODE`,{attempts,minimum:MINIMUM_WORKER_NODE});

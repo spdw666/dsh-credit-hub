@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "dsh-credit-hub",
-  "version": "0.2.2",
-  "releaseUrl": "https://github.com/spdw666/dsh-credit-hub/releases/tag/v0.2.2"
+  "version": "0.2.3",
+  "releaseUrl": "https://github.com/spdw666/dsh-credit-hub/releases/tag/v0.2.3",
+  "published": true
 }

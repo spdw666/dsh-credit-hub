@@ -1,6 +1,6 @@
 {
   "name": "dsh-credit-hub",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DSH 原生多平台账号、模型路由、签到任务与请求记录管理插件",
   "type": "module",
   "license": "MIT",
@@ -55,7 +55,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test --test-concurrency=4 tests/*.test.mjs",
     "verify": "node scripts/verify-native.mjs .",
     "check": "npm run build && npm test && npm run verify",
     "test:engine": "node --test engine/tests/*.test.mjs",

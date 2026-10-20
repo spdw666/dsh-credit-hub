@@ -83,7 +83,7 @@ export async function startServer(service,{host,port,key,adminKey}){
 }
 test('real standalone worker snapshot is local-only, scheduler is idle, proxy uses private admin key',async t=>{
   const f=await fixture(t),hub=await createHubRuntime(f.options);t.after(()=>hub.close());
-  const s=await hub.snapshot();assert.equal(s.title,'积分中枢');assert.equal(s.version,'0.6.0');assert.equal(s.pluginVersion,'0.2.2');assert.equal(s.schedulerRunning,false);assert.deepEqual(s.counts,{accounts:0,platforms:0,routes:0,enabledRoutes:0});assert.equal(JSON.stringify(s).includes('SAMPLE_LEAK'),false);
+  const s=await hub.snapshot();assert.equal(s.title,'积分中枢');assert.equal(s.version,'0.6.0');assert.equal(s.pluginVersion,'0.2.3');assert.equal(s.schedulerRunning,false);assert.deepEqual(s.counts,{accounts:0,platforms:0,routes:0,enabledRoutes:0});assert.equal(JSON.stringify(s).includes('SAMPLE_LEAK'),false);
   const activity=await hub.request({path:'/hub/activity'});assert.equal(activity.body.kpis.requests,0);
   const models=await hub.request({path:'/admin/models'});assert.equal(models.status,200);assert.equal(models.body.data[0].id,'SAMPLE/model');assert.equal('token' in models.body,false);
   const claim=await hub.request({method:'POST',path:'/admin/claim',body:{accountId:'SAMPLE'}});assert.equal(claim.body.observed,true);

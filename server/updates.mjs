@@ -38,7 +38,7 @@ export function createUpdateMonitor({ledger,version,descriptor={},settings={},fe
         const releaseUrl=source.kind==='github'?`https://github.com/${source.repository}`:typeof data.releaseUrl==='string'?data.releaseUrl:null;
         const safeUrl=releaseUrl&&/^https:\/\//.test(releaseUrl)&&!new URL(releaseUrl).username?releaseUrl:null;
         state={...state,status:available?'update_available':'up_to_date',source:source.kind,checkedAtMs:now(),checkedAt:new Date(now()).toISOString(),availableVersion:latest.replace(/^v/,''),updateAvailable:available,releaseUrl:safeUrl,errorCode:null};
-        if(available&&state.notifiedVersion!==latest){const receipt=await onEvent({type:'update.available',key:'update:'+latest,title:'积分中枢有新版本',message:`已安装 ${version}，市场发布版本 ${latest}。打开插件市场检查更新。`,version:latest});if(receipt?.queued>0&&receipt.persisted!==false)state.notifiedVersion=latest;}
+        if(available&&state.notifiedVersion!==latest){const receipt=await onEvent({type:'update.available',key:'update:'+latest,title:'积分中枢有新版本',message:`已安装 ${version}，版本源显示 ${latest}。请查看发布说明与完整安装包；市场更新状态以实际市场为准。`,version:latest});if(receipt?.queued>0&&receipt.persisted!==false)state.notifiedVersion=latest;}
         persist();return status();
       }catch(error){state={...state,status:'check_failed',checkedAtMs:now(),errorCode:/^[a-z0-9_]+$/.test(error.code??error.message)?error.code??error.message:'update_check_failed'};persist();return status();}
     })().finally(()=>{flight=null;});return flight;

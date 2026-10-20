@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.3
+
+- Supervise the worker in the DSH host with bounded readiness waits, startup retries, IPC heartbeats, serial restarts, backoff and crash-storm cooldown.
+- Recover from worker exit, IPC disconnect and an unresponsive event loop; close cancels recovery and confirms the old child has exited before another starts.
+- Refresh model profiles, loopback addresses and private keys on a new worker generation. Reject stale prepared calls before dispatch; never replay already dispatched generations or management actions.
+- Add real SAMPLE child-process and loopback streaming fault-injection tests. Keep automatic check-ins disabled unless explicitly enabled.
+
 ## 0.2.2
 
 - Raise `engines.node` to `>=22.23.3`: Node 22.19–22.22 could install the package but the worker then failed with `worker_node_unavailable`, because it requires `node:sqlite`.

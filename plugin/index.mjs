@@ -25,20 +25,22 @@ export function apply(ctx,config={}) {
   const taskRoot=resolve(unwrap(config.taskRoot)||rootDefault);
   const configFile=unwrap(config.configFile)||join(taskRoot,'runtime/profile/config.json');
   const explicitNode=unwrap(config.nodeExecutable);
-  let stopped=false,hub,compatibility;
-  const ready=resolveWorkerNode({explicit:explicitNode,taskRoot}).then(nodeExecutable=>createHubRuntime({taskRoot,stateRoot:dirname(configFile),configFile,nodeExecutable,engineRoot:fileURLToPath(new URL('../engine/',import.meta.url)),memoryRoot:join(taskRoot,'memory'),logRoot:join(taskRoot,'runtime/logs'),allowScheduler:unwrap(config.allowScheduler)===true,enableBackgroundOperations:true}));
+  let stopped=false,hub,compatibility,native;
+  const ready=createHubRuntime({taskRoot,stateRoot:dirname(configFile),configFile,resolveNodeImpl:({signal})=>resolveWorkerNode({explicit:explicitNode,taskRoot,signal}),engineRoot:fileURLToPath(new URL('../engine/',import.meta.url)),memoryRoot:join(taskRoot,'memory'),logRoot:join(taskRoot,'runtime/logs'),allowScheduler:unwrap(config.allowScheduler)===true,enableBackgroundOperations:true});
   new CreditHubRemote(ctx,ready);
   registerGatewayRetryRecovery(ctx);
-  ctx.effect(()=>()=>{stopped=true;compatibility?.dispose();void hub?.close();});
+  ctx.effect(()=>()=>{stopped=true;native?.dispose?.();compatibility?.dispose();void hub?.close().catch(e=>ctx.logger.error('积分中枢后台退出异常：'+e.code));});
   void ready.then(async runtime=>{
     hub=runtime;if(stopped){await hub.close();return}
-    const native=createCreditHubAdapter({hub,resolveAttachments:()=>ctx.get('attachments')});
+    native=createCreditHubAdapter({hub,resolveAttachments:()=>ctx.get('attachments')});
     const settingsNs=ctx.fiber?.entry?.options?.id??name;
     compatibility=registerNativeProviderCompatibility(ctx,{providerId,adapter:native.adapter,settingsNs,displayName:'积分中枢',discoverModels:async()=>{
       const models=await native.refresh({force:true});
       return models.map(m=>({id:m.id,name:m.name??m.id,contextWindow:m.contextWindow,maxTokens:m.maxTokens,inputModalities:m.capabilities?.multimodal?['text','image']:['text']}));
     }});
     hub.compatibility=compatibility.status;
-    ctx.logger.info(`积分中枢 ${PLUGIN_VERSION} 已就绪：独立引擎、原生管理页、调度默认关闭。`);
+    const reportReady=state=>ctx.logger.info(`积分中枢 ${PLUGIN_VERSION} 后台已连接：generation=${state.generation}；宿主守护已启用；自动调度默认关闭。`);
+    const removeReady=hub.onReady(reportReady);ctx.effect(()=>removeReady);
+    if(hub.status().status==='ready')reportReady(hub.status());
   }).catch(e=>ctx.logger.error('积分中枢启动失败：'+[e.code??'startup_error',e.message].filter(Boolean).join(' · ')));
 }
