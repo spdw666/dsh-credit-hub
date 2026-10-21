@@ -43,7 +43,7 @@ test('late install -> missing/login required -> real offline import -> upstream 
     await write(f.file,auth());const before=digest(await readFile(f.file));
     const imported=row(await f.d.scan());assert.equal(imported.status,'imported');assert.equal(imported.catalogStatus,'ready');assert.equal(imported.routeCount,1);
     assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.upstreams.length,1);assert.equal(f.config.value.routes.length,1);assert.equal(f.config.value.routes[0].enabled,true);
-    const account=f.config.value.accounts[0];assert.equal(account.credentials.kind,'file');assert.equal(account.credentials.autoLaunch,false);assert.ok(account.credentials.file.startsWith(f.dataDir));
+    const account=f.config.value.accounts[0];assert.equal(account.credentials.kind,'file');assert.equal(account.credentials.autoLaunch,false);assert.ok(account.credentials.file.startsWith(f.dataDir));assert.deepEqual(account.tasks,[{id:'daily-checkin',enabled:true}]);
     assert.equal((await parse(account.credentials.file)).accessToken,'SAMPLE_TOKEN_1');assert.equal(digest(await readFile(f.file)),before);
     const summary=JSON.stringify(f.d.status());for(const secret of ['SAMPLE_TOKEN_1','SAMPLE_REFRESH','SAMPLE_ACCOUNT',f.file])assert.ok(!summary.includes(secret));
     await f.d.scan();assert.equal(f.config.value.accounts.length,1);assert.equal(f.catalogs.length,1);assert.equal(digest(await readFile(f.file)),before);
@@ -58,9 +58,9 @@ test('discovery polling catches files appearing after startup and stop clears it
 test('same-principal native credential rotation preserves every existing toggle and label',async()=>{
   const f=await fixture();try{
     await write(f.file,auth());await f.d.scan();
-    const a=f.config.value.accounts[0],oldFile=a.credentials.file;a.enabled=false;a.inferenceEnabled=false;a.label='SAMPLE user choice';f.config.value.upstreams[0].enabled=false;f.config.value.routes[0].enabled=false;await f.config.save(f.config.value);
+    const a=f.config.value.accounts[0],oldFile=a.credentials.file;a.enabled=false;a.inferenceEnabled=false;a.label='SAMPLE user choice';a.tasks=[{id:'daily-checkin',enabled:false}];f.config.value.upstreams[0].enabled=false;f.config.value.routes[0].enabled=false;await f.config.save(f.config.value);
     await write(f.file,auth('SAMPLE_ACCOUNT','SAMPLE_ROTATED_TOKEN'));const result=row(await f.d.scan());
-    assert.equal(result.status,'changed');assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.accounts[0].enabled,false);assert.equal(f.config.value.accounts[0].inferenceEnabled,false);assert.equal(f.config.value.accounts[0].label,'SAMPLE user choice');assert.equal(f.config.value.upstreams[0].enabled,false);assert.equal(f.config.value.routes[0].enabled,false);
+    assert.equal(result.status,'changed');assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.accounts[0].enabled,false);assert.equal(f.config.value.accounts[0].inferenceEnabled,false);assert.equal(f.config.value.accounts[0].label,'SAMPLE user choice');assert.deepEqual(f.config.value.accounts[0].tasks,[{id:'daily-checkin',enabled:false}]);assert.equal(f.config.value.upstreams[0].enabled,false);assert.equal(f.config.value.routes[0].enabled,false);
     assert.notEqual(f.config.value.accounts[0].credentials.file,oldFile);assert.equal((await parse(oldFile)).accessToken,'SAMPLE_TOKEN_1');assert.equal((await parse(f.config.value.accounts[0].credentials.file)).accessToken,'SAMPLE_ROTATED_TOKEN');assert.equal(f.catalogs.length,1);
   }finally{await f.clean();}
 });
@@ -73,7 +73,7 @@ test('already migrated native identity is deduplicated even when JSON layout and
   const f=await fixture();try{
     await write(f.file,auth());const owned=join(f.dataDir,'accounts/SAMPLE/workbuddy-session.json');await write(owned,{principal:'SAMPLE_ACCOUNT',accessToken:'SAMPLE_OLDER_TOKEN',refreshToken:'SAMPLE_REFRESH',expiresAtMs:4000000000000});
     f.config.value.accounts.push({id:'SAMPLE',platform:'workbuddy',edition:'cn',label:'SAMPLE existing',enabled:true,inferenceEnabled:false,credentials:{kind:'file',file:owned}});await f.config.save(f.config.value);
-    assert.equal(row(await f.d.scan()).status,'changed');assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.accounts[0].id,'SAMPLE');assert.equal(f.config.value.accounts[0].inferenceEnabled,false);assert.equal(f.catalogs.length,0);
+    assert.equal(row(await f.d.scan()).status,'changed');assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.accounts[0].id,'SAMPLE');assert.equal(f.config.value.accounts[0].inferenceEnabled,false);assert.equal(f.config.value.accounts[0].tasks,undefined,'credential refresh does not silently migrate existing task choices');assert.equal(f.catalogs.length,0);
   }finally{await f.clean();}
 });
 

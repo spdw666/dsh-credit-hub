@@ -294,6 +294,7 @@ export async function loomyStatus(secret, task = 'pet-work', options = {}) {
     reachedTierId: snapshot.reachedTierId,
     tiers: snapshot.tiers.length,
     claimed: snapshot.claimed,
+    active: claimable,
     claimable,
     ...(snapshot.claimed === null ? {claimableReason: 'snapshot_claim_marker_unverified'} : {}),
     day: dayIn(new Date(), 'Asia/Shanghai'),
@@ -310,7 +311,7 @@ export async function loomyStatus(secret, task = 'pet-work', options = {}) {
 export async function loomyClaim(secret, task = 'pet-work', options = {}) {
   if(task==='daily-quota'||task==='daily-checkin')return loomyRefreshDailyQuota(secret,options);
   normalizeTask(task);
-  const before = await loomyStatus(secret, task, options);
+  const before = await loomyStatus(secret, task, options).catch(error => { error.beforeSubmission = true; throw error; });
   if (before.claimed === true) return {...before, submitted: false, alreadyClaimed: true};
   const businessDate = before.businessDate;
   const configVersion = before.configVersion;
@@ -424,7 +425,8 @@ export async function loomyRefreshDailyQuota(secret,options={}) {
     if(dailyQuotaReceipts.size>500)dailyQuotaReceipts.delete(dailyQuotaReceipts.keys().next().value);
   }
   const evidence=dailyQuotaEvidence(secret,options);
-  return {task:'daily-quota',known:true,observed:true,claimed:false,submitted:true,rechecked:true,reason:'server_auto_daily_quota',alreadyProcessed:typeof d.alreadyProcessed==='boolean'?d.alreadyProcessed:null,registerReward:Number.isFinite(d.registerReward)?d.registerReward:null,...evidence,details:{...balance,...evidence},note:'官方登录额度刷新及余额复核；不是宠物打工奖励或人工签到。'};
+  const observed=evidence.dailyQuotaObserved===true;
+  return {task:'daily-quota',known:true,observed,claimed:false,submitted:true,rechecked:observed,reason:observed?'server_auto_daily_quota':'daily_quota_receipt_unverified',alreadyProcessed:typeof d.alreadyProcessed==='boolean'?d.alreadyProcessed:null,registerReward:Number.isFinite(d.registerReward)?d.registerReward:null,...evidence,details:{...balance,...evidence},note:'官方登录额度刷新及余额复核；不是宠物打工奖励或人工签到。'};
 }
 
 export async function loomyPointBalance(secret,options={}){

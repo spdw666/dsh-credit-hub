@@ -453,11 +453,15 @@ export async function lobsterStatus(secret, task = 'daily-checkin', options = {}
     configRevision: slot.present ? slot.activity.configRevision : null,
     lifecycleState: context?.lifecycleState ?? null,
     authenticated: context?.authenticated ?? null,
+    // ClaimService gates the scheduler on `active`, not the UI's `claimable`.
+    // Keep both bound to the current official action, never just slot presence.
+    active: known && isClaimable(context),
     claimable: known && isClaimable(context),
     claimed: context?.state?.claimedToday === true || context?.state?.completed === true,
     claimedToday: context?.state?.claimedToday ?? null,
     claimedDays: context?.state?.claimedDays ?? null,
     rewardCredits: context?.state?.rewardCredits ?? null,
+    credits: context?.state?.rewardCredits ?? null,
     claimedCredits: context?.state?.claimedCredits ?? null,
     actionsOffered: context?.actions ?? [],
     day: dayIn(new Date(), 'Asia/Shanghai'),
@@ -478,16 +482,16 @@ function idempotencyKey(activityCode) {
 export async function lobsterClaimCheckin(secret, task = 'daily-checkin', options = {}) {
   if (task !== 'daily-checkin') throw new AppError('LobsterAI 任务未登记', 400, 'lobster_task_unknown');
   const {fetchImpl} = options;
-  const before = await lobsterStatus(secret, task, options);
+  const before = await lobsterStatus(secret, task, options).catch(error => { error.beforeSubmission = true; throw error; });
   if (!before.known) return {...before, submitted: false, reason: 'activity_absent'};
   if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
   if (!before.claimable) return {...before, submitted: false, reason: before.authenticated === false ? 'login_required' : 'not_claimable'};
   const actionId = 'check_in';
   if (!CHECKIN_ACTION_WHITELIST.has(actionId)) throw new AppError('LobsterAI 动作不在官方白名单内', 400, 'lobster_action_rejected');
   // Fresh slot read for configRevision — never trust a stale caller-supplied revision.
-  const fresh = before.configRevision === null ? await lobsterActivitySlot(secret, options) : null;
+  const fresh = before.configRevision === null ? await lobsterActivitySlot(secret, options).catch(error => { error.beforeSubmission = true; throw error; }) : null;
   const configRevision = before.configRevision ?? fresh?.activity?.configRevision ?? null;
-  if (!Number.isSafeInteger(configRevision)) throw new AppError('LobsterAI 活动版本号未知，拒绝提交', 502, 'lobster_revision_unknown');
+  if (!Number.isSafeInteger(configRevision)) throw Object.assign(new AppError('LobsterAI 活动版本号未知，拒绝提交', 502, 'lobster_revision_unknown'), {beforeSubmission: true});
   const body = {configRevision, idempotencyKey: idempotencyKey(before.activityCode), payload: {}};
   let failure = null;
   try {

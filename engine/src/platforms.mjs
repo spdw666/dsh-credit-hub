@@ -96,6 +96,17 @@ export class Platforms {
   }
   async status(accountId,taskId) {
     const a=this.account(accountId);const credential=await this.credentials.resolve(accountId);
+    try{return await this.taskStatus(a,accountId,taskId,credential);}
+    catch(error){
+      if(error.status!==401)throw error;
+      // Status reads are replayable; claims are not. Renew only this account's
+      // owned credential and read again only when the token actually changed.
+      const newer=await this.credentials.resolve(accountId,{force:true,renew:true});
+      if(newer.accessToken===credential.accessToken)throw error;
+      return this.taskStatus(a,accountId,taskId,newer);
+    }
+  }
+  async taskStatus(a,accountId,taskId,credential) {
     if(desktopProviderKinds.has(a.platform)){const p=await desktopProvider(a.platform);if(typeof p.status!=='function')throw new AppError('该应用未声明每日签到接口',400,'checkin_not_supported');return p.status(credential,taskId,{account:a});}
     if(a.platform==='workbuddy'&&taskId==='daily-checkin') {const s=await this.wb.fetchCheckinStatus(credential);return {known:true,active:s.active,claimed:s.todayCheckedIn,credits:s.todayCredit,details:s};}
     if(a.platform==='trae'&&taskId==='daily-checkin') {

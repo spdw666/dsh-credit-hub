@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4
+
+- Fix LobsterAI scheduled check-in active/credits contract and require a same-day verified Loomy quota receipt.
+- Reconcile CodeArts claim/confirm and Raccoon daily-login rewards using authoritative read-only checks after lost responses or delayed visibility, without replaying grants.
+- Register supported daily tasks for newly discovered accounts; persist explicit scheduler enable across worker recovery and handle Qoder campaign boundaries.
+- Retry only positively classified pre-submission failures; preserve uncertain submission fences across later read failures.
+- Add explicit account deletion with credential-free suppression fingerprints, reference pruning and exclusive owned-credential cleanup; never infer a ban from one authentication failure.
+
+
 ## 0.2.3
 
 - Supervise the worker in the DSH host with bounded readiness waits, startup retries, IPC heartbeats, serial restarts, backoff and crash-storm cooldown.

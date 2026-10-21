@@ -19,12 +19,20 @@ async function fixture(t){
  t.after(async()=>{await hub.close();await rm(base,{recursive:true,force:true,maxRetries:5,retryDelay:50});});await hub.waitUntilReady({timeoutMs:5000});return {hub,dir,profile,native};
 }
 const post=(hub,path,body={})=>hub.request({method:'POST',path,body});
+
+test('explicit automatic schedule activation survives real worker restart on legacy bundle options',async t=>{
+ const f=await fixture(t);await post(f.hub,'/hub/scheduler',{enabled:true,startup:false,hour:23,minute:59,jitterSeconds:0,windows:{}});
+ assert.equal((await f.hub.snapshot()).schedulerRunning,true);await f.hub.close();
+ const restarted=await createHubRuntime({taskRoot:f.dir,engineRoot:join(f.dir,'engine'),nodeExecutable:process.execPath,allowScheduler:false,enableBackgroundOperations:false,hostEnvironment:{HOME:join(f.dir,'home'),USERPROFILE:join(f.dir,'home'),APPDATA:join(f.dir,'appdata'),LOCALAPPDATA:join(f.dir,'local')}});
+ try{const s=await restarted.snapshot();assert.equal(s.schedule.settings.consentVersion,1);assert.equal(s.schedulerRunning,true);
+ await post(restarted,'/hub/scheduler',{enabled:false});assert.equal((await restarted.snapshot()).schedulerRunning,false);}finally{await restarted.close();}
+});
 test('failed settings rename does not activate new runtime event/update settings',async t=>{const {hub,profile}=await fixture(t);await mkdir(join(profile,'hub-settings.json'));await assert.rejects(post(hub,'/hub/operations',{events:{enabled:false},updates:{intervalHours:2}}));const current=(await hub.snapshot()).operations;assert.equal(current.settings.events.enabled,true);assert.equal(current.settings.updates.intervalHours,1);});
 test('real worker exposes discovery, forecast and bounded scheduler; native sources stay unchanged',async t=>{
- const f=await fixture(t),before=await readFile(f.native),first=await f.hub.snapshot();assert.equal(first.pluginVersion,'0.2.3');assert.equal(first.counts.accounts,3);assert.equal(first.operations.forecast.accounts[0].status,'estimated');assert.ok(first.operations.forecast.accounts[0].estimatedHours>0);assert.equal(first.operations.forecast.accounts[0].reservePercent,null);
+ const f=await fixture(t),before=await readFile(f.native),first=await f.hub.snapshot();assert.equal(first.pluginVersion,'0.2.4');assert.equal(first.counts.accounts,3);assert.equal(first.operations.forecast.accounts[0].status,'estimated');assert.ok(first.operations.forecast.accounts[0].estimatedHours>0);assert.equal(first.operations.forecast.accounts[0].reservePercent,null);
  const scan=await post(f.hub,'/hub/discovery',{connect:true});assert.equal(scan.status,200);const after=await f.hub.snapshot();assert.equal(after.counts.accounts,4,JSON.stringify(scan.body));assert.equal(after.counts.enabledRoutes,1);assert.deepEqual(await readFile(f.native),before);
  await post(f.hub,'/hub/discovery',{connect:true});assert.equal((await f.hub.snapshot()).counts.accounts,4);
- const missing=await f.hub.request({path:'/hub/scheduler-status'});assert.equal(missing.body.todayMissing.length,3);const manual=await post(f.hub,'/hub/scheduler/manual',{missingOnly:true});assert.equal(manual.body.results.length,3);assert.equal((await f.hub.request({path:'/hub/scheduler-status'})).body.todayMissing.length,0);const config=JSON.parse(await readFile(join(f.profile,'config.json'),'utf8'));assert.equal(config.scheduler.enabled,false);
+ const missing=await f.hub.request({path:'/hub/scheduler-status'});assert.equal(missing.body.todayMissing.length,4);const manual=await post(f.hub,'/hub/scheduler/manual',{missingOnly:true});assert.equal(manual.body.results.length,4);assert.equal((await f.hub.request({path:'/hub/scheduler-status'})).body.todayMissing.length,0);const config=JSON.parse(await readFile(join(f.profile,'config.json'),'utf8'));assert.equal(config.scheduler.enabled,false);
 });
 test('native delivery persists until actual client acknowledgement; hidden webhook survives partial settings save',async t=>{
  const {hub,profile}=await fixture(t);

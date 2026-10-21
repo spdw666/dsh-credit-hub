@@ -6,6 +6,7 @@ import {join,resolve,relative,dirname,basename,isAbsolute,sep} from 'node:path';
 import {homedir,userInfo} from 'node:os';
 import {pathToFileURL} from 'node:url';
 import {assertInsideRoot} from '../scripts/import-local.mjs';
+import {isRemovedAccount,removeOwnedCredentialAssets} from './account-removal.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
 const json = value => Buffer.from(JSON.stringify(value,null,2)+'\n');
@@ -17,6 +18,19 @@ const editionOf = account => account.edition??({workbuddy:'cn',workbuddyai:'glob
 const regionOf = account => account.region??(account.platform==='minimax'?'cn':'');
 const identityKey = (account,principal) => sha(JSON.stringify([account.platform,editionOf(account),regionOf(account),String(principal)]));
 const compatible = (a,b) => a.platform===b.platform&&editionOf(a)===editionOf(b)&&regionOf(a)===regionOf(b);
+
+/** Only registered entitlement actions become automatic tasks. A new native
+ * login must not silently lose daily check-in simply because it was installed
+ * after this plugin. Existing accounts are never passed through this default:
+ * their task array (including explicit disables/empty arrays) is user-owned. */
+export function defaultDiscoveryTasks(account={}) {
+  let id;
+  if(['workbuddy','workbuddyai','codebuddy','qoder','minimax','codearts','lobster'].includes(account.platform))id='daily-checkin';
+  else if(['qwenwork','loomy','raccoon'].includes(account.platform))id='daily-quota';
+  else if(account.platform==='trae'&&['cn','solo'].includes(editionOf(account)))id='daily-checkin';
+  else if(account.platform==='zcode')id='free-plan-claim';
+  return id?[{id,enabled:true}]:[];
+}
 
 /** Capture this in the parent BEFORE the worker redirects APPDATA/LOCALAPPDATA. */
 export function captureHostEnvironment(env=process.env,{home=homedir(),username=userInfo().username}={}) {
@@ -158,7 +172,7 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     await assertInsideRoot(root,dataDir);
     const final=await assertInsideRoot(root,join(dataDir,'discovered',candidate.id,bundle.fingerprint));
     const stage=await assertInsideRoot(root,join(dataDir,'discovered','.stage-'+randomUUID()));
-    const account={id:'pending-'+candidate.id,platform:candidate.platform,label:candidate.label,enabled:true,inferenceEnabled:true,...(candidate.edition?{edition:candidate.edition}:{}),...(candidate.region?{region:candidate.region}:{}),credentials:{kind:candidate.credentialKind??'desktop',file:join(final,bundle.name),profileDir:final,localState:join(final,'Local State'),autoLaunch:false,cacheFile:join(dataDir,'private-cache','discovery-'+candidate.id+'.json')},tasks:[]};
+    const account={id:'pending-'+candidate.id,platform:candidate.platform,label:candidate.label,enabled:true,inferenceEnabled:true,...(candidate.edition?{edition:candidate.edition}:{}),...(candidate.region?{region:candidate.region}:{}),credentials:{kind:candidate.credentialKind??'desktop',file:join(final,bundle.name),profileDir:final,localState:join(final,'Local State'),autoLaunch:false,cacheFile:join(dataDir,'private-cache','discovery-'+candidate.id+'.json')},tasks:defaultDiscoveryTasks(candidate)};
     // The gateway's owned WorkBuddy format is normalized without launching the
     // native decryptor; RTs remain local and preserve later explicit renewal.
     let workbuddy;
@@ -216,6 +230,14 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     if(!connect)return publishRow(candidate,{status:'installed',installed:true,reason:'connection_not_requested'});
     if(candidate.requiresSetup)return publishRow(candidate,{status:'needs_setup',installed:true,reason:candidate.requiresSetup});
     const bundle=await stableBundle(candidate,found.file,cfg.maxSnapshotBytes);
+    const deleted=()=>publishRow(candidate,{status:'deleted',installed:true,reason:'account_explicitly_deleted'});
+    if((Array.isArray(service.config.value.pluginAccountRemovals)?service.config.value.pluginAccountRemovals:[]).some(row=>(row.sourceFingerprints??[]).includes(bundle.fingerprint)))return deleted();
+    // WB exposes the stable subject outside its encrypted token, so a removed
+    // identity is rejected before a reusable native credential snapshot is made.
+    if(candidate.platform==='workbuddy'){
+      const raw=plain(bundle.bundle[0].data),principal=raw.account?.uid??raw.uid??raw.principal??raw.userId;
+      if(principal!==undefined&&isRemovedAccount(service.config.value,candidate,principal))return deleted();
+    }
     const prior=Object.entries(state.bindings).find(([,b])=>b.candidateId===candidate.id&&b.sourceFingerprint===bundle.fingerprint&&service.config.value.accounts.some(a=>a.id===b.accountId));
     if(prior){const account=service.config.value.accounts.find(a=>a.id===prior[1].accountId),expiry=prior[1].expiresAtMs;
       if(Number.isFinite(expiry)&&expiry<=now()+60000)return publishRow(candidate,{status:'needs_setup',installed:true,accountId:account.id,reason:'credential_expired_or_expiring',sourceFingerprint:bundle.fingerprint});
@@ -223,20 +245,24 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
       return publishRow(candidate,{status:'imported',installed:true,accountId:account.id,upstreamId:prior[1].upstreamId,routeCount:prior[1].routeCount??0,sourceFingerprint:bundle.fingerprint,catalogStatus:prior[1].catalogStatus??'not_requested',...(prior[1].catalogReason?{catalogReason:prior[1].catalogReason}:{})});
     }
     const isolated=await snapshot(candidate,bundle);
-    const credential=await probeCredential(isolated.account,{engineRoot,dataDir:isolated.dataDir,now:now(),offline:true});
+    const credential=await probeCredential(isolated.account,{engineRoot,dataDir:isolated.dataDir,now:now(),offline:true,allowExpired:true});
+    if(isRemovedAccount(service.config.value,isolated.account,credential.principal)){
+      await removeOwnedCredentialAssets(service,isolated.account,{taskRoot:root});return deleted();
+    }
     const expiry=credential.expiresAtMs??null;if(!credential.principal)throw problem('credential_not_logged_in');
     if(Number.isFinite(expiry)&&expiry<=now()+60000)throw problem('credential_expired_or_expiring');
     const existing=await existingAccount(isolated.account,credential.principal,bundle,cache),key=identityKey(isolated.account,credential.principal);
     const accountId=existing?.id??'discovered-'+candidate.platform+'-'+key.slice(0,20),upstreamId=service.config.value.upstreams.find(u=>u.accountId===accountId&&u.kind===candidate.platform)?.id??'discovered-up-'+key.slice(0,20);
     if(epoch!==generation)throw problem('discovery_stopped');await verifyBundle(bundle.bundle);
-    await commit(value=>{
+    try{await commit(value=>{
       if(epoch!==generation)throw problem('discovery_stopped');
+      if(isRemovedAccount(value,isolated.account,credential.principal))throw problem('discovery_account_deleted');
       const current=value.accounts.find(a=>a.id===accountId);
       if(current){current.credentials={...current.credentials,...isolated.account.credentials,cacheFile:current.credentials?.cacheFile??isolated.account.credentials.cacheFile};}
       else value.accounts.push({...isolated.account,id:accountId});
       if(!value.upstreams.some(u=>u.id===upstreamId))value.upstreams.push({id:upstreamId,kind:candidate.platform,accountId,enabled:true,discovered:true});
       return true;
-    });
+    });}catch(error){if(error.code!=='discovery_account_deleted')throw error;await removeOwnedCredentialAssets(service,isolated.account,{taskRoot:root});return deleted();}
     service.credentials?.cache?.delete(accountId);service.platforms?.catalogs?.delete(upstreamId);
     const binding={candidateId:candidate.id,accountId,upstreamId,sourceFingerprint:bundle.fingerprint,expiresAtMs:expiry,importedAt:new Date(now()).toISOString(),catalogStatus:'not_requested'};
     state.bindings[key]=binding;

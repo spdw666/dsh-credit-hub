@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import {stat,readFile} from 'node:fs/promises';
 import {ACCOUNT_EXPORT_PATH,validateAccountExportRequest} from './transfer.mjs';
 
-export const PLUGIN_VERSION='0.2.3';
+export const PLUGIN_VERSION='0.2.4';
 export const MAX_RPC_BYTES=2*1024*1024;
 export const MAX_INPUT_BYTES=4*1024*1024;
 export function hubError(code,message,status=400){return Object.assign(new Error(message),{code,status});}
@@ -76,7 +76,7 @@ export function parseManagementRequest(input){
   if(input.body!==undefined&&Buffer.byteLength(JSON.stringify(input.body))>MAX_INPUT_BYTES)throw hubError('rpc_request_too_large','Management request exceeds the 4 MiB limit',413);
   if(method==='POST'&&url.pathname===ACCOUNT_EXPORT_PATH){if(url.search)throw hubError('invalid_account_export_request','Account export does not accept query parameters');validateAccountExportRequest(input.body);}
   const local=['/hub/snapshot','/hub/accounts','/hub/routes','/hub/audit','/hub/activity','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events','/hub/events/pending','/hub/forecast','/hub/scheduler-status'];
-  if(local.includes(url.pathname)&&method==='GET'||['/hub/accounts','/hub/routes','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events/ack','/hub/events/test','/hub/scheduler/manual'].includes(url.pathname)&&method==='POST')return {method,path,pathname:url.pathname,query:Object.fromEntries(url.searchParams),body:input.body,local:true};
+  if(local.includes(url.pathname)&&method==='GET'||['/hub/accounts','/hub/accounts/remove','/hub/routes','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events/ack','/hub/events/test','/hub/scheduler/manual'].includes(url.pathname)&&method==='POST')return {method,path,pathname:url.pathname,query:Object.fromEntries(url.searchParams),body:input.body,local:true};
   const dynamicGet=/^\/admin\/workbuddy\/(?:accounts\/[a-zA-Z0-9_.-]+\/details|task-jobs\/[a-f0-9-]{36})$/.test(url.pathname);
   const dynamicPost=/^\/admin\/workbuddy\/(?:accounts\/[a-zA-Z0-9_.-]+\/(?:profile|inference|mark-status)|task-jobs\/[a-f0-9-]{36}\/cancel)$/.test(url.pathname);
   if(!(method==='GET'&&(gets.has(url.pathname)||dynamicGet)||method==='POST'&&(posts.has(url.pathname)||dynamicPost)))throw hubError('management_operation_not_allowed','This management operation is not exposed by the plugin',403);

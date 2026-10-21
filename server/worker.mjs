@@ -7,6 +7,9 @@ import {attachRuntimeMemory} from './memory.mjs';
 import {PLUGIN_VERSION,MAX_RPC_BYTES,assertIsolatedConfig,assertCredentialIsolation,boundedPublic,publicAccount,hubError,normalizeOptions,requireWithin,createHandleMaps,translateIds,validateEngineRoot} from './contracts.mjs';
 import {isAccountExportRequest,validateAccountExportRequest,engineAccountExportResponse} from './transfer.mjs';
 import {createHubOperations} from './operations.mjs';
+import {schedulerActivation,shouldStartScheduler} from './scheduler-activation.mjs';
+import {removeHubAccount} from './account-removal.mjs';
+import {probeIsolatedCredential} from './discovery.mjs';
 
 const incoming=JSON.parse(process.argv[2]??'{}');
 const options=normalizeOptions(incoming,incoming.taskRoot);
@@ -28,11 +31,15 @@ function snapshot(){
 }
 async function mutate(operation,body){
   if(!body||typeof body!=='object'||Array.isArray(body))throw hubError('invalid_management_body','An object is required');
+  if(operation==='/hub/accounts/remove'){
+    if(Object.keys(body).some(k=>!['accountId','confirm'].includes(k))||typeof body.accountId!=='string')throw hubError('invalid_account_delete','accountId and confirm are required');
+    return removeHubAccount(service,body.accountId,{confirm:body.confirm,taskRoot:options.taskRoot,resolvePrincipal:account=>probeIsolatedCredential(account,{engineRoot:options.engineRoot,dataDir:service.config.dataDir,allowExpired:true})});
+  }
   const value=structuredClone(service.config.value);
   if(operation==='/hub/scheduler'){
     const allowed=new Set(['enabled','startup','timezone','hour','minute','jitterSeconds','retryMinutes','windows','maxConcurrency','startupSpreadSeconds']);
     if(Object.keys(body).some(k=>!allowed.has(k)))throw hubError('invalid_scheduler_setting','Unknown scheduler setting');
-    Object.assign(value.scheduler,body);await service.config.save(value);
+    value.scheduler=schedulerActivation(value.scheduler,body);await service.config.save(value);
     if(value.scheduler.enabled)service.scheduler.start();else await service.scheduler.stop();
     return {saved:true,settings:service.config.value.scheduler,running:!service.scheduler.stopped};
   }
@@ -126,7 +133,7 @@ try{
   operations=await createHubOperations({service,options,descriptor,hostEnvironment:options.hostEnvironment??{}});assertStarting();
   operations.start();
   // The independent plugin owns its scheduler. Installation remains idle.
-  if(options.allowScheduler&&service.config.value.scheduler.enabled)service.scheduler.start();
+  if(shouldStartScheduler(options,service.config.value.scheduler))service.scheduler.start();
   stopMemory=await attachRuntimeMemory({taskRoot:options.taskRoot,memoryRoot:options.memoryRoot,configFile:options.configFile,summary:()=>{const s=snapshot();return {pluginVersion:PLUGIN_VERSION,coreVersion,counts:s.counts,schedulerRunning:s.schedulerRunning,workerPid:process.pid}}});assertStarting();
   // A shutdown received during asynchronous startup must not advertise a new
   // ready generation or answer a heartbeat after its closing transition.

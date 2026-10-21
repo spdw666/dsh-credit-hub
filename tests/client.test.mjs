@@ -5,9 +5,9 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-async function loadClient() {
+async function loadClient(reactOverrides = {}) {
   const result = await build({ entryPoints: [fileURLToPath(new URL('../client/index.jsx', import.meta.url))], bundle: true, platform: 'browser', format: 'cjs', external: ['react', 'react/jsx-runtime'], write: false });
-  const react = { createElement: (type, props, ...children) => ({ type, props, children }), useCallback: fn => fn, useEffect() {}, useId: () => 'hub-test', useRef: value => ({ current: value }), useState: value => [value, () => {}] };
+  const react = { createElement: (type, props, ...children) => ({ type, props, children }), useCallback: fn => fn, useEffect() {}, useId: () => 'hub-test', useRef: value => ({ current: value }), useState: value => [value, () => {}], ...reactOverrides };
   const module = { exports: {} };
   const styles = [];
   const sandbox = { module, exports: module.exports, require: () => react, document: { createElement: () => ({ dataset: {}, remove() { this.removed = true; } }), head: { append: element => styles.push(element) } }, console, setInterval, clearInterval, Date, Intl };
@@ -37,6 +37,17 @@ test('client sends exact native Connection RPC route and named input', async () 
   assert.equal(calls[1][0], '/api');
   assert.equal(calls[1][1], 'creditHub/request');
   assert.equal(JSON.stringify(calls[1][2]), JSON.stringify({ args: { input } }));
+});
+
+test('account deletion requires the visible confirmation step and posts only the opaque account handle', async () => {
+  const states=[];let cursor=0;const calls=[];
+  const {api}=await loadClient({useState(initial){const i=cursor++;if(!(i in states))states[i]=initial;return [states[i],value=>{states[i]=typeof value==='function'?value(states[i]):value;}];}});
+  const account={id:'account-SAMPLE_HANDLE',label:'SAMPLE Account',platform:'workbuddy'};
+  const render=()=>{cursor=0;return api.Accounts({snapshot:{accounts:[account]},busy:false,perform:async(label,input)=>{calls.push({label,input});return true;}});};
+  const text=node=>Array.isArray(node)?node.map(text).join(''):node&&typeof node==='object'?(node.children??[]).map(text).join(''):node===null||node===undefined||node===false?'':String(node);
+  const find=(node,label)=>{if(Array.isArray(node)){for(const item of node){const hit=find(item,label);if(hit)return hit;}return;}if(!node||typeof node!=='object')return;if(node.props?.onClick&&text(node)===label)return node;return find(node.children??[],label);};
+  let tree=render();find(tree,'删除账号').props.onClick();assert.equal(calls.length,0);tree=render();assert.ok(text(tree).includes('不保留登录凭据'));find(tree,'取消').props.onClick();assert.equal(calls.length,0);
+  tree=render();find(tree,'删除账号').props.onClick();tree=render();await find(tree,'确认删除，不保留登录凭据').props.onClick();assert.deepEqual(JSON.parse(JSON.stringify(calls)),[{label:'删除账号',input:{method:'POST',path:'/hub/accounts/remove',body:{accountId:'account-SAMPLE_HANDLE',confirm:true}}}]);
 });
 
 test('client unwraps both transport and command errors without reporting success', async () => {

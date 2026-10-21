@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前发布版 **0.2.3**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.2.4**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -20,7 +20,7 @@ dsh plugin add https://github.com/spdw666/dsh-credit-hub/releases/latest/downloa
 dsh plugin add github:spdw666/dsh-credit-hub
 ```
 
-市场条目使用同一稳定 tarball 地址。市场收录须经维护方 PR 审核；仓库有 Release 不等于已经收录。
+本项目已被插件市场收录，市场条目使用同一稳定 tarball 地址。完整稳定 Release 更新该地址的新安装／显式重装目标；GitHub 提交、Release 资产、市场原生更新徽标与实际安装升级分别核验。
 
 ### 运行条件
 
@@ -39,7 +39,7 @@ dsh plugin add github:spdw666/dsh-credit-hub
 
 ### 后装 Agent 自动发现
 
-默认每 60 秒检查受支持客户端的已知登录位置。可解析的已登录格式会复制到插件独立目录，识别身份，建立账号/上游，再获取实际模型目录；新路由默认启用，可在账户页关闭。原客户端只读，既有账号开关与路由保持。同一身份更新、不同身份新增，新账号不擅自增加签到任务。
+默认每 60 秒检查受支持客户端的已知登录位置。可解析的已登录格式会复制到插件独立目录，识别身份，建立账号/上游，再获取实际模型目录；新路由默认启用，可在账户页关闭。原客户端只读，既有账号开关与路由保持。同一身份更新、不同身份新增。新账号自动登记已核实的签到/每日额度任务，只有用户启用全局排程后才执行；既有账号的任务与禁用选择不覆盖。
 
 候选包含 WorkBuddy、Trae、千问办公、ZCode、MiniMax、Qoder、CodeBuddy、CodeArts、Cline、LobsterAI、Loomy、小浣熊和 OpenCode 的已知版本路径。未安装、未登录、需要独立配置、已接入及目录失败分开呈现。加密 WorkBuddy、Qoder 原生身份、MiniMax lease、OpenCode 独立服务等条件未满足时不会伪装成已接通。SQLite/WAL 与 Trae 身份元数据纳入内容校验。
 
@@ -50,11 +50,28 @@ dsh plugin add github:spdw666/dsh-credit-hub
 - 模型目录、账号快照接入和真实调用成功分别记录。
 - 接力保留完整 messages、tools、tool IDs/results 与输出预算，不为回退裁剪上下文。
 
+### 显式删除与防重新导入
+
+账号页提供确认删除。删除插件内账号、上游与路由引用，清理独占的插件自有凭据，不为这次删除新建含凭据的恢复备份。共享文件和原客户端目录保持不动；清理结果如有保留项会明确返回。
+
+插件仅保留不含 token 的删除指纹，后台发现重复扫描或重启后不会自动重新导入同一已删除主体；客户端换成另一主体仍能接入。401／403 等认证错误不会自动认定封禁或自动删号。删除仅影响本插件，不修改独立 AI 积分网关项目。
+
 ### 错峰签到
 
-每平台配置时间窗口、窗口内持久随机预约、启动补跑分散与全局并发上限。启动仅自动补跑当天从未尝试项；失败、未确认和运行中项不因重启重放。自动/手动共享有界队列，同账号串行，支持“今日未签到”、单个/已选/全部补签。跨午夜及 DST 按真实时区时刻处理。
+每平台配置时间窗口、窗口内持久随机预约、启动补跑分散与全局并发上限。当天从未尝试项可以补跑；明确尚未提交的临时网络/限流失败按 retryMinutes 与官方退避提示重试。未确认、运行中与缺乏阶段证据的旧失败不因重启重放。Qoder 按官方 10:00 活动边界登记新窗口。自动/手动共享有界队列，同账号串行，支持“今日未签到”、单个/已选/全部补签。跨午夜及 DST 按真实时区时刻处理。
 
-**自动签到默认关闭**。后台发现和版本检查不等于签到；启用排程、手动补签和任务执行是不同操作。
+**新安装自动签到默认关闭**。用户在设置中启用排程后，启用选择持久化，后台自恢复或 DSH 下次启动继续执行；关闭排程仍立即生效。后台发现和版本检查不等于签到；启用排程、手动补签和任务执行是不同操作。
+
+| 平台 | 自动任务与验收依据 |
+| --- | --- |
+| WorkBuddy / CodeBuddy / Qoder / 国内 Trae / MiniMax / CodeArts / LobsterAI | 官方活动状态 → 领取 → 再查官方已领取状态；活动未开放与登录失效单独提示 |
+| Loomy | 每日 first-login 额度刷新，与同日日期、每日额度和余额交叉核验；不是宠物打工奖励 |
+| 商汤小浣熊 | 登录奖励触发后核验当日官方积分账单；保留 observed 语义，不把已有余额算作新赚积分 |
+| 千问办公 | 查询官方每日自动额度，不伪造主动签到 |
+| ZCode | 仅官方当前提供的免费套餐领取，可能有交互验证；不是每天固定发放 |
+| BigModel / Antigravity / NVIDIA / FreeAPI / Cline / OpenCode / 国际 Trae | 当前没有已核实的每日签到适配，不生成虚假成功记录 |
+
+CodeArts 领取与确认分阶段处理；领取响应丢失后仅核查官方状态，已 CLAIMED 时只补确认。CodeArts 与小浣熊追加有界只读后验，不因返回延迟重复领取。LobsterAI 使用官方活动提供的 check_in 动作与实时活动版本。领取前发现登录失效时保留 action_required 提示，并按 retryMinutes 间隔重新核验登录态；客户端重新登录被发现后，后续核验可恢复正常执行。领取后出现不明结果则保持 uncertain，不进入该重试路径。
 
 ### 事件 → 通知出口
 

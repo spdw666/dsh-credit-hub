@@ -10,6 +10,7 @@ import {AppError, redact, hash, rememberSecret, dayIn} from './util.mjs';
 import {stat, readFile, mkdir, open, writeFile, rename, unlink} from 'node:fs/promises';
 import {createDecipheriv, randomBytes} from 'node:crypto';
 import {dpapiUnprotect as defaultDpapi} from './windows-crypto.mjs';
+import {setTimeout as wait} from 'node:timers/promises';
 
 export const RACCOON_ORIGIN = 'https://xiaohuanxiong.com';
 const PATH_PREFIX = '/api/web/';
@@ -19,8 +20,10 @@ export const descriptor = Object.freeze({
   id: 'raccoon',
   name: '商汤小浣熊 (SenseTime Raccoon)',
   authKind: 'native_bearer_token',
-  checkinSupported: false, // no official check-in/sign-in surface found in the shipped app
+  checkinSupported: false, // no separate sign-in endpoint; daily login benefit uses daily-quota
   claimSupported: false,
+  dailyQuotaSupported: true,
+  dailyQuotaTask: 'daily-quota',
   underlyingProvider: 'xiaohuanxiong.com LLM gateway (v2, OpenAI-shaped) on SenseTime stack',
   billing: 'official_account',
   byok: false,
@@ -321,14 +324,24 @@ export async function raccoonStatus(secret, task = 'daily-checkin', options={}) 
   return {known: false, task, claimable: false, claimed: null, supported: false, reason: 'no_checkin_surface_found', evidence: descriptor.sourceUrls};
 }
 
-/** Contract `claim`: honest unsupported description (no fake success). */
+/** Daily login benefits require a dated bill; legacy daily-checkin remains distinct. */
 export async function raccoonClaim(secret,task='daily-checkin',options={}) {
   if(task==='daily-quota'){
    const before=await raccoonDailyStatus(secret,options);if(before.observed)return {...before,submitted:false,credit:0};
-   const grant=await raccoonJson(secret,'/api/web/desktop/v1/login/points/grant',{...options,method:'POST',headers:{'X-Client-Platform':'desktop-windows'}});
-   const after=await raccoonDailyStatus(secret,options);
+   let grant=null,submissionFailure=null;
+   try { grant=await raccoonJson(secret,'/api/web/desktop/v1/login/points/grant',{...options,method:'POST',headers:{'X-Client-Platform':'desktop-windows'}}); }
+   catch(error){ submissionFailure=error; }
+   // A login grant may commit even when its HTTP response is lost. Only the dated
+   // official bill settles this operation; the POST is never replayed here.
+   let after=await raccoonDailyStatus(secret,options);
+   for(const milliseconds of [100,300]){
+    if(after.observed)break;
+    await wait(milliseconds,undefined,{signal:options.signal});
+    after=await raccoonDailyStatus(secret,options);
+   }
+   if(!after.observed&&submissionFailure)throw submissionFailure;
    if(!after.observed)throw new AppError('小浣熊每日额度与登录延期尚未获账单确认',502,'raccoon_daily_unconfirmed');
-   return {...after,claimed:false,submitted:true,credit:0,rechecked:true,desktopRewardGranted:grant.granted===true,desktopRewardPoints:Number.isFinite(grant.popup?.points)?grant.popup.points:null};
+   return {...after,claimed:false,submitted:true,credit:0,rechecked:true,desktopRewardGranted:grant?.granted===true,desktopRewardPoints:Number.isFinite(grant?.popup?.points)?grant.popup.points:null,...(submissionFailure?{submissionResponseLost:true}:{})};
   }
   return {
     supported: false,

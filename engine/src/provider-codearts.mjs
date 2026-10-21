@@ -4,6 +4,7 @@ import {readFile,writeFile,mkdir,rename,open,unlink} from 'node:fs/promises';
 import {createHash,createHmac,createDecipheriv,createPrivateKey,sign,randomBytes} from 'node:crypto';
 import {dpapiUnprotect} from './windows-crypto.mjs';
 import {redact,rememberSecret,AppError,dayIn} from './util.mjs';
+import {setTimeout as wait} from 'node:timers/promises';
 
 // Huawei Cloud CodeArts Agent (码道) adapter, now with the real IAM request signing.
 //
@@ -535,16 +536,40 @@ export async function codeartsClaim(credential, task = 'daily-checkin', options 
   if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
   if (!before.claimable && !before.pendingConfirmation) return {...before, submitted: false, reason: 'not_claimable'};
   const body = {campaignId: DAILY_CAMPAIGN_ID, idempotentKey: `claim_${DAILY_CAMPAIGN_ID}_${Date.now()}`, channel: OPS_CHANNEL};
-  if(!before.pendingConfirmation)await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options});
+  let claimFailure = null;
+  if(!before.pendingConfirmation){
+    try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options}); }
+    catch(error){ claimFailure=error; }
+  }
+  // A disconnected response can still have committed the claim. Inspect delivery before
+  // deciding what failed; never issue a second claim to recover a missing acknowledgement.
+  if(claimFailure){
+    const observed=await codeartsCheckinRecheck(credential,task,options,state=>state.claimed||state.pendingConfirmation);
+    if(observed.claimed)return {...observed,submitted:true,confirmed:true,rechecked:true,submissionResponseLost:true};
+    if(!observed.pendingConfirmation)throw claimFailure;
+  }
   // claim alone is not a receipt: the upstream has a CLAIMED (claimed-but-unconfirmed) state,
   // and only /v1/ops/confirm pushes it to CONFIRMED.
   let confirmed = false;
   try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/confirm', body: {campaignId: DAILY_CAMPAIGN_ID}, ...options}); confirmed = true; }
   catch { confirmed = false; }
-  const after = await codeartsStatus(credential, task, options);
+  const after = await codeartsCheckinRecheck(credential,task,options,state=>state.claimed);
   const settled = after.status === 'CONFIRMED' || after.status === 'CONSUMED';
   if (!settled) throw new AppError('CodeArts 领取结果尚未得到服务端确认', 502, 'codearts_claim_unconfirmed');
-  return {...after, submitted: true, confirmed:confirmed && after.confirmed === true, rechecked: true};
+  return {...after, submitted: true, confirmed:after.confirmed === true, rechecked: true,
+    ...(claimFailure?{submissionResponseLost:true}:{}),...(!confirmed?{confirmationResponseLost:true}:{})};
+}
+
+// Official delivery may lag a successful write. Retries are bounded and read-only:
+// neither a claim nor a confirm is replayed by this helper.
+async function codeartsCheckinRecheck(credential,task,options,done){
+  let state=await codeartsStatus(credential,task,options);
+  for(const milliseconds of [100,300]){
+    if(done(state))break;
+    await wait(milliseconds,undefined,{signal:options.signal});
+    state=await codeartsStatus(credential,task,options);
+  }
+  return state;
 }
 
 /** Contract `health`: live identity + real credit balance + real campaign state (all read-only). */
