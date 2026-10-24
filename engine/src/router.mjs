@@ -163,11 +163,14 @@ export class Router {
         completed=true;requestCompleted=true;
         return;
       }catch(e){
+        // A persisted ZCode activity gate returns before fetch. Retract exactly
+        // this candidate's provisional send, never an earlier transport attempt.
+        if(e.code==='zcode_upstream_blocked'&&e.upstreamRequestSent===false&&usage.retractUnsentDispatch())plan.retractUnsentDispatch();
         if(signal?.aborted)e=interrupted(signal);else if(targetExpired)e=timeoutError;failure=e;last=e;
         skipped=relayActive&&!usage.row.dispatched&&['relay_capacity_incompatible','relay_context_incompatible','tools_not_supported','images_not_supported','reasoning_effort_not_supported','reasoning_parameter_not_supported','wb_inference_disabled'].includes(e.code);
         if(skipped)usage.row.candidatePlan={...usage.row.candidatePlan,state:'skipped',reasonCode:e.code};
         plan.failure(e,target,{skipped});
-        const depleted=!blockedByCircuit&&!signal?.aborted&&!isContextWindowError(e)&&this.pool.exhausted(route,target,e),poolModelAbsent=route.accountPool?.enabled&&e.code==='model_not_found',relayReason=signal?.aborted?null:blockedByCircuit?(e.status===429?'rate_limited':null):this.relay.failure(route,target,e,{source});
+        const depleted=!blockedByCircuit&&!signal?.aborted&&!isContextWindowError(e)&&this.pool.exhausted(route,target,e),poolModelAbsent=route.accountPool?.enabled&&e.code==='model_not_found',relayReason=signal?.aborted||e.code==='zcode_upstream_blocked'?null:blockedByCircuit?(e.status===429?'rate_limited':null):this.relay.failure(route,target,e,{source});
         if(relayReason&&relayReason!=='capability_unavailable'){lastSupplierFailure=e;firstSupplierFailure??=e;}
         if(relayReason==='rate_limited')rememberRateLimit(target);
         if(!started&&!signal?.aborted&&i===targets.length-1&&['rate_limited','capability_unavailable'].includes(relayReason)&&rateBlocked.size){
@@ -202,7 +205,7 @@ export class Router {
         // Internal candidate incompatibility is a local eligibility skip, not a
         // malformed caller request. No target may rewrite the submitted budget.
         if(!started&&!signal?.aborted&&i===targets.length-1&&relayReason==='capability_unavailable'&&skipped)throw new AppError('当前同型号供应均未确认支持本次完整请求；历史、工具和输出预算均已保留',503,'same_model_unavailable');
-        if(started||signal?.aborted||i===targets.length-1||(!relayReason&&!depleted&&!poolModelAbsent&&e.code!=='wb_inference_disabled'&&!(route.fallbackStatuses??[408,429,500,502,503,504]).includes(e.status??502)))throw e;
+        if(e.code==='zcode_upstream_blocked'||started||signal?.aborted||i===targets.length-1||(!relayReason&&!depleted&&!poolModelAbsent&&e.code!=='wb_inference_disabled'&&!(route.fallbackStatuses??[408,429,500,502,503,504]).includes(e.status??502)))throw e;
         previousTarget=target;relayTrigger=relayReason??'upstream_unavailable';
       }
       finally{clearTimeout(targetTimer);if(response?.body&&!response.body.locked)await response.body.cancel().catch(()=>{});usage.row.requestOutcome=plan.summary(completed?'completed':'ongoing');usage.finish(completed?'completed':skipped?'skipped':signal?.aborted&&signal.reason?.name!=='TimeoutError'||!failure?'cancelled':'failed',failure);}

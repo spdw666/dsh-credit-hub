@@ -18,6 +18,7 @@ import {restoreLoomyDailyQuota} from './daily-quota-receipt.mjs';
 import {qwenWorkContext} from './qwenwork.mjs';
 import {zcodePreview,zcodeStatus,zcodeClaim} from './zcode.mjs';
 import {miniMaxStatus,miniMaxClaim,miniMaxMembership} from './minimax.mjs';
+import {join} from 'node:path';
 export class Platforms {
   constructor(config,credentials){this.config=config;this.credentials=credentials;this.wb=new WorkBuddyUpstreamClient();this.quotaCache=new Map();this.catalogs=new Map();this.catalogFlights=new Map();this.trae=new Map();}
   account(id){return this.credentials.account(id);}
@@ -164,7 +165,7 @@ export class Platforms {
     if(u.kind==='antigravity')return antigravityChat(u,await this.credentials.resolve(u.accountId),input,signal,this.config);
     if(u.kind==='nvidia'){const credential=await this.credentials.resolve(u.accountId);try{const result=await controlledNvidiaChat(u,credential,input,signal,nvidiaChat);nvidiaAuthState(this.credentials.ledger,u.accountId,credential,'authenticated');return result;}catch(e){if(e.code==='nvidia_auth_failed')nvidiaAuthState(this.credentials.ledger,u.accountId,credential,'rejected');throw e;}}
     if(u.kind==='bigmodel')return bigModelChat(await this.credentials.resolve(u.accountId),input,signal);
-    if(u.kind==='zcode')return zcodeChat(await this.credentials.resolve(u.accountId),input,signal,this.credentials.ledger);
+    if(u.kind==='zcode')return zcodeChat(await this.credentials.resolve(u.accountId),input,signal,this.credentials.ledger,{runtimeFile:this.config.dataDir?join(this.config.dataDir,'zcode-standard-proxy','runtime.json'):undefined});
     if(u.kind==='qwenwork')return qwenWorkChat(await this.credentials.resolve(u.accountId),input,signal);
     if(u.kind==='minimax'){const models=await this.models(u.id);return miniMaxChat(await this.credentials.resolve(u.accountId),input,models.find(m=>m.id===target.model),signal);}
     throw new AppError(`${u.kind}: chat protocol awaits verification`,501,'platform_protocol_pending');

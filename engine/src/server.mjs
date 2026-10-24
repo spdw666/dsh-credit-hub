@@ -16,7 +16,7 @@ import {startWorkBuddyLogin,pollWorkBuddyLogin,cancelWorkBuddyLogin} from './wor
 import {projectRoot} from './config.mjs';
 import {workBuddyRotationStatus,saveWorkBuddyRotation,evaluateWorkBuddyRotation} from './workbuddy-rotation.mjs';
 import {previewWorkBuddyImport,importWorkBuddyAccounts,exportWorkBuddyAccounts,updateWorkBuddyAccount} from './workbuddy-transfer.mjs';
-import {AppError,errorView} from './util.mjs';
+import {AppError,errorView,zcodeFailureMetadata} from './util.mjs';
 import {collectChat,validateChat} from './openai.mjs';
 import {buildActivityContext} from './activity-context.mjs';
 import {relayPolicy,validateRelay} from './model-relay.mjs';
@@ -177,7 +177,7 @@ export async function startServer(service,{host,port,key,adminKey,admin=true,onS
         }catch(e){if(controller.signal.aborted&&controller.signal.reason?.name==='TimeoutError')throw new AppError('Gateway request deadline exceeded',504,'request_timeout');throw e;}finally{clearTimeout(timeout);controllers.delete(controller);res.off('close',disconnect);}
       }
       throw new AppError('Endpoint not found',404,'not_found');
-    }catch(e){const error=errorView(e),retry=[429,503,504].includes(error.status)&&Number.isFinite(e.retryAfterSeconds)&&e.retryAfterSeconds>=0&&e.retryAfterSeconds<=86400?{retryAfterSeconds:e.retryAfterSeconds}:{};const metadata=rateLimitMetadata(e);if(![429,503,504].includes(error.status)){delete metadata.retryAfterSeconds;delete metadata.retryAfterSource;}const payload={message:error.message,type:error.code,code:error.code,...retry,...metadata,...gatewayFailureContract(e,requestContext),...(Number.isInteger(e.upstreamStatus)&&e.upstreamStatus>=400&&e.upstreamStatus<=599?{upstreamStatus:e.upstreamStatus}:{})};if(res.destroyed)return;if(requestContext&&!res.headersSent){res.setHeader('X-AI-Credit-Retry-Owner','gateway');res.setHeader('X-Should-Retry','false');}if(res.headersSent){res.end(`event: error\ndata: ${JSON.stringify({error:payload})}\n\n`);}else {if(retry.retryAfterSeconds!==undefined)res.setHeader('Retry-After',String(Math.ceil(retry.retryAfterSeconds)));json(res,error.status,{error:payload});}}
+    }catch(e){const error=errorView(e),retry=[429,503,504].includes(error.status)&&Number.isFinite(e.retryAfterSeconds)&&e.retryAfterSeconds>=0&&e.retryAfterSeconds<=86400?{retryAfterSeconds:e.retryAfterSeconds}:{};const metadata=rateLimitMetadata(e);if(![429,503,504].includes(error.status)){delete metadata.retryAfterSeconds;delete metadata.retryAfterSource;}const payload={message:error.message,type:error.code,code:error.code,...retry,...metadata,...zcodeFailureMetadata(e),...gatewayFailureContract(e,requestContext),...(Number.isInteger(e.upstreamStatus)&&e.upstreamStatus>=400&&e.upstreamStatus<=599?{upstreamStatus:e.upstreamStatus}:{})};if(res.destroyed)return;if(requestContext&&!res.headersSent){res.setHeader('X-AI-Credit-Retry-Owner','gateway');res.setHeader('X-Should-Retry','false');}if(res.headersSent){res.end(`event: error\ndata: ${JSON.stringify({error:payload})}\n\n`);}else {if(retry.retryAfterSeconds!==undefined)res.setHeader('Retry-After',String(Math.ceil(retry.retryAfterSeconds)));json(res,error.status,{error:payload});}}
   });
   server.headersTimeout=15000;server.requestTimeout=30000;server.keepAliveTimeout=5000;
   await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,host,()=>{server.off('error',reject);resolve()})});

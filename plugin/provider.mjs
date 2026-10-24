@@ -47,7 +47,14 @@ export function createCreditHubAdapter({hub,models=[],resolveAttachments,minimum
     // A prepared PiAiAdapter call owns an immutable collection. In particular,
     // never pair its old loopback address with a key from a replacement worker.
     const raw=current.map(m=>({id:m.id,name:m.name??m.id,api:'openai-completions',provider:providerId,baseUrl:worker.baseUrl+'/v1',headers:{...attributionHeaders(),'X-AI-Credit-Source':'dsh'},input:m.capabilities?.multimodal?['text','image']:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:m.contextWindow??32768,maxTokens:m.maxTokens??4096,...thinkingMetadata(m)}));
-    const profile={provider:providerId,displayName:'积分中枢',...gatewayRequestPolicy(worker,current),retryPolicy:resolveRetryPolicy({mode:'normal',maxRetries:1},'credit-hub retry policy'),modelErrors:new Map(),defaultContextWindow:32768,maxRequestImageBytes:20971520,requestImagePixelBudget:4194304,requestImageMaxBytes:1048576,piProvider:{...base,getModels:()=>raw}};
+    const requestPolicy=gatewayRequestPolicy(worker,current);
+    // PiAiAdapter describes a request default only from configuredMaxTokens;
+    // raw.maxTokens is a capability ceiling, not an inferred request default.
+    // Retain only catalog-declared defaults, bounded by the model's real cap.
+    // Explicit deployment defaults above keep priority; caller options stay intact.
+    for(const m of current)if(!requestPolicy.configuredMaxTokens.has(m.id)&&Number.isSafeInteger(m.defaultMaxTokens)&&m.defaultMaxTokens>0&&Number.isSafeInteger(m.maxTokens)&&m.maxTokens>0)
+      requestPolicy.configuredMaxTokens.set(m.id,Math.min(m.defaultMaxTokens,m.maxTokens));
+    const profile={provider:providerId,displayName:'积分中枢',...requestPolicy,retryPolicy:resolveRetryPolicy({mode:'normal',maxRetries:1},'credit-hub retry policy'),modelErrors:new Map(),defaultContextWindow:32768,maxRequestImageBytes:20971520,requestImagePixelBudget:4194304,requestImageMaxBytes:1048576,piProvider:{...base,getModels:()=>raw}};
     profileWorkers.set(profile,worker);
     profiles=new Map([[providerId,profile]]);
   };

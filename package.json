@@ -1,6 +1,6 @@
 {
   "name": "dsh-credit-hub",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "DSH 原生多平台账号、模型路由、签到任务与请求记录管理插件",
   "type": "module",
   "license": "MIT",
@@ -51,7 +51,9 @@
     "engine/bundle",
     "release.json",
     "CHANGELOG.md",
-    "docs/screenshots"
+    "docs/screenshots",
+    "integrations/zcode-standard-proxy",
+    "docs/zcode.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

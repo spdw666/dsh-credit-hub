@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.2.4**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.2.5**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -141,3 +141,11 @@ npm run verify
 独立包名 `dsh-credit-hub`，并非覆盖原项目。引擎派生自 [spdw666/multi-agent-checkin-dsh](https://github.com/spdw666/multi-agent-checkin-dsh) 0.6.0 的 MIT 核心；原生 UI、隔离 worker、发现/通知/预测/调度与兼容集成为本项目实现。保留原许可证和第三方归属，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、`engine/THIRD_PARTY_NOTICES.md` 与 vendor 许可证。
 
 MIT. See [LICENSE](LICENSE).
+
+### ZCode 全权益模型标准代理
+
+0.2.5 将 ZCode 模型转发接入固定版本的标准 OpenAI 代理链，按当前账号官方权益目录导入，而不是把参考兼容表当成可用模型。2026-10-24 核验目录为 `glm-5.3` 与 `glm-5.3-flash`；两者元数据为 1M 上下文、128000 输出、low/high/max 强制思考。原始消息、完整工具定义与工具结果均保留。
+
+ZCode 需另有 Bun、Git 和当前原生登录态；运行层安装在插件私有 dataDir，不复用其他网关的进程、key 或数据。完整安装与诊断见 [ZCode 说明](docs/zcode.md)。固定第三方运行层采用 CC-BY-NC-SA-4.0，完整许可与修改说明见 `integrations/zcode-standard-proxy/`，不纳入本项目 MIT 许可。
+
+官方 3012 与本地冷却分开标记，本地拦截不计为已请求官方；不自动重发或换供应。升级保留现有账号、删除指纹、路由开关及 DSH 默认模型。

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.5
+
+- Route all live-entitled ZCode model IDs through the pinned standard OpenAI proxy, without Flash-only branching or trimming messages/tools/budgets.
+- Add isolated Bun runtime installer, authenticated loopback bridge, singleflight cold-start and complete third-party license attribution.
+- Declare verified 1M/128K and always-on low/high/max reasoning metadata only for the exact GLM-5.3 and GLM-5.3-Flash IDs; preserve explicit deployment/caller defaults.
+- Separate fresh official 3012 rejections from unsent local cooldown gates in HTTP/SSE diagnostics and dispatch accounting; never automatically replay or change providers.
+
+
 ## 0.2.4
 
 - Fix LobsterAI scheduled check-in active/credits contract and require a same-day verified Loomy quota receipt.
