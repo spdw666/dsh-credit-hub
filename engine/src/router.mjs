@@ -10,6 +10,23 @@ import {adaptRelayReasoning} from './relay-reasoning.mjs';
 import {gatewayRequestTimeout} from './request-timeouts.mjs';
 import {RequestPlan,outputCapacity,supplierTerminal} from './request-plan.mjs';
 const interrupted=signal=>new AppError(signal?.reason?.name==='TimeoutError'?'Gateway request deadline exceeded':'Request cancelled',signal?.reason?.name==='TimeoutError'?504:499,signal?.reason?.name==='TimeoutError'?'request_timeout':'request_cancelled');
+const positiveTokens=value=>Number.isSafeInteger(value)&&value>0;
+const sourceLabel=value=>typeof value==='string'&&/^[a-zA-Z0-9_.:-]{1,120}$/.test(value)?value:undefined;
+function sourceUrl(value){try{const url=new URL(value);return typeof value==='string'&&value.length<=2048&&url.protocol==='https:'&&!url.username&&!url.password&&!url.search&&!url.hash?value:undefined;}catch{return undefined;}}
+function declaredCatalogMetadata(model,maxTokens){
+  const result={};
+  // A ceiling is not a request default. Only a separate, positive declaration
+  // may reach PiAiAdapter.configuredMaxTokens, bounded by the published ceiling.
+  if(positiveTokens(model.defaultMaxTokens)&&positiveTokens(maxTokens)){
+    result.defaultMaxTokens=Math.min(model.defaultMaxTokens,maxTokens);
+    const source=sourceLabel(model.defaultMaxTokensSource);if(source)result.defaultMaxTokensSource=source;
+  }
+  if(positiveTokens(model.officialMaxTokens))result.officialMaxTokens=model.officialMaxTokens;
+  for(const key of ['contextWindowSource','maxTokensSource']){const source=sourceLabel(model[key]);if(source)result[key]=source;}
+  if(Array.isArray(model.metadataSources)){const sources=model.metadataSources.slice(0,8).map(sourceUrl).filter(Boolean);if(sources.length)result.metadataSources=sources;}
+  const reasoningSource=sourceUrl(model.reasoningSource);if(reasoningSource)result.reasoningSource=reasoningSource;
+  return result;
+}
 export class Router {
   constructor(config,platforms,{ledger,relayAttemptTimeoutMs=30000,catalogTimeoutMs=20000,relayNetworkRetryDelayMs=250,relayPrefillTimeoutMs=240000,relayRateLimitDelay=(ms,signal)=>sleep(ms,undefined,{signal})}={}){if(!Number.isSafeInteger(relayAttemptTimeoutMs)||relayAttemptTimeoutMs<1||relayAttemptTimeoutMs>600000||!Number.isSafeInteger(catalogTimeoutMs)||catalogTimeoutMs<1||catalogTimeoutMs>60000)throw new TypeError('Relay and catalog deadlines must be positive bounded integers');if(!Number.isSafeInteger(relayNetworkRetryDelayMs)||relayNetworkRetryDelayMs<0||relayNetworkRetryDelayMs>5000)throw new TypeError('Network retry delay must be bounded');if(!Number.isSafeInteger(relayPrefillTimeoutMs)||relayPrefillTimeoutMs<1||relayPrefillTimeoutMs>600000)throw new TypeError('Prefill deadline must be bounded');if(typeof relayRateLimitDelay!=='function')throw new TypeError('Rate-limit delay must be a function');Object.assign(this,{config,platforms,ledger,relayAttemptTimeoutMs,catalogTimeoutMs,relayNetworkRetryDelayMs,relayPrefillTimeoutMs,relayRateLimitDelay});this.catalogFlights=new Map();this.pool=new WorkBuddyPool(config,ledger);this.relay=new ModelRelay(config,platforms,ledger);this.relay.pool=this.pool;this.relay.catalogRead=(id,options)=>this.catalog(id,options);}
   async catalog(id,{signal}={}){
@@ -43,7 +60,7 @@ export class Router {
     const maxTokens=outputCapacity(primary)??primary.maxTokens??4096;
     if(kind==='nvidia'&&(primary.importable===false||!Number.isInteger(primary.contextWindow)||primary.contextWindow<1||!Number.isInteger(primary.maxTokens)||primary.maxTokens<1))return undefined;
     const efforts=primary.reasoningEfforts??(Array.isArray(primary.reasoning?.supportedEfforts)?Object.fromEntries(primary.reasoning.supportedEfforts.map(k=>[k,k])):null);
-    return {id:route.id,object:'model',created:0,owned_by:'ai-credit-gateway',name:route.name??primary.name??route.id,upstream:targets[selected].upstreamId,...(kind==='nvidia'?{requestTimeoutMs:nvidiaRequestTimeout(primary.id)}:{}),capabilities:{streaming:true,tools:primary.tools===true,multimodal:primary.multimodal===true},contextWindow,maxTokens,...(relay?{modelRelay:{strictSameModel:true,partition:this.relay.partition(route),modelFamily:discovered.family,targetCount:metadata.filter(m=>m&&m.callable!==false&&(!primary.tools||m.tools===true)&&(!primary.multimodal||m.multimodal===true)).length,fullWindowCompatibleCount:compatible.length,deliveryMode:'verified_request_buffer',attemptTimeoutMs:this.relayAttemptTimeoutMs,attemptTimeoutMode:'prefill_then_progress_idle',prefillTimeoutMs:this.relayPrefillTimeoutMs,prefillMinRequestBytes:131072,requestTimeoutMs:gatewayRequestTimeout(this.config.value.server,route.id)}}:{}),reasoning:primary.reasoning??null,reasoningEfforts:efforts??null,...(primary.reasoningEffortMapping?{reasoningEffortMapping:primary.reasoningEffortMapping,reasoningMappingSource:primary.reasoningMappingSource}:{})};
+    return {id:route.id,object:'model',created:0,owned_by:'ai-credit-gateway',name:route.name??primary.name??route.id,upstream:targets[selected].upstreamId,...(kind==='nvidia'?{requestTimeoutMs:nvidiaRequestTimeout(primary.id)}:{}),capabilities:{streaming:true,tools:primary.tools===true,multimodal:primary.multimodal===true},contextWindow,maxTokens,...declaredCatalogMetadata(primary,maxTokens),...(relay?{modelRelay:{strictSameModel:true,partition:this.relay.partition(route),modelFamily:discovered.family,targetCount:metadata.filter(m=>m&&m.callable!==false&&(!primary.tools||m.tools===true)&&(!primary.multimodal||m.multimodal===true)).length,fullWindowCompatibleCount:compatible.length,deliveryMode:'verified_request_buffer',attemptTimeoutMs:this.relayAttemptTimeoutMs,attemptTimeoutMode:'prefill_then_progress_idle',prefillTimeoutMs:this.relayPrefillTimeoutMs,prefillMinRequestBytes:131072,requestTimeoutMs:gatewayRequestTimeout(this.config.value.server,route.id)}}:{}),reasoning:primary.reasoning??null,reasoningEfforts:efforts??null,...(primary.reasoningEffortMapping?{reasoningEffortMapping:primary.reasoningEffortMapping,reasoningMappingSource:primary.reasoningMappingSource}:{})};
   }
   async models(){if(typeof this.config.load==='function')await this.config.load();const rows=await Promise.all(this.config.value.routes.filter(r=>r.enabled!==false).map(r=>this.routeInfo(r)));return {object:'list',data:rows.filter(Boolean)};}
   async * chat(raw,signal,{onTarget,source='api',requestId:providedRequestId}={}) {

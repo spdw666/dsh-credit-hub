@@ -41,12 +41,22 @@ const secretKeys=/^(?:credentials|authorization|accessToken|refreshToken|apiKey|
 const identityKeys=/^(?:uid|userId|principal|enterpriseId|machineId|deviceId|deviceCenterId|email|phone|mobile|accountNumber)$/i;
 export function maskText(value){let s=String(value);if(/^(?:(?:account|route|upstream)-[a-f0-9]{12}|event-[a-f0-9]{24}|delivery-[a-f0-9-]{36}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(s))return s;s=s.replace(/Bearer\s+[^\s,;]+/gi,'Bearer [hidden]');if(s.includes('@'))s=s.replace(/[A-Z0-9._%+-]{1,128}@(?:[A-Z0-9-]{1,63}\.){1,5}[A-Z]{2,16}/gi,'[邮箱已隐藏]');return s.replace(/(?<!\d)(\d{3})\d{4,}(\d{2,4})(?!\d)/g,'$1****$2');}
 function maskIdentity(value){const s=String(value??'');return s.length>4?s.slice(0,2)+'***'+s.slice(-2):'***';}
-export function publicValue(value,depth=0){
+const publicZcodeDocumentationUrls=new Set([
+  'https://docs.z.ai/guides/llm/glm-5.3',
+  'https://docs.z.ai/guides/vlm/glm-5.3-flash',
+  'https://zcode.z.ai/cn/docs/welcome',
+  'https://github.com/zai-org/ZCode/blob/3c5b227649371507ddc4eb46ac5133afe6db1cab/config/provider/zcode-builtin.json',
+]);
+function publicZcodeDocumentation(value,key){
+  if(!['metadataSources','reasoningSource'].includes(key)||typeof value!=='string'||value.length>2048)return false;
+  return publicZcodeDocumentationUrls.has(value);
+}
+export function publicValue(value,depth=0,key=''){
   if(depth>15)return '[depth limited]';
-  if(typeof value==='string')return maskText(value);
+  if(typeof value==='string')return publicZcodeDocumentation(value,key)?value:maskText(value);
   if(value===null||typeof value!=='object')return value;
-  if(Array.isArray(value))return value.slice(0,2000).map(v=>publicValue(v,depth+1));
-  const out={};for(const [key,item] of Object.entries(value)){if(secretKeys.test(key))continue;out[key]=identityKeys.test(key)?maskIdentity(item):publicValue(item,depth+1);}return out;
+  if(Array.isArray(value))return value.slice(0,2000).map(v=>publicValue(v,depth+1,key));
+  const out={};for(const [key,item] of Object.entries(value)){if(secretKeys.test(key))continue;out[key]=identityKeys.test(key)?maskIdentity(item):publicValue(item,depth+1,key);}return out;
 }
 export function boundedPublic(value){if(Buffer.byteLength(JSON.stringify(value))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);const body=publicValue(value);if(Buffer.byteLength(JSON.stringify(body))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);return body;}
 export function publicAccount(account,index,{blockedKinds=['antigravity','opencode']}={}){const snapshotReady=account.platform==='freeapi'&&account.credentials?.kind==='none'||typeof account.credentials?.file==='string'&&account.credentials.file!=='auto',blocked=blockedKinds.includes(account.platform),setupRequired=blocked||!snapshotReady;return {id:account.id,label:maskText(account.label??account.name??`账户${String(index+1).padStart(2,'0')}`),platform:account.platform,enabled:account.enabled!==false,inferenceEnabled:account.inferenceEnabled!==false,credentialMode:account.credentials?.kind??account.credentials?.mode??'unconfigured',snapshotReady,setupRequired,connectionState:blocked?'setup_required':!snapshotReady?'snapshot_required':'not_checked'};}
