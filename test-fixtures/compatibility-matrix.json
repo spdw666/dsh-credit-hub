@@ -1,14 +1,14 @@
 {
   "schemaVersion": 1,
-  "collectedAt": "2026-10-18T10:54:13.613Z",
-  "scope": "All 32 official release tags present in the saved 2026-10-18 GitHub tag inventory; source and module contract checks, not 32 installed desktop runtimes.",
+  "collectedAt": "2026-10-27T13:19:03.154Z",
+  "scope": "33 official release tags through dsh-v0.2.1-rc.3; incremental official source and module-contract checks, not 33 installed desktop runtimes.",
   "firstTag": "dsh-v0.1.0-rc.7",
-  "lastTag": "dsh-v0.2.1-rc.2",
-  "exactDshRange": "0.2.1-rc.2 || 0.2.1-rc.1 || 0.2.1-alpha.5 || 0.2.1-alpha.4 || 0.2.1-alpha.3 || 0.2.1-alpha.2 || 0.2.1-alpha.1 || 0.2.0-rc.2 || 0.2.0-rc.1 || 0.1.7-rc.2 || 0.1.7-rc.1 || 0.1.7-alpha.2 || 0.1.7-alpha.1 || 0.1.6-alpha.2 || 0.1.6-alpha.1 || 0.1.5-rc.3 || 0.1.5-rc.2 || 0.1.5-rc.1 || 0.1.5-alpha.2 || 0.1.5-alpha.1 || 0.1.3-alpha.2 || 0.1.3-alpha.1 || 0.1.2-rc.1 || 0.1.2-alpha.5 || 0.1.2-alpha.4 || 0.1.2-alpha.3 || 0.1.2-alpha.2 || 0.1.2-alpha.1 || 0.1.1-rc.2 || 0.1.1-rc.1 || 0.1.0-rc.8 || 0.1.0-rc.7",
+  "lastTag": "dsh-v0.2.1-rc.3",
+  "exactDshRange": "0.2.1-rc.3 || 0.2.1-rc.2 || 0.2.1-rc.1 || 0.2.1-alpha.5 || 0.2.1-alpha.4 || 0.2.1-alpha.3 || 0.2.1-alpha.2 || 0.2.1-alpha.1 || 0.2.0-rc.2 || 0.2.0-rc.1 || 0.1.7-rc.2 || 0.1.7-rc.1 || 0.1.7-alpha.2 || 0.1.7-alpha.1 || 0.1.6-alpha.2 || 0.1.6-alpha.1 || 0.1.5-rc.3 || 0.1.5-rc.2 || 0.1.5-rc.1 || 0.1.5-alpha.2 || 0.1.5-alpha.1 || 0.1.3-alpha.2 || 0.1.3-alpha.1 || 0.1.2-rc.1 || 0.1.2-alpha.5 || 0.1.2-alpha.4 || 0.1.2-alpha.3 || 0.1.2-alpha.2 || 0.1.2-alpha.1 || 0.1.1-rc.2 || 0.1.1-rc.1 || 0.1.0-rc.8 || 0.1.0-rc.7",
   "workerNodeMinimum": "22.23.3",
   "manifestRecommendations": {
     "hostNode": "^22.19.0 || >=24.0.0",
-    "dshSdk": "0.2.1-rc.2 || 0.2.1-rc.1 || 0.2.1-alpha.5 || 0.2.1-alpha.4 || 0.2.1-alpha.3 || 0.2.1-alpha.2 || 0.2.1-alpha.1 || 0.2.0-rc.2 || 0.2.0-rc.1 || 0.1.7-rc.2 || 0.1.7-rc.1 || 0.1.7-alpha.2 || 0.1.7-alpha.1 || 0.1.6-alpha.2 || 0.1.6-alpha.1 || 0.1.5-rc.3 || 0.1.5-rc.2 || 0.1.5-rc.1 || 0.1.5-alpha.2 || 0.1.5-alpha.1 || 0.1.3-alpha.2 || 0.1.3-alpha.1 || 0.1.2-rc.1 || 0.1.2-alpha.5 || 0.1.2-alpha.4 || 0.1.2-alpha.3 || 0.1.2-alpha.2 || 0.1.2-alpha.1 || 0.1.1-rc.2 || 0.1.1-rc.1 || 0.1.0-rc.8 || 0.1.0-rc.7",
+    "dshSdk": "0.2.1-rc.3 || 0.2.1-rc.2 || 0.2.1-rc.1 || 0.2.1-alpha.5 || 0.2.1-alpha.4 || 0.2.1-alpha.3 || 0.2.1-alpha.2 || 0.2.1-alpha.1 || 0.2.0-rc.2 || 0.2.0-rc.1 || 0.1.7-rc.2 || 0.1.7-rc.1 || 0.1.7-alpha.2 || 0.1.7-alpha.1 || 0.1.6-alpha.2 || 0.1.6-alpha.1 || 0.1.5-rc.3 || 0.1.5-rc.2 || 0.1.5-rc.1 || 0.1.5-alpha.2 || 0.1.5-alpha.1 || 0.1.3-alpha.2 || 0.1.3-alpha.1 || 0.1.2-rc.1 || 0.1.2-alpha.5 || 0.1.2-alpha.4 || 0.1.2-alpha.3 || 0.1.2-alpha.2 || 0.1.2-alpha.1 || 0.1.1-rc.2 || 0.1.1-rc.1 || 0.1.0-rc.8 || 0.1.0-rc.7",
     "cordis": "4.0.5 || 4.0.5-alpha.2 || 4.0.5-alpha.1 || 4.0.4 || 4.0.3 || 4.0.2 || 4.0.1",
     "schemastery": "3.18.5 || 3.18.5-alpha.2 || 3.18.5-alpha.1 || 3.18.4 || 3.18.3 || 3.18.2 || 3.18.1",
     "piAi": "^1.1.0 || ^1.0.2 || ^0.87.1 || ^0.85.1 || ^0.84.2 || ^0.82.1",
@@ -20,6 +20,199 @@
     ]
   },
   "releases": [
+    {
+      "tag": "dsh-v0.2.1-rc.3",
+      "version": "0.2.1-rc.3",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "sourceEvidence": {
+        "llm": {
+          "path": "packages/llm/llm/src/index.ts",
+          "sha256": "12863e4b6419825e2600a63110379c5c6bbab18b3a2365ca45645baca5f96db2",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/llm/llm/src/index.ts"
+        },
+        "adapter": {
+          "path": "packages/llm/llm-pi-ai/src/adapter.ts",
+          "sha256": "a83e09594d63e3dae39ccb6e602019b83ef233dad725e564ce23735c6e9a020d",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/llm/llm-pi-ai/src/adapter.ts"
+        },
+        "typert": {
+          "path": "packages/typert/protocol/src/index.ts",
+          "sha256": "68a759fada0b0f6414d9ebaf1a3d24480acb3197953ce84d0eb4f741eaa3e297",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/typert/protocol/src/index.ts"
+        },
+        "llmPackage": {
+          "path": "packages/llm/llm/package.json",
+          "sha256": "ee8f1bd78ba21083f0f73b5530650c42fe67a0f6ec027c8119c7394e45b3bcaf",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/llm/llm/package.json"
+        },
+        "adapterPackage": {
+          "path": "packages/llm/llm-pi-ai/package.json",
+          "sha256": "1f89b125b809b2a5f24a8c50ec8918cba583f183bde4d34112562ba8c867e06f",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/llm/llm-pi-ai/package.json"
+        },
+        "typertPackage": {
+          "path": "packages/typert/protocol/package.json",
+          "sha256": "198af79042877c373467fd259f12d417e66f486f801a1e7da10f4bfffa12e4df",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/typert/protocol/package.json"
+        },
+        "cordis": {
+          "path": "vendor/cordis/package.json",
+          "sha256": "b2426a9e1970d1b4a1702544e74d23a750fbebcfa132fbb8980549d2f484eee8",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/vendor/cordis/package.json"
+        },
+        "schemastery": {
+          "path": "vendor/schemastery/package.json",
+          "sha256": "177eab1c24ff0941c0bdc13ecdedd341fd344e027c7db2daf0a89b7011efd2f5",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/vendor/schemastery/package.json"
+        },
+        "rootPackage": {
+          "path": "package.json",
+          "sha256": "10ffa7534fc85a56ef5aff7eceaca4d10afe937d22b6cca803c7971ebccab996",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/package.json"
+        },
+        "connection": {
+          "path": "packages/client/connection/src/index.ts",
+          "sha256": "33a14e80298e0a0bc7bafef515d853d13584cd2433844b3dc2a89d4980d315e1",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/connection/src/index.ts"
+        },
+        "slots": {
+          "path": "packages/client/ui-slots/src/index.ts",
+          "sha256": "43989fb355e1e85316caa70b28de3294f9d6e7b179199a4e429dcd1ef73f2e24",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-slots/src/index.ts"
+        },
+        "sidebar": {
+          "path": "packages/client/ui-sidebar/src/client/index.ts",
+          "sha256": "531a30bc0490a9be3fbce7845403e60b75726ff5503aa6613e3f6a955a572e86",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-sidebar/src/client/index.ts"
+        },
+        "settings": {
+          "path": "packages/client/ui-settings/src/client/index.ts",
+          "sha256": "63d15aa09f92e3e3bd890178d5052aa3bcd73783b756d95d6cd0758ddd1b0508",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-settings/src/client/index.ts"
+        },
+        "layout": {
+          "path": "packages/client/ui-layout/src/client/index.ts",
+          "sha256": "ab1cdd016582d3f2b7c978ec0afa994a8636390cc18cef800d8301d239d46b9e",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-layout/src/client/index.ts"
+        },
+        "clientRpc": {
+          "path": "packages/client/connection/src/client/rpc.ts",
+          "sha256": "8a55426351dfc3b4150b6fdd60daf20735824cbb90b4b806321ec442c639e460",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/connection/src/client/rpc.ts"
+        },
+        "clientWebApi": {
+          "path": "packages/client/connection/src/client/api.ts",
+          "sha256": "54aa86f493b80693b2a6ce89bfc5df6105386717bb5307866d11320345c8a747",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/connection/src/client/api.ts"
+        },
+        "slotsRuntime": {
+          "path": "packages/client/ui-renderer/src/client/registry.ts",
+          "sha256": "6b8b6b969d8bcf0314ea20438a223f3a90e1bd516571faecae5c3c01008ecf21",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-renderer/src/client/registry.ts"
+        },
+        "settingsContract": {
+          "path": "packages/client/ui-settings/src/client/contract/slots.ts",
+          "sha256": "2318031c951e80df0185be3fff1a55faf8d4932c2b36c16940d3ee33dce68060",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-settings/src/client/contract/slots.ts"
+        },
+        "layoutService": {
+          "path": "packages/client/ui-layout/src/client/service.ts",
+          "sha256": "2b70b115e7cc04eb29cb8d95cec706b4e3fd39af96418bdfe1cc03359b4c81c4",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-layout/src/client/service.ts"
+        },
+        "gateway": {
+          "path": "packages/api/gateway/src/index.ts",
+          "sha256": "0a1234ae8400dbadebab5c53c8dfb352e24fa271b767645d5f0275fd620b36eb",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/api/gateway/src/index.ts"
+        },
+        "connectionPackage": {
+          "path": "packages/client/connection/package.json",
+          "sha256": "b9cd9b0db26856abf229e9a9281188f2190440e1d3d2d3a75c74682aa1b50390",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/connection/package.json"
+        },
+        "layoutPackage": {
+          "path": "packages/client/ui-layout/package.json",
+          "sha256": "3e4be9f373a3c682c5bee90e4b2c6b6f1a831f870ba10c51d7f4eb57c9082a7c",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-layout/package.json"
+        },
+        "sidebarPackage": {
+          "path": "packages/client/ui-sidebar/package.json",
+          "sha256": "60ded75b818e3bcff60597e4e00e9d1c45b184cac43bf743fd09bb849954df17",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-sidebar/package.json"
+        },
+        "settingsGeneralPackage": {
+          "path": "packages/client/ui-settings-general/package.json",
+          "sha256": "6a1fe94bed031308ee8aaecf88fb76f316b8feb3502a13aa91f92cb9b2b8e67d",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/ui-settings-general/package.json"
+        },
+        "clientConnection": {
+          "path": "packages/client/connection/src/client/index.ts",
+          "sha256": "932b2d75fc3ad2490664f2980008cc408b13e8706bc862af406200aff86057dd",
+          "url": "https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/client/connection/src/client/index.ts"
+        }
+      },
+      "sdk": {
+        "llm": "0.2.1-rc.3",
+        "adapter": "0.2.1-rc.3",
+        "typert": "0.2.1-rc.3",
+        "piAi": "^1.1.0",
+        "cordis": "4.0.5",
+        "schemastery": "3.18.5",
+        "hostNode": "^22.19.0 || >=24.0.0",
+        "clientPackages": {
+          "connectionPackage": "@deepseek-ai/dsh-client-connection",
+          "layoutPackage": "@deepseek-ai/dsh-client-ui-layout",
+          "sidebarPackage": "@deepseek-ai/dsh-client-ui-sidebar",
+          "settingsGeneralPackage": "@deepseek-ai/dsh-client-ui-settings-general"
+        }
+      },
+      "features": {
+        "registerAdapter": true,
+        "registerConfigurableProviders": true,
+        "registerModelDiscovery": true,
+        "stream": true,
+        "streamWithSnapshot": true,
+        "prepareCall": true,
+        "typertRemote": true,
+        "typertService": true,
+        "rpcFourArguments": true,
+        "rpcResultEnvelope": true,
+        "rpcNamedArgs": true,
+        "rpcOkValue": true,
+        "slotInject": true,
+        "settingsSection": true,
+        "keyedMain": true,
+        "sidebarPanelList": true,
+        "selectPanel": true,
+        "clientConnection": true
+      },
+      "verification": {
+        "sourceAudit": true,
+        "registrationFixture": true,
+        "officialModuleFixture": true,
+        "fullHistoricalHostRuntime": false
+      },
+      "moduleFixture": {
+        "piAi": "1.1.0 (actual npm library)",
+        "llm": "same official tag source",
+        "cordisDependency": "installed 4.0.5 library",
+        "typertDescriptor": true,
+        "listModels": true,
+        "resolveModel": true,
+        "providerRetryPolicy": true,
+        "streamFixture": {
+          "completeContext": true,
+          "toolDefinition": true,
+          "toolCallId": true,
+          "toolResult": true,
+          "toolVocabulary": "tool-role-message",
+          "outputBudget": 64000,
+          "upstreamNetwork": false
+        },
+        "upstreamNetwork": false,
+        "fullHistoricalHostRuntime": false
+      }
+    },
     {
       "tag": "dsh-v0.2.1-rc.2",
       "version": "0.2.1-rc.2",

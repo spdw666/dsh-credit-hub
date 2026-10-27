@@ -10,6 +10,12 @@ permissions:
 jobs:
   windows-node22:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh-sdk: [0.2.1-rc.2, 0.2.1-rc.3]
+    env:
+      CREDIT_HUB_TEST_DSH_VERSION: ${{ matrix.dsh-sdk }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -51,7 +57,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-node22-evidence
+          name: windows-node22-${{ matrix.dsh-sdk }}-evidence
           path: |
             plugin-tests.log
             engine-tests.log

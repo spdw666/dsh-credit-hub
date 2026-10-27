@@ -4,7 +4,7 @@
  * and discovery services must never take down the independent management UI.
  */
 export const FIRST_AUDITED_DSH_VERSION='0.1.0-rc.7';
-export const LAST_AUDITED_DSH_VERSION='0.2.1-rc.2';
+export const LAST_AUDITED_DSH_VERSION='0.2.1-rc.3';
 export const WORKER_NODE_MINIMUM='22.23.3';
 const isFunction=value=>typeof value==='function';
 const issue=(code,feature,severity='notice')=>Object.freeze({code,feature,severity});

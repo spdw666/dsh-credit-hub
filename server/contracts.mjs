@@ -3,7 +3,7 @@ import {createHash} from 'node:crypto';
 import {stat,readFile} from 'node:fs/promises';
 import {ACCOUNT_EXPORT_PATH,validateAccountExportRequest} from './transfer.mjs';
 
-export const PLUGIN_VERSION='0.2.5';
+export const PLUGIN_VERSION='0.2.6';
 export const MAX_RPC_BYTES=2*1024*1024;
 export const MAX_INPUT_BYTES=4*1024*1024;
 export function hubError(code,message,status=400){return Object.assign(new Error(message),{code,status});}

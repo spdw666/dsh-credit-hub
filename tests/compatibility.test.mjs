@@ -63,7 +63,7 @@ test('registration layer preserves complete request identity including messages,
 test('audited release range includes every available official tag rather than dropping prereleases',async()=>{
   const tags=JSON.parse(await readFile(new URL('../test-fixtures/dsh-tags.json',import.meta.url),'utf8'));
   const range=buildDshCompatibilityRange(tags.map(t=>t.name));
-  assert.equal(tags.length,32);assert.equal(range.split(' || ').length,32);
+  assert.equal(tags.length,33);assert.equal(range.split(' || ').length,33);
   assert.ok(range.includes('0.1.0-rc.7'));assert.ok(range.includes('0.2.1-alpha.1'));
   assert.ok(!range.includes('*'));assert.throws(()=>buildDshCompatibilityRange(['SAMPLE-invalid']),/Invalid/);
 });
@@ -74,6 +74,6 @@ test('official source matrix preserves all stable RPC and settings seams and rep
     assert.deepEqual(Object.values(row.sdk.clientPackages),matrix.manifestRecommendations.clientInject);
     assert.equal(row.verification.fullHistoricalHostRuntime,false);
   }
-  assert.equal(matrix.releases.filter(r=>r.features.keyedMain).length,19);
+  assert.equal(matrix.releases.filter(r=>r.features.keyedMain).length,20);
   assert.equal(matrix.releases.filter(r=>!r.features.keyedMain).length,13);
 });

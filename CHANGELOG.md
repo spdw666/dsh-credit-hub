@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6
+
+- Add audited DSH 0.2.1-rc.3 to exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 33 tags, including native sidebar, settings, Typert and prepared/snapshot provider seams.
+- Default the isolated development SDK to rc.3 and run independent rc.2/rc.3 CI jobs. Keep worker Node >=22.23.3 unchanged.
+- Preserve full requests, tools, budgets, account selections and scheduler consent; no provider protocol rewrite or profile migration.
+
 ## 0.2.5
 
 - Route all live-entitled ZCode model IDs through the pinned standard OpenAI proxy, without Flash-only branching or trimming messages/tools/budgets.
