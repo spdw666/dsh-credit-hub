@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.7
+
+- Add audited DSH 0.2.1-rc.4 and 0.2.1-rc.5 to exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 35 tags. rc.4 and rc.5 export the same 66 llm / 16 typert symbols as rc.3, and the same 18 audited seams, re-verified by real Typert, LLM and PiAiAdapter contracts at both fixed tags.
+- Default the isolated development SDK to rc.5 and keep independent rc.2/rc.3/rc.5 CI jobs. Keep worker Node >=22.23.3 unchanged.
+- Fix Web-panel WorkBuddy account capture: a capture request without an explicit account id now derives `wb-` plus a random suffix instead of failing validation, matching the desktop dialog and the OAuth login flow. Invalid explicit ids still return 400 invalid_account_id.
+
 ## 0.2.6
 
 - Add audited DSH 0.2.1-rc.3 to exact optional host SDK peer ranges; preserve every previously audited prerelease.

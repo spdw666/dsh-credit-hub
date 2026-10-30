@@ -1,8 +1,8 @@
 // Development/CI only. Production receives these interfaces from its DSH host.
 import {execFileSync} from 'node:child_process';import {fileURLToPath} from 'node:url';import {mkdir,writeFile,lstat,realpath,rm,unlink,symlink} from 'node:fs/promises';import {join,resolve,sep} from 'node:path';
 const npm=process.env.npm_execpath??process.argv[2];if(!npm)throw Error('Run npm run sdk:install, or pass the absolute npm-cli.js path');
-const hostVersion=process.env.CREDIT_HUB_TEST_DSH_VERSION??'0.2.1-rc.3';
-if(!['0.2.1-rc.2','0.2.1-rc.3'].includes(hostVersion))throw Error('Unsupported development SDK version');
+const hostVersion=process.env.CREDIT_HUB_TEST_DSH_VERSION??'0.2.1-rc.5';
+if(!['0.2.1-rc.2','0.2.1-rc.3','0.2.1-rc.4','0.2.1-rc.5'].includes(hostVersion))throw Error('Unsupported development SDK version');
 const sdk=['@deepseek-ai/cordis@4.0.5','@deepseek-ai/schemastery@3.18.5','@deepseek-ai/cordis-plugin-loader@1.0.6','@deepseek-ai/dsh-llm@HOST_VERSION','@deepseek-ai/dsh-llm-retry@HOST_VERSION','@deepseek-ai/dsh-llm-pi-ai@HOST_VERSION','@deepseek-ai/dsh-typert-protocol@HOST_VERSION','@deepseek-ai/dsh-attachment@HOST_VERSION','@deepseek-ai/dsh-authorization@HOST_VERSION','@deepseek-ai/dsh-credentials@HOST_VERSION','@deepseek-ai/dsh-fs@HOST_VERSION','@deepseek-ai/dsh-launch-environment@HOST_VERSION','@deepseek-ai/dsh-timeout@HOST_VERSION','@earendil-works/pi-ai@1.1.0'].map(spec=>spec.replace('@HOST_VERSION','@'+hostVersion));
 const root=fileURLToPath(new URL('../',import.meta.url)),development=join(root,'work/dev-sdk'),modules=resolve(root,'node_modules');await mkdir(development,{recursive:true});const dependencies=Object.fromEntries(sdk.map(spec=>{const at=spec.lastIndexOf('@');return [spec.slice(0,at),spec.slice(at+1)];}));await writeFile(join(development,'package.json'),JSON.stringify({name:'credit-hub-development-sdk',version:'0.0.0',private:true,dependencies},null,2)+'\n');
 // Root peers are intentionally optional for production; install the SDK as

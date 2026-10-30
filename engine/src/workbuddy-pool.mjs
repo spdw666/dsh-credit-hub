@@ -2,6 +2,7 @@
 import {AppError,atomicJson,hash} from './util.mjs';
 import {CredentialManager} from './credentials.mjs';
 import {join} from 'node:path';
+import {randomUUID} from 'node:crypto';
 import {readFile,writeFile,rm} from 'node:fs/promises';
 import {syncWorkBuddyPools} from './workbuddy-management.mjs';
 import {workBuddyEdition} from './workbuddy-auth.mjs';
@@ -79,7 +80,9 @@ export async function configureWorkBuddyPool(service,{routeId,accountIds,enabled
   route.accountPool={enabled:enabled!==false,accountIds,cooldownSeconds,autoManaged:true};
   await service.config.save(value);return {saved:true,...service.router.pool.status(route)};
 }
-export async function captureWorkBuddyAccount(service,{id,label},{readCurrent}={}) {
+export async function captureWorkBuddyAccount(service,{id,label}={},{readCurrent}={}) {
+  // A capture without an explicit id is the normal Web-panel path, not an error.
+  if(id===undefined)id='wb-'+randomUUID().slice(0,20);
   if(!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id??''))throw new AppError('Use a unique account ID (letters, numbers, hyphen)',400,'invalid_account_id');
   const current=readCurrent?await readCurrent():await new CredentialManager(service.config,{bind:(_id,platform,principal)=>({ok:true,fingerprint:hash(platform+'\0'+principal)})}).read({id:'capture-current',platform:'workbuddy',enabled:true,credentials:{kind:'desktop',file:'auto'}});
   const principalHash=hash('workbuddy\0'+current.principal),value=structuredClone(service.config.value);

@@ -107,9 +107,9 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 
 ## 兼容证据
 
-已审计 33 个已知官方 tag（0.1.0-rc.7～0.2.1-rc.3）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
+已审计 35 个已知官方 tag（0.1.0-rc.7～0.2.1-rc.5）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
 
-这不是 33 个完整历史桌面安装验收。0.2.1-rc.3 已执行固定 tag 官方模块契约与真实 SDK 下的插件回归；另以本机现装 rc.3 官方运行层启动了独立空白 Host，原生提供方／模型发现注册与连续心跳通过，退出后测试 Host 和 worker 均已关闭；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
+这不是 35 个完整历史桌面安装验收。0.2.1-rc.5 已执行固定 tag 官方模块契约与真实 SDK 下的插件回归；另以本机现装 rc.5 官方运行层启动了独立空白 Host，原生提供方／模型发现注册与连续心跳通过，退出后测试 Host 和 worker 均已关闭；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
 
 ## 开发
 
