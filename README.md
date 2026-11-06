@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.2.6**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.2.8**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -107,9 +107,9 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 
 ## 兼容证据
 
-已审计 35 个已知官方 tag（0.1.0-rc.7～0.2.1-rc.5）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
+已审计 36 个已知官方 tag（0.1.0-rc.7～0.2.2-rc.1）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
 
-这不是 35 个完整历史桌面安装验收。0.2.1-rc.5 已执行固定 tag 官方模块契约与真实 SDK 下的插件回归；另以本机现装 rc.5 官方运行层启动了独立空白 Host，原生提供方／模型发现注册与连续心跳通过，退出后测试 Host 和 worker 均已关闭；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
+这不是 36 个完整历史桌面安装验收。0.2.2-rc.1 已执行固定 tag 官方模块契约：导出面与 rc.5 逐项相同（llm 66／typert 16／llm-pi-ai 7／cordis 26），18 项审计接缝全部为真。同 tag 还带三处依赖换代——cordis 4.0.5→4.1.0、schemastery 3.18.5→3.19.0、pi-ai 1.1.0→1.3.0——开发 SDK 已按宿主版本分别锁定，不跨版本复用。rc.5 曾以本机现装官方运行层启动独立空白 Host 完成注册与心跳验收；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
 
 ## 开发
 
@@ -132,7 +132,7 @@ npm run test:engine
 npm run verify
 ```
 
-`sdk:install` 只用于开发/CI，默认安装锁定的 0.2.1-rc.3 官方 SDK；设置 CREDIT_HUB_TEST_DSH_VERSION=0.2.1-rc.2 可回归上一宿主版本。CI 对 rc.2/rc.3 分别构建、测试和打包；生产宿主提供这些接口。Qwen 离线编码测试可设置 `CREDIT_HUB_TEST_PYTHON` 为装有 cryptography/wasmtime 的 Python；未配置的额外平台测试会明确跳过。CI 会安装这些依赖并执行。
+`sdk:install` 只用于开发/CI，默认安装锁定的 0.2.2-rc.1 官方 SDK；设置 CREDIT_HUB_TEST_DSH_VERSION=0.2.1-rc.5 可回归上一宿主版本。每个宿主版本的 vendor 依赖（cordis／schemastery／loader／pi-ai）各自精确锁定，不跨版本借用。CI 对 rc.2／rc.3／rc.5／0.2.2-rc.1 分别构建、测试和打包，其中 0.2.2-rc.1 跑 Node 24（该版 `engines.node` 为 `>=24.9.0`），旧版仍跑 Node 22.23.3；生产宿主提供这些接口。Qwen 离线编码测试可设置 `CREDIT_HUB_TEST_PYTHON` 为装有 cryptography/wasmtime 的 Python；未配置的额外平台测试会明确跳过。CI 会安装这些依赖并执行。
 
 `lib/client.js` 使用官方 `__ModuleLoader__`、slots 与 Connection RPC/Typert，无 iframe。发布包保留预构建客户端和 vendor 核心。构建/测试不需要真实账号或上游生成。
 

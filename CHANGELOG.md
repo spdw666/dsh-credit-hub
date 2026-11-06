@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.8
+
+- Add audited DSH 0.2.2-rc.1 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 36 tags. 0.2.2-rc.1 exports the same 66 llm / 16 typert / 7 llm-pi-ai / 26 cordis symbols and the same 18 audited seams as rc.5, re-verified by real Typert, LLM and PiAiAdapter contracts at the fixed tag.
+- Follow the host's dependency upgrade in the development SDK: cordis 4.0.5→4.1.0, schemastery 3.18.5→3.19.0, cordis-plugin-loader 1.0.6→1.1.0, pi-ai 1.1.0→1.3.0. Each host version now pins its own vendored versions instead of borrowing another release's mix.
+- Honour the new host floor: 0.2.2-rc.1 declares `engines.node >=24.9.0`, so its CI job runs Node 24.21.0 while the rc.2/rc.3/rc.5 jobs stay on Node 22.23.3. The plugin's own worker floor remains Node >=22.23.3, since the worker is not the host.
+
 ## 0.2.7
 
 - Add audited DSH 0.2.1-rc.4 and 0.2.1-rc.5 to exact optional host SDK peer ranges; preserve every previously audited prerelease.
