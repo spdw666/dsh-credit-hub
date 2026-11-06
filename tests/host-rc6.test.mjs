@@ -35,6 +35,7 @@ test('development SDK pins each host to its own vendored versions and CI keeps a
   for(const host of ['0.2.1-rc.2','0.2.1-rc.3','0.2.1-rc.5','0.2.2-rc.1'])assert.match(ci,new RegExp(`dsh-sdk: ${host.replace(/\./g,'\\.')}`),host);
   assert.match(ci,/CREDIT_HUB_TEST_DSH_VERSION: \$\{\{ matrix\.dsh-sdk \}\}/);
   // 0.2.2-rc.1 declares engines.node >=24.9.0 and cannot run on the Node 22 jobs.
-  assert.match(ci,/dsh-sdk: 0\.2\.2-rc\.1\n\s+node: '24\.21\.0'/);
+  // GitHub checks this file out with CRLF on its Windows runners, so never anchor on a bare \n.
+  assert.match(ci,/dsh-sdk: 0\.2\.2-rc\.1\r?\n\s+node: '24\.21\.0'/);
   assert.equal((ci.match(/node: '22\.23\.3'/g)??[]).length,3);
 });
