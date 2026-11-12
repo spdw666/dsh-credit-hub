@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.9
+
+- Add audited DSH 0.2.2-rc.2 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 37 tags. 0.2.2-rc.2 adds exactly two llm exports (`LLM_FAILURE_CODES`, `RETRY_CODE_CHOICES`) and removes none: llm 66→68, typert 16, cordis 26 unchanged, and the llm-pi-ai adapter still exports `PiAiAdapter` (its source adds only a debug-level `onThinkingOmitted` log). All 18 audited seams are unchanged, re-verified by real Typert, LLM and PiAiAdapter contracts at the fixed tag.
+- Pin 0.2.2-rc.2 to the same vendored mix as rc.1 (cordis 4.1.0, schemastery 3.19.0, loader 1.1.0, pi-ai 1.3.0) and make it the default development SDK. CI adds a second Node 24.21.0 job for rc.2 while keeping the rc.1 job.
+- Complete the isolated development SDK: install the seven host packages `dsh-llm`, `dsh-attachment`, `dsh-fs`, `dsh-llm-retry` and `dsh-session` declare as required peers (`dsh-error`, `dsh-sandbox`, `dsh-agent`, `dsh-session`, `dsh-session-projection`, `dsh-scope`, `dsh-system-prompt`). `@deepseek-ai/dsh-llm` imports `@deepseek-ai/dsh-error` from its `lib/index.js` entry, so a dev SDK without it fails every provider and watchdog suite at import; the host's flat `node_modules` used to hide the gap. The isolated SDK now resolves with zero unmet required peers.
+- No plugin runtime change: the new llm exports are additive, and the adapter only consumes `resolveRetryPolicy`, `attributionHeaders`, `PiAiAdapter` and the Typert base pair.
+
 ## 0.2.8
 
 - Add audited DSH 0.2.2-rc.1 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
