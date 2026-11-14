@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.10
+
+- Add audited DSH 0.2.2-rc.3 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 38 tags. rc.3 exports the same 66 llm / 16 typert / 7 llm-pi-ai / 26 cordis symbols and the same 18 audited seams as rc.2, re-verified by real Typert, LLM and PiAiAdapter contracts at the fixed tag (context 1000000, retry 1, tools and the 64000-token budget intact).
+- Audit the sidebar slot contract as its own evidence path: rc.3 is the first release to declare `sidebar.session.action` (kind `hoc`, root) with its own `SidebarSessionActionOwnerProps`, and it adds `wide` to `SidebarFooterActionOwnerProps`. The three slots this plugin occupies — keyed `main`, list `sidebar.panellist`, list `settings.section` — are unchanged, so no client code moved.
+- Pin 0.2.2-rc.3 to the same vendored mix as rc.1/rc.2 (cordis 4.1.0, schemastery 3.19.0, loader 1.1.0, pi-ai 1.3.0) and make it the default development SDK. CI adds a third Node 24.21.0 job for rc.3 while keeping the rc.1 and rc.2 jobs.
+- No plugin runtime change: the adapter protocol and registration seams are untouched, so only the audited host range, the matrix row, the pinned development SDK and the version move.
+
 ## 0.2.9
 
 - Add audited DSH 0.2.2-rc.2 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.

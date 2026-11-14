@@ -12,8 +12,8 @@ jobs:
     runs-on: windows-latest
     strategy:
       fail-fast: false
-      # 0.2.2-rc.1 and 0.2.2-rc.2 declare engines.node >=24.9.0, so they are exercised
-      # on the same runtime the desktop host ships; older hosts stay on their Node 22 line.
+      # The 0.2.2 line declares engines.node >=24.9.0, so those hosts are exercised on
+      # the same runtime the desktop host ships; older hosts stay on their Node 22 line.
       matrix:
         include:
           - dsh-sdk: 0.2.1-rc.2
@@ -25,6 +25,8 @@ jobs:
           - dsh-sdk: 0.2.2-rc.1
             node: '24.21.0'
           - dsh-sdk: 0.2.2-rc.2
+            node: '24.21.0'
+          - dsh-sdk: 0.2.2-rc.3
             node: '24.21.0'
     env:
       CREDIT_HUB_TEST_DSH_VERSION: ${{ matrix.dsh-sdk }}
