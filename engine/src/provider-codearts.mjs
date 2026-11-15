@@ -23,8 +23,18 @@ const MAX_BODY = 1024 * 1024;
 const SESSION_KEY = 'huaweicloud.codearts-snap';
 const AGENT_TYPE = 'PromptCenter';
 const OPS_CHANNEL = 'IDE';
-// 「每日签到领1000 积分」的活动 ID；delivery 同时返回推荐码(3)/新用户(4)/学生认证(2)。
+// The desktop product (0.2.x) delivers and claims with `channel=DESKTOP`; its BenefitService
+// posts `{campaignId, idempotentKey, channel:'DESKTOP'}` and reports `user.login` on the same
+// channel. Delivery returns the same campaign set for both channels (live-verified), so the
+// signed delivery query keeps the IDE value that the golden vectors already cover, while every
+// write mirrors the app exactly.
+const OPS_CLAIM_CHANNEL = 'DESKTOP';
+// Legacy id of the 1000-credit daily check-in. The upstream renumbered the campaign without
+// notice (the live one is 34 = 「每日签到领100积分」), so the daily campaign is matched by type
+// and this id is only a last-resort fallback.
 const DAILY_CAMPAIGN_ID = 1;
+const DAILY_CAMPAIGN_TYPE = 'USER_LOGIN';
+const DAILY_TRIGGER_EVENT = 'user.login';
 
 // Route table: the ONLY method+path(+exact query) pairs this adapter will sign. The query
 // participates in the signature, so it is part of the key rather than a free-form argument.
@@ -35,6 +45,7 @@ const ROUTES = new Map([
   [`GET /v1/ops/delivery?channel=${OPS_CHANNEL}`, {agentType: AGENT_TYPE}],
   ['POST /v1/ops/claim', {agentType: AGENT_TYPE}],
   ['POST /v1/ops/confirm', {agentType: AGENT_TYPE}],
+  ['POST /v1/ops/events/trigger', {agentType: AGENT_TYPE}],
   ['POST /api/v2/chat/completions', {agentType: null}],
 ]);
 export const codeartsDescriptor = Object.freeze({
@@ -560,7 +571,13 @@ export async function codeartsCampaigns(credential, options = {}) {
   return {items: Array.isArray(items) ? items : [], serverTime: firstNumber(data?.data, 'serverTime'), ended: Array.isArray(data?.data?.endedCampaigns) ? data.data.endedCampaigns.length : 0};
 }
 
-export const findDailyCampaign = items => (Array.isArray(items) ? items.find(item => item?.campaignId === DAILY_CAMPAIGN_ID) ?? null : null);
+export const findDailyCampaign = items => {
+  const list = Array.isArray(items) ? items : [];
+  const login = list.filter(item => item?.type === DAILY_CAMPAIGN_TYPE);
+  return login.find(item => item?.extra?.triggerEvent === DAILY_TRIGGER_EVENT) ?? login[0]
+    ?? list.find(item => item?.extra?.triggerEvent === DAILY_TRIGGER_EVENT)
+    ?? list.find(item => item?.campaignId === DAILY_CAMPAIGN_ID) ?? null;
+};
 
 /** Contract `status`: real service state, never inferred from HTTP status alone. */
 export async function codeartsStatus(credential, task = 'daily-checkin', options = {}) {
@@ -569,12 +586,14 @@ export async function codeartsStatus(credential, task = 'daily-checkin', options
   const campaign = findDailyCampaign(items);
   const status = typeof campaign?.status === 'string' ? campaign.status : null;
   const claimable = campaign?.claimable === true;
-  const claimed = status === 'CONFIRMED' || status === 'CONSUMED';
+  // The shipped app renders CLAIMED/CONFIRMED/CONSUMED all as 「今日已领」: the day's claim is
+  // complete at CLAIMED, the later states only differ in how the credit settled.
+  const claimed = status === 'CLAIMED' || status === 'CONFIRMED' || status === 'CONSUMED';
   return {
     known: campaign !== null,
-    task, campaignId: DAILY_CAMPAIGN_ID,
+    task, campaignId: Number.isSafeInteger(campaign?.campaignId) ? campaign.campaignId : DAILY_CAMPAIGN_ID,
     title: typeof campaign?.title === 'string' ? campaign.title : null,
-    status, claimable, claimed, pendingConfirmation:status==='CLAIMED', active:claimable||status==='CLAIMED', credits:firstNumber(campaign,'benefitAmount'), confirmed:status === "CONFIRMED" || status === "CONSUMED",
+    status, claimable, claimed, pendingConfirmation:status==='CLAIMED', active:claimable||status==='CLAIMED'||status==='ELIGIBLE'||status==='CONFIRMED'||status==='CONSUMED', credits:firstNumber(campaign,'benefitAmount'), confirmed:status === "CONFIRMED" || status === "CONSUMED",
     pendingAmount: firstNumber(campaign, 'pendingTotalAmount'),
     credit: firstNumber(campaign, 'benefitAmount'),
     unit: typeof campaign?.benefitUnit === 'string' ? campaign.benefitUnit : null,
@@ -584,18 +603,41 @@ export async function codeartsStatus(credential, task = 'daily-checkin', options
   };
 }
 
+/** `POST /v1/ops/events/trigger` → report today's `user.login`, exactly like the desktop app
+ * (`login-YYYYMMDD-<rand>`). The daily campaign is `triggerMode: MANUAL_CLAIM` and only turns
+ * into ELIGIBLE after the product reports the day's login, so a plugin that never opens the app
+ * has to send this event itself before it can claim. */
+export async function codeartsLoginEvent(credential, options = {}) {
+  const day = dayIn(new Date(options.now ?? Date.now()), 'Asia/Shanghai').replaceAll('-', '');
+  const body = {triggerEvent: DAILY_TRIGGER_EVENT, channel: OPS_CLAIM_CHANNEL, idempotentKey: `login-${day}-${randomBytes(4).toString('hex')}`};
+  await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/events/trigger', body, ...options});
+  return {reported: true, day, channel: OPS_CLAIM_CHANNEL};
+}
+
 /** Contract `claim`: submit, then re-read delivery and require the server to have moved the state. */
 export async function codeartsClaim(credential, task = 'daily-checkin', options = {}) {
-  const before = await codeartsStatus(credential, task, options);
+  let before = await codeartsStatus(credential, task, options);
   if (options.confirmOnly === true && !before.claimed && !(before.known && before.pendingConfirmation))
     return {...before, submitted: false, reason: 'pending_confirmation_changed'};
   if (!before.known) return {...before, submitted: false, reason: 'campaign_absent'};
   if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
-  if (!before.claimable && !before.pendingConfirmation) return {...before, submitted: false, reason: 'not_claimable'};
-  const body = {campaignId: DAILY_CAMPAIGN_ID, idempotentKey: `claim_${DAILY_CAMPAIGN_ID}_${Date.now()}`, channel: OPS_CHANNEL};
-  let claimFailure = null;
+  if (!before.claimable) {
+    // No login event yet today → the campaign is not eligible. Report it once, then re-read.
+    let loginEventReported = false;
+    try { await codeartsLoginEvent(credential, options); loginEventReported = true; } catch { loginEventReported = false; }
+    if (loginEventReported) before = await codeartsStatus(credential, task, options);
+    if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
+    if (!before.claimable && !before.pendingConfirmation)
+      return {...before, submitted: false, reason: 'not_claimable', loginEventReported};
+  }
+  const body = {campaignId: before.campaignId, idempotentKey: `claim_${before.campaignId}_${Date.now()}`, channel: OPS_CLAIM_CHANNEL};
+  let claimFailure = null, userBenefitId = null;
   if(!before.pendingConfirmation){
-    try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options}); }
+    try {
+      const response = await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options});
+      const id = response?.data?.userBenefitId ?? response?.data?.id ?? response?.userBenefitId ?? null;
+      userBenefitId = typeof id === 'string' && id ? id : null;
+    }
     catch(error){ claimFailure=error; }
   }
   // A disconnected response can still have committed the claim. Inspect delivery before
@@ -605,14 +647,16 @@ export async function codeartsClaim(credential, task = 'daily-checkin', options 
     if(observed.claimed)return {...observed,submitted:true,confirmed:true,rechecked:true,submissionResponseLost:true};
     if(!observed.pendingConfirmation)throw claimFailure;
   }
-  // claim alone is not a receipt: the upstream has a CLAIMED (claimed-but-unconfirmed) state,
-  // and only /v1/ops/confirm pushes it to CONFIRMED.
+  // claim alone is not a receipt: the upstream has a CLAIMED (claimed-but-unconfirmed) state.
+  // `/v1/ops/confirm` takes the `userBenefitId` the claim returned (the app's contract); a
+  // campaign id is not a substitute, so a missing id is never confirmed blindly.
   let confirmed = false;
-  try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/confirm', body: {campaignId: DAILY_CAMPAIGN_ID}, ...options}); confirmed = true; }
-  catch { confirmed = false; }
+  if (userBenefitId) {
+    try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/confirm', body: {userBenefitId}, ...options}); confirmed = true; }
+    catch { confirmed = false; }
+  }
   const after = await codeartsCheckinRecheck(credential,task,options,state=>state.claimed);
-  const settled = after.status === 'CONFIRMED' || after.status === 'CONSUMED';
-  if (!settled) throw new AppError('CodeArts 领取结果尚未得到服务端确认', 502, 'codearts_claim_unconfirmed');
+  if (!after.claimed) throw new AppError('CodeArts 领取结果尚未得到服务端确认', 502, 'codearts_claim_unconfirmed');
   return {...after, submitted: true, confirmed:after.confirmed === true, rechecked: true,
     ...(claimFailure?{submissionResponseLost:true}:{}),...(!confirmed?{confirmationResponseLost:true}:{})};
 }
