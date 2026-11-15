@@ -182,12 +182,37 @@ export function signCodeArtsRequest(credential, {method, path, rawQuery = '', he
 
 // ------------------------------------------------------------------ credential
 
+/** Read the 0.2.x DESKTOP session (`<userData>/secretStorage/*.enc` + `Local State`).
+ * Same credential, different container: nothing here is submitted to the network. */
+export async function readCodeArtsDesktopSession({file,localState,decryptAuthImpl} = {}) {
+ if(typeof file!=='string'||!file)throw new AppError('未找到本机 CodeArts 桌面版登录会话',401,'codearts_state_unavailable');
+ const stored=await nativeCodeArtsStored(file);
+ if(!stored)throw new AppError('未找到本机 CodeArts 桌面版登录会话',401,'codearts_state_unavailable');
+ const local=localState??join(dirname(dirname(file)),'Local State');
+ const data=await (decryptAuthImpl??decryptCodeArtsAuth)(stored,local);
+ const auth=codeArtsAuthFromNative(data),session=data?.session??{};
+ const accessKey=typeof auth?.accessKey==='string'?auth.accessKey.trim():'';
+ const secretKey=typeof auth?.secretKey==='string'?auth.secretKey.trim():'';
+ const securityToken=typeof auth?.securitytoken==='string'?auth.securitytoken.trim():'';
+ if(!accessKey||!secretKey||!securityToken)throw new AppError('本机 CodeArts 桌面版会话缺少临时 AK/SK',401,'codearts_session_missing');
+ rememberSecret(accessKey); rememberSecret(secretKey); rememberSecret(securityToken);
+ return {
+  accessKey, secretKey, securityToken, expiresAt:auth.expires_at??null,
+  accessToken:securityToken, principal:"codearts:"+sha256Hex(Buffer.from(String(session.userId ?? session.domainId ?? session.id ?? ''))).slice(0,24),
+  loginType:'desktop_safe_storage', stationType:session.stationType??null,
+  domainId:typeof session.domainId==='string'?session.domainId:null,
+  hasStaticAccessToken:false, scopesEmpty:false,
+  source:'ide_safe_storage',
+ };
+}
+
 /**
  * Read the local IDE session. The IAM temporary AK/SK/securityToken are the real credential —
  * `securityToken` is NOT an `x-auth-token` (that is what produced APIG.0301 in the earlier probe).
  * Returns a PRIVATE object; only `codeartsCredentialView` may leave the process.
  */
-export async function readCodeArtsLocalSession({file = defaultCodeArtsStateDb()} = {}) {
+export async function readCodeArtsLocalSession({file = defaultCodeArtsStateDb(),localState,decryptAuthImpl} = {}) {
+ if(isCodeArtsDesktopFile(file))return readCodeArtsDesktopSession({file,localState,decryptAuthImpl});
   const {DatabaseSync} = await import('node:sqlite');
   let db;
   try { db = new DatabaseSync(file, {readOnly: true}); }
@@ -237,7 +262,7 @@ export async function refreshCodeArtsAuth(auth,{fetchImpl=fetch,now=Date.now(),s
  let response;
  try {response=await fetchImpl(CODEARTS_TOKEN_URL,{method:'POST',redirect:'error',signal:signal??AbortSignal.timeout(30000),
   headers:{DPoP:codeartsDpop(auth,now),'Content-Type':'application/x-www-form-urlencoded'},
-  body:new URLSearchParams({client_id:'codearts-agent',code_verifier:verifier,grant_type:'refresh_token',refresh_token:auth.refresh_token}).toString()});}
+  body:new URLSearchParams({client_id:typeof auth.clientId==='string'&&auth.clientId?auth.clientId:'codearts-agent',code_verifier:verifier,grant_type:'refresh_token',refresh_token:auth.refresh_token}).toString()});}
  catch {throw new AppError('CodeArts 续期请求未确认；未自动重试',503,'codearts_refresh_unconfirmed');}
  // A gateway rate limiter can return HTML/plain text. Its explicit rejection did
  // not issue credentials, and must not become a permanent unknown-rotation marker.
@@ -257,14 +282,46 @@ export async function refreshCodeArtsAuth(auth,{fetchImpl=fetch,now=Date.now(),s
  return {...auth,accessKey:c.access_key_id,secretKey:c.secret_access_key,securitytoken:c.security_token,expires_at:c.expiration,refresh_token:data.refresh_token};
 }
 
+/** The 0.2.x DESKTOP product (Electron, not the VS Code extension) stores the same
+ * IAM session as an Electron-safeStorage secret: `<userData>/secretStorage/
+ * sha256('authSession:<region>').enc`, i.e. base64 text whose decoded bytes are a
+ * `v10` DPAPI+AES-256-GCM blob. A `.enc` path therefore never goes through SQLite. */
+export const isCodeArtsDesktopFile = file => /\.enc$/i.test(String(file ?? ''));
+
 async function nativeCodeArtsStored(file) {
+ if (isCodeArtsDesktopFile(file)) {
+  let bytes;
+  try { bytes = await readFile(file); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  return { text: bytes.toString('utf8'), sourceHash: sha256Hex(bytes), kind: 'electron_safe_storage' };
+ }
  const {DatabaseSync}=await import('node:sqlite');const db=new DatabaseSync(file,{readOnly:true});
  try {const value=db.prepare('select value from ItemTable where key=?').get('secret://'+JSON.stringify({extensionId:'huaweicloud.authentication',key:'HuaweiCloudSession'}))?.value;
   if(!value)return null;const text=typeof value==='string'?value:Buffer.from(value).toString('utf8');return {text,sourceHash:sha256Hex(Buffer.from(text))};
  }finally{db.close();}
 }
+/** Translate the desktop payload `{session,loginContext}` into the auth shape the rest of
+ * this module already uses (`accessKey`/`secretKey`/`securitytoken`/`refresh_token`/
+ * `expires_at` + `loginContext.dpopKeyPair.{privateKeyJwk,publicKeyJwk}`). The desktop
+ * file keeps both DPoP keys as JSON *strings*, so they are parsed here once. */
+export function codeArtsAuthFromNative(data) {
+ const session=data?.session;
+ if(!session||typeof session.accessKey!=='string'||typeof session.securityToken!=='string')return data;
+ const parse=value=>{if(value===null||value===undefined)return null;return typeof value==='string'?(value?JSON.parse(value):null):value;};
+ const context=data.loginContext??{};
+ let privateKeyJwk=null,publicKeyJwk=null;
+ try { privateKeyJwk=parse(context?.dpopKeyPair?.privateKey); publicKeyJwk=parse(context?.dpopKeyPair?.publicKey); }
+ catch { /* a malformed DPoP pair only disables renewal, never the current AK/SK */ }
+ return {...session,securitytoken:session.securityToken,
+  // The refresh request is bound to the client that obtained the token: the
+  // desktop product signs in as `codearts`, the extension as `codearts-agent`.
+  clientId:typeof session.clientId==='string'&&session.clientId?session.clientId:null,
+  refresh_token:typeof session.refreshToken==='string'?session.refreshToken:null,
+  expires_at:Number.isFinite(session.expiresAt)?new Date(session.expiresAt).toISOString():null,
+  loginContext:{pkcePair:context?.pkcePair??null,dpopKeyPair:{privateKeyJwk,publicKeyJwk}}};
+}
 async function decryptCodeArtsAuth(stored,localState) {
- const bytes=Buffer.from(JSON.parse(stored.text)?.data??[]),wrapped=Buffer.from(JSON.parse(await readFile(localState,'utf8'))?.os_crypt?.encrypted_key??'','base64');
+ const bytes=stored.kind==='electron_safe_storage'?Buffer.from(String(stored.text??'').trim(),'base64'):Buffer.from(JSON.parse(stored.text)?.data??[]),wrapped=Buffer.from(JSON.parse(await readFile(localState,'utf8'))?.os_crypt?.encrypted_key??'','base64');
  if(!['v10','v11'].includes(bytes.subarray(0,3).toString())||wrapped.subarray(0,5).toString()!=='DPAPI')throw new AppError('CodeArts 本机凭据封装未识别',401,'codearts_storage_format');
  const key=await dpapiUnprotect(wrapped.subarray(5));let plain;
  try{const d=createDecipheriv('aes-256-gcm',key,bytes.subarray(3,15));d.setAuthTag(bytes.subarray(-16));plain=Buffer.concat([d.update(bytes.subarray(15,-16)),d.final()]);return JSON.parse(plain.toString('utf8'));}
@@ -282,8 +339,8 @@ async function resolveCodeArtsFresh(base,file,options={}) {
  const stored=await nativeCodeArtsStored(file);if(!stored)return base;
  const cacheFile=options.cacheFile??join(process.env.LOCALAPPDATA??dirname(file),'AI Credit Gateway','private-cache','codearts-'+sha256Hex(Buffer.from(file)).slice(0,16)+'.json');
  const now=options.now??Date.now();
- const localState=options.localState??join(dirname(dirname(dirname(file))),'Local State');
- const original=await (options.decryptAuthImpl??decryptCodeArtsAuth)(stored,localState);
+ const localState=options.localState??join(isCodeArtsDesktopFile(file)?dirname(dirname(file)):dirname(dirname(dirname(file))),'Local State');
+ const original=codeArtsAuthFromNative(await (options.decryptAuthImpl??decryptCodeArtsAuth)(stored,localState));
  const sourceCredentialHash=sha256Hex(Buffer.from(JSON.stringify([base.principal,original.refresh_token??null,original.loginContext?.pkcePair?.codeVerifier??null,['kty','crv','x','y'].map(k=>original.loginContext?.dpopKeyPair?.publicKeyJwk?.[k]??null)])));
  const matches=value=>value?.sourceCredentialHash?value.sourceCredentialHash===sourceCredentialHash:value?.sourceHash===stored.sourceHash;
  let cached;
@@ -329,7 +386,7 @@ export async function resolveCodeArtsCredential(account={},config={},options={})
  const file=ref&&ref!=='auto'?(typeof config.path==='function'?config.path(ref):ref):defaultCodeArtsStateDb();
  const owned={};for(const key of ['cacheFile','localState'])if(account?.credentials?.[key])owned[key]=typeof config.path==='function'?config.path(account.credentials[key]):account.credentials[key];options={...options,...owned};
  const flightKey=file+'|'+(options.cacheFile??'default');if(codeartsRefreshFlights.has(flightKey))return codeartsRefreshFlights.get(flightKey);
- const pending=(async()=>resolveCodeArtsFresh(await readCodeArtsLocalSession({file}),file,options))();codeartsRefreshFlights.set(flightKey,pending);
+ const pending=(async()=>resolveCodeArtsFresh(await readCodeArtsLocalSession({file,localState:options.localState}),file,options))();codeartsRefreshFlights.set(flightKey,pending);
  try{return await pending}finally{codeartsRefreshFlights.delete(flightKey);}
 }
 

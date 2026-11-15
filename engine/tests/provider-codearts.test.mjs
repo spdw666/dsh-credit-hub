@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,mkdir,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,dirname} from 'node:path';
+import {createHash} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {
   CODEARTS_ORIGIN,CODEARTS_BALANCE_SOURCE,buildCanonicalRequest,canonicalQuery,canonicalUri,codeartsBalance,codeartsCampaigns,
@@ -375,6 +376,14 @@ test('CodeArts refresh uses exact official STS, PKCE and ES256 DPoP without secr
     return Response.json({credentials:{access_key_id:'fixture-ak',secret_access_key:'fixture-sk',security_token:'fixture-token',expiration:new Date(200000).toISOString()},refresh_token:'fixture-next'});
   }});
   assert.equal(calls,1);assert.equal(refreshed.refresh_token,'fixture-next');assert.equal(auth.refresh_token,'fixture-refresh');
+  // The desktop product obtains its token as `codearts`; replaying the refresh as
+  // `codearts-agent` would ask a different client to redeem another client's grant.
+  calls=0;
+  const desktop=await refreshCodeArtsAuth({...auth,clientId:'codearts'},{now:100000,fetchImpl:async(url,o)=>{
+    calls++;assert.equal(new URLSearchParams(o.body).get('client_id'),'codearts');
+    return Response.json({credentials:{access_key_id:'fixture-ak',secret_access_key:'fixture-sk',security_token:'fixture-token',expiration:new Date(200000).toISOString()},refresh_token:'fixture-desktop-next'});
+  }});
+  assert.equal(calls,1);assert.equal(desktop.refresh_token,'fixture-desktop-next');
   calls=0;const error=await refreshCodeArtsAuth(auth,{fetchImpl:async()=>{calls++;return Response.json({error_code:'STS5.1806',error_msg:'fixture-refresh'},{status:400})}}).catch(e=>e);
   assert.equal(calls,1);assert.equal(error.code,'codearts_refresh_failed');assert.equal(error.upstreamCode,'STS5.1806');assert.equal(error.message.includes('fixture-refresh'),false);
 });
@@ -466,4 +475,50 @@ for(const state of ['CLAIMED','CONFIRMED','CLAIMABLE'])test('CodeArts confirmOnl
  assert.equal(result.submitted,state==='CLAIMED');
  if(state==='CLAIMABLE'){assert.equal(result.claimed,false);assert.equal(result.reason,'pending_confirmation_changed')}
  else assert.equal(result.claimed,true);
+});
+
+// ------------------------------------------------------------------ desktop safeStorage (0.2.x Electron product)
+const DESKTOP_PAYLOAD={
+  session:{id:'session-fixture',userId:'uid-fixture',userName:'hw-fixture',domainId:'domain-fixture',
+    accessKey:AK,secretKey:SK,securityToken:ST,refreshToken:'refresh-fixture',expiresAt:1794748956449,
+    clientId:'codearts',stationType:'HC',createdAt:1794700000000,updatedAt:1794740000000},
+  loginContext:{pkcePair:{codeVerifier:'verifier-fixture',codeChallenge:'challenge-fixture'},
+    dpopKeyPair:{privateKey:'{"kty":"EC","crv":"P-256","x":"x-fixture","y":"y-fixture","d":"d-fixture"}',
+      publicKey:'{"kty":"EC","crv":"P-256","x":"x-fixture","y":"y-fixture"}'}},
+};
+
+test('CodeArts desktop session payload maps onto the extension auth shape and a broken DPoP pair never blocks the AK/SK',async()=>{
+  const {codeArtsAuthFromNative}=await import('../src/provider-codearts.mjs');
+  const auth=codeArtsAuthFromNative(DESKTOP_PAYLOAD);
+  assert.equal(auth.accessKey,AK);assert.equal(auth.secretKey,SK);
+  assert.equal(auth.securitytoken,ST);
+  assert.equal(auth.refresh_token,'refresh-fixture');
+  assert.equal(auth.expires_at,'2026-11-15T13:22:36.449Z');
+  assert.deepEqual(Object.keys(auth.loginContext.dpopKeyPair.privateKeyJwk).sort(),['crv','d','kty','x','y']);
+  assert.equal(auth.loginContext.dpopKeyPair.publicKeyJwk.d,undefined);
+  assert.equal(auth.loginContext.pkcePair.codeVerifier,'verifier-fixture');
+  const broken=codeArtsAuthFromNative({...DESKTOP_PAYLOAD,loginContext:{dpopKeyPair:{privateKey:'{not-json',publicKey:null}}});
+  assert.equal(broken.securitytoken,ST);assert.equal(broken.loginContext.dpopKeyPair.privateKeyJwk,null);
+  const untouched={text:'SAMPLE_ENVELOPE'};assert.equal(codeArtsAuthFromNative(untouched),untouched);
+});
+
+test('CodeArts desktop .enc is decoded from base64 without SQLite and keeps the extension principal derivation',async()=>{
+  const mod=await import('../src/provider-codearts.mjs');
+  const dir=await mkdtemp(join(tmpdir(),'dsh-codearts-desktop-'));
+  try{
+    const profile=join(dir,'codearts'),file=join(profile,'secretStorage',createHash('sha256').update('authSession:cn-north-4').digest('hex')+'.enc');
+    await mkdir(dirname(file),{recursive:true});
+    await writeFile(file,'djEwc2FtcGxlLW9wYXF1ZS1jaXBoZXJ0ZXh0');
+    await writeFile(join(profile,'Local State'),JSON.stringify({os_crypt:{encrypted_key:'SAMPLE'}}));
+    const kinds=[];
+    const session=await mod.readCodeArtsDesktopSession({file,decryptAuthImpl:async stored=>{kinds.push(stored.kind);return DESKTOP_PAYLOAD;}});
+    assert.deepEqual(kinds,['electron_safe_storage']);
+    assert.equal(session.accessToken,ST);assert.equal(session.securityToken,ST);
+    assert.equal(session.principal,'codearts:'+createHash('sha256').update('uid-fixture').digest('hex').slice(0,24));
+    assert.equal(session.loginType,'desktop_safe_storage');assert.equal(session.source,'ide_safe_storage');
+    assert.equal(session.expiresAt,'2026-11-15T13:22:36.449Z');
+    assert.equal(session.stationType,'HC');assert.equal(session.domainId,'domain-fixture');
+    await assert.rejects(mod.readCodeArtsLocalSession({file,decryptAuthImpl:async()=>({session:{userId:'uid-fixture',securityToken:ST}})}),{code:'codearts_session_missing'});
+    await assert.rejects(mod.readCodeArtsLocalSession({file:join(profile,'secretStorage','absent-session.enc')}),{code:'codearts_state_unavailable'});
+  }finally{await rm(dir,{recursive:true,force:true});}
 });

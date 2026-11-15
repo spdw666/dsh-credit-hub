@@ -41,7 +41,7 @@ dsh plugin add github:spdw666/dsh-credit-hub
 
 默认每 60 秒检查受支持客户端的已知登录位置。可解析的已登录格式会复制到插件独立目录，识别身份，建立账号/上游，再获取实际模型目录；新路由默认启用，可在账户页关闭。原客户端只读，既有账号开关与路由保持。同一身份更新、不同身份新增。新账号自动登记已核实的签到/每日额度任务，只有用户启用全局排程后才执行；既有账号的任务与禁用选择不覆盖。
 
-候选包含 WorkBuddy、Trae、千问办公、ZCode、MiniMax、Qoder、CodeBuddy、CodeArts、Cline、LobsterAI、Loomy、小浣熊和 OpenCode 的已知版本路径。未安装、未登录、需要独立配置、已接入及目录失败分开呈现。加密 WorkBuddy、Qoder 原生身份、MiniMax lease、OpenCode 独立服务等条件未满足时不会伪装成已接通。SQLite/WAL 与 Trae 身份元数据纳入内容校验。
+候选包含 WorkBuddy、Trae、千问办公、ZCode、MiniMax、Qoder、CodeBuddy、CodeArts、Cline、LobsterAI、Loomy、小浣熊和 OpenCode 的已知版本路径。CodeArts 同时覆盖扩展形态（`codearts-agent` 的 VS Code globalStorage）与 0.2.x 桌面形态（`codearts/secretStorage/authSession:<region>` 的 Electron safeStorage 密文，按区域枚举文件名）；两者是不同的候选，同一台机器上互不影响。未安装、未登录、需要独立配置、已接入及目录失败分开呈现。加密 WorkBuddy、Qoder 原生身份、MiniMax lease、OpenCode 独立服务等条件未满足时不会伪装成已接通。SQLite/WAL、Electron safeStorage 信封与 Trae 身份元数据纳入内容校验。
 
 ### 账号与模型
 

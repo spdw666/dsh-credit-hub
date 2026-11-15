@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Discover the CodeArts 0.2.x DESKTOP product (Electron) as its own candidate: `<userData>/secretStorage/sha256('authSession:<region>').enc` beside `<userData>/Local State`, for the seven IAM regions the desktop build can sign in to. The extension-era `codearts-agent/User/globalStorage/state.vscdb` candidate is unchanged, so a machine that has either (or both) reports only the one it actually has.
+- Read that session without SQLite: the `.enc` file is base64 text whose decoded bytes are a `v10` DPAPI+AES-256-GCM blob, so `nativeCodeArtsStored` hands `.enc` paths back as raw text and `decryptCodeArtsAuth` unwraps them from base64. `codeArtsAuthFromNative` normalizes `{session,loginContext}` (`securityToken`/`refreshToken`/`expiresAt`, DPoP keys stored as JSON strings) into the auth shape the rest of the adapter already consumes, so signing, credits, catalog and check-in keep a single code path.
+- Snapshot every sibling `.enc` into the owned copy, root the Electron profile at `<userData>`, dedupe markers so a seven-region candidate probes each directory once, and scope the refresh cache per identity: the desktop product keeps one secret per product, so two signed-in accounts differ only in content and would otherwise overwrite each other's rotating refresh token. Renewal replays the session's own `clientId` (`codearts` for the desktop product, `codearts-agent` for the extension). Tests cover candidate shape, detection and per-identity caches (`tests/discovery.test.mjs`), plus payload normalization, `.enc` decoding, principal derivation and client-bound renewal (`engine/tests/provider-codearts.test.mjs`).
+
 ## 0.2.10
 
 - Add audited DSH 0.2.2-rc.3 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
