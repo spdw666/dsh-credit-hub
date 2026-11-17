@@ -119,6 +119,54 @@ export class Scheduler {
     if(this.stopped||this.tickFlight)return;
     this.tickFlight=this.performTick();try{return await this.tickFlight;}finally{this.tickFlight=null;}
   }
+  /**
+   * Renew desktop sessions that are close to expiry. LobsterAI serves a 30-day access token and CodeBuddy
+   * 28 days, both with a long-lived refresh token; renewing a week (LobsterAI) / three days (Buddy) early
+   * means a desktop install can be uninstalled and the account still keeps signing in.
+   * Runs at most every 30 minutes, only for accounts that are enabled for the check-in task, and never
+   * retries a session the server already declared terminally dead.
+   */
+  /** Re-read expiry metadata for desktop logins that cannot be renewed, so the
+   * account table can show "expires in N days → log in again" before the daily
+   * check-in starts failing. Never renews and never logs anyone out. */
+  async refreshSessionHealth() {
+    const credentials=this.service?.credentials;
+    const table={...(this.ledger.get('credit-hub:credential-expiry:v1')??{})};
+    const accounts=(this.config.value.accounts??[]).filter(a=>a.enabled!==false);
+    for(const account of accounts) {
+      if(account.platform!=='loomy')continue;
+      const row=await credentials.sessionLifetime(account.id);
+      if(row&&Number.isFinite(row.expiresAtMs))table[account.id]={accountId:account.id,expiresAtMs:row.expiresAtMs,observedAtMs:Date.now(),renewable:false};
+    }
+    this.ledger.set('credit-hub:credential-expiry:v1',table);
+    return table;
+  }
+  async renewalTick() {
+    const service=this.service,credentials=service?.credentials;
+    if(typeof credentials?.renewDesktopSession!=='function')return {skipped:'no_credentials'};
+    const now=Date.now();if(now-(this.automaticRenewalAt??0)<1800000)return {skipped:'not_due'};
+    this.automaticRenewalAt=now;
+    const results=[];
+    for(const account of (this.config.value.accounts??[])) {
+      if(account.enabled===false)continue;
+      if(!['lobster','codebuddy','workbuddyai','qoder'].includes(account.platform))continue;
+      const task=(account.tasks??[]).find(t=>t.id==='daily-checkin');if(!task||task.enabled===false)continue;
+      const prior=credentials.renewalState?.(account.id);
+      // A terminal "re-login required" verdict must not be retried every tick; only a new desktop login
+      // (which resets the credential source) may clear it.
+      if(prior?.loginRequired===true&&prior?.ok===false)continue;
+      let credential;
+      try { credential=await credentials.resolve(account.id,{force:true}); }
+      catch (error) { results.push({accountId:account.id,status:'unavailable',code:error.code??'credential_error'}); continue; }
+      const due=account.platform==='qoder'?(credentials.shouldRenewQoder?.(credential)??false):account.platform==='lobster'?await (await import('./provider-lobster.mjs')).shouldRenewLobster({expiresAtMs:credential.expiresAtMs})
+        :(await import('./provider-buddy.mjs')).shouldRenewBuddy({expiresAtMs:credential.expiresAtMs});
+      if(!due){results.push({accountId:account.id,status:'fresh',expiresAt:Number.isFinite(credential.expiresAtMs)?new Date(credential.expiresAtMs).toISOString():null});continue;}
+      try { const renewed=account.platform==='qoder'?await credentials.renewQoder(account,{trigger:'schedule'}):await credentials.renewDesktopSession(account,{trigger:'schedule'});results.push({accountId:account.id,status:'renewed',expiresAt:Number.isFinite(renewed.expiresAtMs)?new Date(renewed.expiresAtMs).toISOString():null}); }
+      catch (error) { results.push({accountId:account.id,status:error.loginRequired===true?'login_required':'error',code:error.code??'renew_failed'}); }
+    }
+    if(results.length)this.ledger.set('credential-renewal-last',{at:new Date(now).toISOString(),results});
+    return {results};
+  }
   async performTick() {
     if(this.service&&clientUpdateDue(this.service)){
       this.track(runClientUpdateCheck(this.service).catch(error=>{this.ledger.set('client-updates',{status:'error',error:error.message,checkedAt:new Date().toISOString()});}));
@@ -130,6 +178,15 @@ export class Scheduler {
       this.track(runAutomaticWorkBuddyTasks(this.service).then(result=>{if(result.enabled)this.ledger.set('wb-automatic-tasks-last',{at:Date.now(),...result});}).catch(error=>{this.ledger.set('wb-automatic-tasks-last',{at:Date.now(),status:'error',code:error.code??'wb_auto_tasks_error'});}));
     }
     if(this.service?.config?.value?.workbuddy?.rotation?.enabled===true){this.track(evaluateWorkBuddyRotation(this.service,{dryRun:false},{scheduled:true}).catch(error=>{this.ledger.set('wb-rotation-last-error',{at:Date.now(),code:error.code??'wb_rotation_error'});}));}
+    // Silent credential renewal is independent of the check-in schedule: closing the check-in
+    // windows must not let a desktop login state lapse.
+    await this.renewalTick();
+    // Sessions without any renewal path (Loomy) still deserve an early hint: a
+    // probe every 6h keeps the account table honest without hammering upstream.
+    if(Date.now()-(this.sessionHealthAt??0)>=21600000){
+      this.sessionHealthAt=Date.now();
+      this.track(this.refreshSessionHealth().catch(()=>{}));
+    }
     const s=this.config.value.scheduler;if(!s.enabled)return;
     // Compatibility for integrations exposing only a batch claim API. Native
     // ClaimService always has run(); its automatic and manual requests take the

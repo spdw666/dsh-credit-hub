@@ -27,11 +27,14 @@ test('event payload whitelist masks identifiers and never emits credentials, URL
 
 test('five operational event families and update.available are mapped; stale observations do not reset low-balance edge',async t=>{
   const delivered=[],router=createEventRouter({ledger:memory(),now:()=>NOW,settings:{cooldownSeconds:0},onNativeEvent:event=>delivered.push(event)});t.after(()=>router.close());
-  const balances=[{accountId:account.id,value:5,total:100,unit:'积分',checkedAt:at(-1000)}],credentials=[{accountId:account.id,expiresAtMs:NOW+2*DAY}],records=[claim(1),{id:2,time:at(-500),account_id:account.id,task:'model-relay',status:'switched',result:{routeId:'SAMPLE_ROUTE',reasonCode:'credits_exhausted'}}];
+  const balances=[{accountId:account.id,value:5,total:100,unit:'积分',checkedAt:at(-1000)}],credentials=[{accountId:account.id,expiresAtMs:NOW+2*DAY,renewable:false}],records=[claim(1),{id:2,time:at(-500),account_id:account.id,task:'model-relay',status:'switched',result:{routeId:'SAMPLE_ROUTE',reasonCode:'credits_exhausted'}}];
   router.evaluate({accounts:[account],balances,credentials,records});await router.flush();assert.deepEqual(delivered.map(e=>e.type).sort(),['balance.low','checkin.failed','credential.expiring','relay.triggered']);
   router.evaluate({accounts:[account],balances:[{...balances[0],stale:true}],credentials,records});router.evaluate({accounts:[account],balances,credentials,records});await router.flush();assert.equal(delivered.length,4);
-  router.evaluate({accounts:[account],balances:[{...balances[0],value:200}],credentials:[{accountId:account.id,expiresAtMs:NOW+30*DAY}]});
-  router.evaluate({accounts:[account],balances:[{...balances[0],checkedAt:at(0)}],credentials:[{accountId:account.id,expiresAtMs:NOW+DAY}]});await router.flush();assert.equal(delivered.filter(e=>e.type==='balance.low').length,2);assert.equal(delivered.filter(e=>e.type==='credential.expiring').length,2);
+  router.evaluate({accounts:[account],balances:[{...balances[0],value:200}],credentials:[{accountId:account.id,expiresAtMs:NOW+30*DAY,renewable:false}]});
+  router.evaluate({accounts:[account],balances:[{...balances[0],checkedAt:at(0)}],credentials:[{accountId:account.id,expiresAtMs:NOW+DAY,renewable:false}]});await router.flush();assert.equal(delivered.filter(e=>e.type==='balance.low').length,2);assert.equal(delivered.filter(e=>e.type==='credential.expiring').length,2);
+  // A credential that renews itself is deliberately never escalated: its expiry
+  // hint is silence, not an operator task.
+  router.evaluate({accounts:[account],balances,credentials:[{accountId:account.id,expiresAtMs:NOW+2*DAY,renewable:true}]});await router.flush();assert.equal(delivered.filter(e=>e.type==='credential.expiring').length,2);
   router.emit({type:'update.available',id:'release-0.2.0',data:{currentVersion:'0.1.1',latestVersion:'0.2.0',url:'SAMPLE_PRIVATE_URL'}});await router.flush();assert.equal(delivered.at(-1).type,'update.available');assert.equal(delivered.at(-1).data.latestVersion,'0.2.0');assert.equal('url' in delivered.at(-1).data,false);
   assert.equal(EVENT_TYPES.length,6);
 });

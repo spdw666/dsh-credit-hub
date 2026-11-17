@@ -47,6 +47,23 @@ export function accountConnectionLabel(account) {
   return account.setupRequired || account.connectionState === 'setup_required' ? '待独立配置' : account.connectionState === 'snapshot_required' ? '待凭据快照' : '未核验';
 }
 
+export function renewalLabel(health) {
+  if (!health || typeof health !== 'object') return '';
+  const at = health.at ? new Date(health.at) : null;
+  const when = at && !Number.isNaN(at.getTime()) ? at.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+  if (health.ok === false) return `续期失败${when ? ` · ${when}` : ''}${health.error ? `（${health.error}）` : ''}`;
+  // Renewal is silent: a platform that renews itself is reported as healthy and
+  // deliberately shows NO expiry date. Only the un-renewable ones (Loomy) get a
+  // countdown, because there the operator has to act before it lapses.
+  if (health.renewable !== false) return `续期正常${when ? ` · ${when}` : ''}`;
+  const until = health.expiresAt ? new Date(health.expiresAt) : null;
+  if (!until || Number.isNaN(until.getTime())) return '不可自动续期 · 到期需重新登录';
+  const day = until.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+  const days = Math.ceil((until.getTime() - Date.now()) / 86400000);
+  return days >= 0
+    ? `不可自动续期 · 有效至 ${day} · 剩 ${days} 天，到期需重新登录`
+    : `不可自动续期 · 已于 ${day} 过期，请重新登录`;
+}
 export function Accounts({ snapshot, busy, perform }) {
   const [query, setQuery] = useState('');
   const [platform, setPlatform] = useState('all');
@@ -65,7 +82,7 @@ export function Accounts({ snapshot, busy, perform }) {
     <details className="credit-hub__operation-details"><summary>后装 Agent 自动发现与接入</summary><DiscoveryPanel snapshot={snapshot} busy={busy} perform={perform}/></details>
     <p className="credit-hub__muted">“模型调用”只控制积分调用资格；停用模型调用后，自动签到与任务仍由独立排程控制。余额仅在点击刷新时请求上游。</p>
     {removal && <div role="alert" className="credit-hub__notice"><strong>删除账号：{removal.label || removal.platform}</strong><p>删除该账号、模型引用及独占的插件凭据快照，并阻止自动发现重新导入同一身份。原客户端与无凭据历史记录保留。</p><div className="credit-hub__toolbar"><Button disabled={busy} onClick={() => perform('删除账号', {method:'POST',path:'/hub/accounts/remove',body:{accountId:removal.id,confirm:true}}).then(ok=>{if(ok)setRemoval(null);})}>确认删除，不保留登录凭据</Button><Button disabled={busy} onClick={()=>setRemoval(null)}>取消</Button></div></div>}
-    <Table columns={['账户', '平台', '模型调用', '账户状态', '凭据方式 / 核验', '操作']} count={visible.length} empty={accounts.length ? '没有匹配的账户' : '还没有账户'}>{visible.map((account, index) => <tr key={account.id || index}><td><span className="credit-hub__cell-main">{account.label || `账户${index + 1}`}</span></td><td>{text(account.platform)}</td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 模型调用`} checked={account.inferenceEnabled !== false} disabled={busy} onChange={event => update(account, { inferenceEnabled: event.target.checked })}>{account.inferenceEnabled !== false ? '参与调用' : '已停用'}</Check></td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 账户状态`} checked={account.enabled !== false} disabled={busy} onChange={event => update(account, { enabled: event.target.checked })}>{account.enabled !== false ? '启用' : '停用'}</Check></td><td><span className="credit-hub__cell-detail">{({ file: '独立文件快照', desktop: '客户端快照', 'api-key': 'API Key' })[account.credentialMode] || text(account.credentialMode, '本地凭据')}</span><Badge pending={account.connectionState !== 'not_checked'}>{accountConnectionLabel(account)}</Badge></td><td><Button disabled={busy} aria-label={`删除 ${account.label || account.platform} 账号`} onClick={()=>setRemoval(account)}>删除账号</Button></td></tr>)}</Table>
+    <Table columns={['账户', '平台', '模型调用', '账户状态', '凭据方式 / 核验', '操作']} count={visible.length} empty={accounts.length ? '没有匹配的账户' : '还没有账户'}>{visible.map((account, index) => <tr key={account.id || index}><td><span className="credit-hub__cell-main">{account.label || `账户${index + 1}`}</span></td><td>{text(account.platform)}</td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 模型调用`} checked={account.inferenceEnabled !== false} disabled={busy} onChange={event => update(account, { inferenceEnabled: event.target.checked })}>{account.inferenceEnabled !== false ? '参与调用' : '已停用'}</Check></td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 账户状态`} checked={account.enabled !== false} disabled={busy} onChange={event => update(account, { enabled: event.target.checked })}>{account.enabled !== false ? '启用' : '停用'}</Check></td><td><span className="credit-hub__cell-detail">{({ file: '独立文件快照', desktop: '客户端快照', 'api-key': 'API Key' })[account.credentialMode] || text(account.credentialMode, '本地凭据')}</span><Badge pending={account.connectionState !== 'not_checked'}>{accountConnectionLabel(account)}</Badge>{account.credentialHealth ? <span className="credit-hub__cell-detail">{renewalLabel(account.credentialHealth)}</span> : null}</td><td><Button disabled={busy} aria-label={`删除 ${account.label || account.platform} 账号`} onClick={()=>setRemoval(account)}>删除账号</Button></td></tr>)}</Table>
   </>;
 }
 

@@ -18,6 +18,9 @@ export async function createService(file,{schedule=false,workbuddyRuntime={}}={}
   rememberSecret(keys.adminKey);rememberSecret(keys.apiKey);
   let closing;const service={config,ledger,credentials,platforms,claims,router,scheduler,keys,keysFile,workbuddyRuntime,close(){return closing??=(async()=>{service.workbuddyTaskJobsClosing=true;service.workbuddyExecutorController?.abort(new Error('WB executor service shutdown'));await scheduler.stop();await Promise.allSettled([...(service.workbuddyTaskFlights??[]),...(service.workbuddyTaskJobFlights??[]),workBuddyRotationFlight(service)]);ledger.close();})();}};
   service.workbuddyExecutorController=new AbortController();registerWorkBuddyTaskExecutors(service);
+  // Synchronous view over the last observed expiry metadata: the management
+  // snapshot is built synchronously, so probing here would stall the UI.
+  service.sessionHealth=accountId=>{const row=(ledger.get('credit-hub:credential-expiry:v1')??{})[accountId];return row&&Number.isFinite(row.expiresAtMs)?{kind:'read',ok:true,expiresAt:new Date(row.expiresAtMs).toISOString(),at:new Date(row.observedAtMs??Date.now()).toISOString(),renewable:row.renewable!==false}:null;};
   scheduler.service=service;
   router.relay.balanceSource=()=>service.balanceCache;
   if(schedule)scheduler.start();return service;

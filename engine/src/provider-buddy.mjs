@@ -5,7 +5,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {createDecipheriv,randomUUID} from 'node:crypto';
 import {dpapiUnprotect} from './windows-crypto.mjs';
 import {runNativeHelper} from './credentials.mjs';
-import {AppError,rememberSecret} from './util.mjs';
+import {AppError,rememberSecret,atomicJson} from './util.mjs';
 import {selectCliModels,prepareChatBody,declaredTools} from '../vendor/workbuddy-core.mjs';
 import {providerFetch,providerJson} from './provider-http.mjs';
 import {buddyChatRejection} from './provider-rate-limit.mjs';
@@ -15,8 +15,22 @@ export function normalizeBuddyCredential(raw,{expectedDomain,filePath,proxyUrl}=
   const accessToken=raw.auth?.accessToken??raw.accessToken??raw.token,uid=String(raw.account?.uid??raw.uid??raw.principal??''),domain=raw.auth?.domain??raw.domain;
   if(typeof accessToken!=='string'||!accessToken||!uid)throw new AppError('Buddy登录态待解密或已退出',401,'provider_login_required');rememberSecret(accessToken);
   if(expectedDomain&&domain!==expectedDomain)throw new AppError('Buddy登录区域与账号配置不符',401,'provider_region_mismatch');
-  const c={accessToken,uid,principal:uid,domain,filePath,proxyUrl,source:'desktop',billingPlatform:domain.endsWith('.cn')?'workbuddy':domain,billingPrincipal:uid,expiresAtMs:raw.auth?.expiresAt??raw.expiresAt};endpoints(c);return c;
+  // The IDE stores a full refreshable pair (auth.refreshToken + auth.refreshExpiresAt); keeping it is what
+  // makes silent renewal possible once the 28-day access token lapses.
+  const refreshTokenRaw=raw.auth?.refreshToken??raw.refreshToken;
+  const refreshToken=typeof refreshTokenRaw==='string'?refreshTokenRaw.trim():'';
+  if(refreshToken)rememberSecret(refreshToken);
+  const c={accessToken,refreshToken,refreshTokenPresent:refreshToken.length>0,refreshExpiresAtMs:buddyExpiryMs(raw.auth?.refreshExpiresAt??raw.refreshExpiresAt),uid,principal:uid,domain,filePath,proxyUrl,source:'desktop',billingPlatform:domain.endsWith('.cn')?'workbuddy':domain,billingPrincipal:uid,expiresAtMs:buddyExpiryMs(raw.auth?.expiresAt??raw.expiresAt)??jwtExpiryMs(accessToken)};endpoints(c);return c;
 }
+/** Accepts epoch seconds, epoch millis, numeric strings or ISO dates. Unknown → null. */
+export function buddyExpiryMs(value){
+  if(typeof value==='number'&&Number.isFinite(value))return value>1e12?value:value>1e9?value*1000:null;
+  if(typeof value==='string'&&/^\d+$/.test(value.trim()))return buddyExpiryMs(Number(value.trim()));
+  if(typeof value==='string'){const t=Date.parse(value);return Number.isFinite(t)?t:null}
+  return null;
+}
+/** exp (ms) from an unverified JWT payload — used only to expose expiry, never to trust identity claims. */
+export function jwtExpiryMs(token){try{const payload=JSON.parse(Buffer.from(String(token).split('.')[1]??'','base64url').toString());return Number.isFinite(payload?.exp)?payload.exp*1000:null}catch{return null}}
 async function readCodeBuddy(file,edition,localState){
   const db=new DatabaseSync(file,{readOnly:true});let value;try{value=db.prepare('SELECT value FROM ItemTable WHERE key=?').get('secret://'+JSON.stringify({extensionId:'tencent-cloud.coding-copilot',key:'planning-genie.new.accessToken'+(edition==='cn'?'cn':'')}))?.value}finally{db.close()}
   if(!value)throw new AppError('CodeBuddy当前区域尚无登录态',401,'provider_login_required');
@@ -67,3 +81,46 @@ export async function buddyChat(upstream,c,input,signal,options={}){
 }
 export const codeBuddyProvider={resolve:resolveBuddyCredential,models:buddyModels,health:buddyHealth,status:buddyStatus,claim:buddyClaim,chat:buddyChat};
 export const workBuddyAIProvider=codeBuddyProvider;
+
+// ------------------------------------------------------------------ silent renewal (token expiry)
+// Endpoint and header set verified live 2026-11-16 against the official client flow (antecedents:
+// anye-99/dsh-codearts-auth src/buddy-oauth.ts refreshToken + src/refresh.ts RefreshScheduler):
+//   POST {billing}/v2/plugin/auth/token/refresh   body {}   → {code:0,data:{accessToken,refreshToken,expiresIn}}
+// X-Refresh-Token alone is sufficient; the bearer/domain headers are what the IDE sends. A rotated pair is
+// never written back into state.vscdb (the IDE owns that file); it goes to the gateway snapshot instead.
+export const BUDDY_REFRESH_PATH='/v2/plugin/auth/token/refresh';
+export const BUDDY_RENEW_LEAD_MS=3*24*60*60*1000;
+const BUDDY_REFRESH_TERMINAL_HTTP=new Set([401,403]);
+export async function refreshBuddyCredential(c,{fetchImpl,signal,now=Date.now(),timeoutMs=20000}={}){
+  if(typeof now==='function')now=now();
+  const token=typeof c?.refreshToken==='string'?c.refreshToken.trim():'';
+  if(!token){const e=new AppError('Buddy续期凭据缺失，请先在原客户端重新登录',401,'provider_refresh_login_required');e.loginRequired=true;throw e}
+  const call=fetchImpl??globalThis.fetch;if(typeof call!=='function')throw new AppError('Buddy网络请求需要显式注入fetchImpl',400,'provider_fetch_not_injected');
+  const activeSignal=signal??AbortSignal.timeout(timeoutMs),global=endpoints(c).global;
+  let response;
+  try{
+    response=await call(endpoints(c).billing+BUDDY_REFRESH_PATH,{method:'POST',body:'{}',redirect:'error',signal:activeSignal,headers:{Authorization:'Bearer '+c.accessToken,Accept:'application/json','Content-Type':'application/json','X-Refresh-Token':token,'X-Auth-Refresh-Source':'ide-main','X-Domain':c.domain,'X-User-Id':c.uid,'X-Product':'SaaS','X-Requested-With':'XMLHttpRequest','User-Agent':global?'WorkBuddy/5.5.2':'CLI/2.63.2 CodeBuddy/2.63.2'}});
+  }catch(error){
+    if(activeSignal.aborted)throw new AppError('Buddy续期请求已取消或超时',499,'request_cancelled');
+    const lost=new AppError('Buddy续期结果未确认（网络失败），等待重新读取本机登录态',503,'provider_refresh_unconfirmed');lost.retryable=true;throw lost;
+  }
+  let envelope=null;try{envelope=await response.json()}catch{envelope=null}
+  const code=envelope?.code;
+  if(BUDDY_REFRESH_TERMINAL_HTTP.has(response.status)||code===401||code===403){
+    const e=new AppError(`Buddy续期凭据已失效，请在原客户端重新登录${envelope?.msg?`: ${envelope.msg}`:''}`,401,'provider_refresh_login_required');e.loginRequired=true;e.upstreamCode=typeof code==='number'?code:null;throw e;
+  }
+  const accessToken=typeof envelope?.data?.accessToken==='string'?envelope.data.accessToken.trim():'';
+  if(!response.ok||code!==0||!accessToken){
+    const lost=new AppError(`Buddy续期结果未确认${envelope?.msg?`: ${envelope.msg}`:` (HTTP ${response.status})`}`,503,'provider_refresh_unconfirmed');lost.retryable=true;lost.upstreamCode=typeof code==='number'?code:null;throw lost;
+  }
+  const rotated=typeof envelope.data.refreshToken==='string'&&envelope.data.refreshToken.trim()?envelope.data.refreshToken.trim():token;
+  rememberSecret(accessToken);rememberSecret(rotated);
+  const accessIn=Number(envelope.data.expiresIn),refreshIn=Number(envelope.data.refreshExpiresIn);
+  return {accessToken,refreshToken:rotated,rotated:rotated!==token,expiresAtMs:jwtExpiryMs(accessToken)??(accessIn>0?now+accessIn*1000:null),refreshExpiresAtMs:refreshIn>0?now+refreshIn*1000:jwtExpiryMs(rotated),refreshedAt:new Date(now).toISOString()};
+}
+/** Apply a rotated pair to a resolved credential (used after a successful refresh). */
+export function withBuddyTokens(c,rotated){return {...c,accessToken:rotated.accessToken,refreshToken:rotated.refreshToken??c.refreshToken,refreshTokenPresent:true,expiresAtMs:rotated.expiresAtMs??c.expiresAtMs,refreshExpiresAtMs:rotated.refreshExpiresAtMs??c.refreshExpiresAtMs,source:'gateway_snapshot',renewedAt:rotated.refreshedAt}}
+export function buddySnapshotPath(config,accountId){const dataDir=config?.dataDir;return dataDir&&accountId?join(dataDir,'accounts',accountId,'buddy-session.json'):null}
+export async function readBuddySnapshot(file){if(!file)return null;try{const data=JSON.parse((await readFile(file,'utf8')).replace(/^\uFEFF/,''));return data&&typeof data==='object'?data:null}catch{return null}}
+export async function saveBuddySnapshot(file,snapshot){if(!file)throw new AppError('未配置Buddy续期快照路径',500,'provider_snapshot_path');rememberSecret(snapshot?.accessToken);rememberSecret(snapshot?.refreshToken);await atomicJson(file,{schemaVersion:1,platform:'buddy',managedBy:'ai-credit-gateway',accessToken:snapshot.accessToken,refreshToken:snapshot.refreshToken,expiresAtMs:snapshot.expiresAtMs??null,refreshExpiresAtMs:snapshot.refreshExpiresAtMs??null,uid:snapshot.uid??null,domain:snapshot.domain??null,rotatedAt:snapshot.refreshedAt??new Date().toISOString()});return file}
+export function shouldRenewBuddy({expiresAtMs,now=Date.now(),leadMs=BUDDY_RENEW_LEAD_MS}){return Number.isFinite(expiresAtMs)?expiresAtMs-now<=leadMs:false}

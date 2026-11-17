@@ -3,7 +3,10 @@ import {desktopSseResponse,desktopCompletionLimit} from './provider-sse.mjs';
 // Evidence (read-only; official GitHub netease-youdao/LobsterAI + local install D:/LobsterAI + live probe 2026-10-11):
 //  - Server origin https://lobsterai-server.youdao.com (dist-electron/main/libs/endpoints.js).
 //  - Auth lives in %APPDATA%/LobsterAI/lobsterai.sqlite, table `kv`, keys `auth_tokens` (accessToken/refreshToken)
-//    and `auth_user`. The token is re-read from the DB on EVERY resolve — never cached, never written to disk.
+//    and `auth_user`. The access token is re-read from the DB on every resolve, so a desktop re-login always wins.
+//  - Silent renewal (POST /api/auth/refresh) rotates BOTH tokens. The rotation is NEVER written back into
+//    lobsterai.sqlite (that would sign the running client out); it is kept in data/accounts/<id>/lobster-session.json
+//    and used only when the desktop store has no usable token. See the renewal block below.
 //  - Model catalog: GET /api/models/available → 30 entries (verified live, HTTP 200).
 //  - Balance: GET /api/user/quota + /api/user/profile-summary → free 300 + daily-login 100 ≈ 400 total (verified live).
 //  - Daily check-in (CONFIRMED — the earlier "no daily check-in" conclusion is superseded):
@@ -14,8 +17,9 @@ import {desktopSseResponse,desktopCompletionLimit} from './provider-sse.mjs';
 //    the official client's ActivityServerErrorCode.
 //  - Chat: POST /api/proxy/v1/chat/completions. Upstream answers SSE even for stream:false; failures arrive as
 //    `event:error` with HTTP 200 (converted to AppError here); delta.reasoning_content is INCREMENTAL.
-import {AppError, redact, hash, rememberSecret, dayIn} from './util.mjs';
+import {AppError, redact, hash, rememberSecret, dayIn, atomicJson} from './util.mjs';
 import {readFile} from 'node:fs/promises';
+import {join} from 'node:path';
 
 const thinkingProfiles = new Map();
 const REASONING_LEVEL_ORDER = ['minimal','low','medium','high','xhigh','max'];
@@ -83,6 +87,178 @@ function jwtExp(token) {
   } catch { return null; }
 }
 
+// ------------------------------------------------------------------ silent renewal (token expiry)
+// Official contract (netease-youdao/LobsterAI specs/bugfixes/auth-session-lifecycle): the server issues a
+// 30-day access token and a 180-day refresh token; POST /api/auth/refresh rotates BOTH and the old refresh
+// token must be persisted before the call returns. The request body carries the desktop client's identity
+// fields (keyfrom attribution + installation uuid + userId) next to the refresh token — cross-checked with
+// two independent MIT implementations (xinxinshuhao-create/lobsterai2api internal/upstream/client.go
+// KeyfromBody, and anye-99/dsh-codearts-auth src/lobsterai.ts lobsteraiKeyfromBody).
+// 40100/40101 = refresh token terminally dead → re-login required, never retried in a loop.
+export const LOBSTER_REFRESH_PATH = '/api/auth/refresh';
+export const LOBSTER_RENEW_LEAD_MS = 7 * 24 * 60 * 60 * 1000;
+const LOBSTER_REFRESH_TERMINAL = new Set([40100, 40101]);
+const LOBSTER_KEYFROM_VERSION = '0.1.0';
+
+/**
+ * Read the identity fields the official client sends with a refresh, plus the refresh-token expiry.
+ * READ-ONLY. Only non-secret values leave (keyfrom attribution is a constant, the uuid identifies the
+ * installation, userId is not a credential); the personal yid/phone/nickname never leave.
+ */
+export async function readLobsterRenewalState({dbFile = defaultLobsterDbPath(), openSqlite} = {}) {
+  if (!dbFile) throw new AppError('未找到 LobsterAI 数据目录 (APPDATA)', 401, 'lobster_db_path_missing');
+  const {DatabaseSync} = openSqlite ? {DatabaseSync: openSqlite} : await import('node:sqlite');
+  let db;
+  try { db = new DatabaseSync(dbFile, {readOnly: true}); }
+  catch (error) { throw new AppError(error.code === 'ENOENT' ? '未找到本机 LobsterAI 数据（桌面端未安装或不可读）' : 'LobsterAI 数据库无法只读打开', 401, 'lobster_db_unavailable'); }
+  try {
+    const rows = db.prepare("SELECT key, value FROM kv WHERE key IN ('auth_tokens','auth_user','keyfrom.attribution.v1','installation_uuid')").all();
+    const byKey = Object.fromEntries(rows.map(row => [row.key, row.value]));
+    const parse = (key) => { try { return JSON.parse(byKey[key] ?? 'null'); } catch { return null; } };
+    const tokens = parse('auth_tokens'); const user = parse('auth_user');
+    const keyfrom = parse('keyfrom.attribution.v1');
+    let uuid = null;
+    try { const raw = parse('installation_uuid'); if (typeof raw === 'string' && raw.trim()) uuid = raw.trim(); } catch { uuid = null; }
+    const refreshToken = typeof tokens?.refreshToken === 'string' ? tokens.refreshToken.trim() : '';
+    return {
+      refreshToken,
+      refreshTokenPresent: refreshToken.length > 0,
+      refreshExpiresAtMs: refreshToken ? jwtExp(refreshToken) : null,
+      userId: user?.userId === undefined || user?.userId === null ? '' : String(user.userId),
+      uuid,
+      firstKeyfrom: typeof keyfrom?.firstKeyfrom === 'string' ? keyfrom.firstKeyfrom : null,
+      latestKeyfrom: typeof keyfrom?.latestKeyfrom === 'string' ? keyfrom.latestKeyfrom : null,
+      source: 'desktop_sqlite_kv',
+    };
+  } finally { try { db.close(); } catch { /* already closed */ } }
+}
+
+/** Keyfrom/identity envelope of the official refresh request; empty values are OMITTED, never sent as ''. */
+export function lobsterRefreshBody({refreshToken, firstKeyfrom, latestKeyfrom, uuid, userId}, clientVersion = LOBSTER_CLIENT_VERSION) {
+  const body = {firstKeyfrom: firstKeyfrom ?? 'official', latestKeyfrom: latestKeyfrom ?? firstKeyfrom ?? 'official', version: LOBSTER_KEYFROM_VERSION};
+  if (uuid) body.uuid = uuid;
+  if (userId) body.userId = userId;
+  body.refreshToken = refreshToken;
+  return body;
+}
+
+/**
+ * One rotation. Returns {accessToken, refreshToken, expiresAtMs, refreshExpiresAtMs, userId, yid?}.
+ * Terminal failures carry `loginRequired:true`; a lost/ambiguous answer carries `retryable:true` but is NOT
+ * beforeSubmission — the caller must persist the outcome before any later retry.
+ */
+export async function refreshLobsterToken(state, {fetchImpl = globalThis.fetch, clientVersion = LOBSTER_CLIENT_VERSION, timeoutMs = 20000, signal, now = Date.now()} = {}) {
+  if (typeof now === 'function') now = now();
+  if (typeof state?.refreshToken !== 'string' || !state.refreshToken) {
+    const error = new AppError('LobsterAI 续期凭据缺失，请先在桌面端重新登录一次', 401, 'lobster_refresh_login_required');
+    error.loginRequired = true; throw error;
+  }
+  if (typeof fetchImpl !== 'function') throw new AppError('LobsterAI 网络请求需要显式注入 fetchImpl', 400, 'lobster_fetch_not_injected');
+  rememberSecret(state.refreshToken);
+  const activeSignal = signal ?? AbortSignal.timeout(timeoutMs);
+  let response;
+  try {
+    response = await fetchImpl(LOBSTER_SERVER_ORIGIN + LOBSTER_REFRESH_PATH, {
+      method: 'POST',
+      headers: {accept: 'application/json', 'content-type': 'application/json', 'cache-control': 'no-store', 'user-agent': `LobsterAI/${clientVersion}`},
+      body: JSON.stringify(lobsterRefreshBody(state, clientVersion)),
+      redirect: 'error', signal: activeSignal,
+    });
+  } catch (error) {
+    if (activeSignal.aborted) throw new AppError('LobsterAI 续期请求已取消或超时', 499, 'request_cancelled');
+    const lost = new AppError('LobsterAI 续期结果未确认（网络失败），等待重新读取本机登录态', 503, 'lobster_refresh_unconfirmed');
+    lost.retryable = true; throw lost;
+  }
+  const envelope = await boundedJson(response).catch(() => null);
+  const code = Number(envelope?.code ?? NaN), message = redact(String(envelope?.message ?? '')).slice(0, 160);
+  if (response.status === 401 || response.status === 403 || LOBSTER_REFRESH_TERMINAL.has(code)) {
+    const error = new AppError(`LobsterAI 续期凭据已失效，请在桌面端重新登录${message ? `: ${message}` : ''}`, 401, 'lobster_refresh_login_required');
+    error.loginRequired = true; error.upstreamCode = Number.isFinite(code) ? code : null; throw error;
+  }
+  if (!response.ok || code !== 0 || !envelope) {
+    const lost = new AppError(`LobsterAI 续期结果未确认${message ? `: ${message}` : ` (HTTP ${response.status})`}`, 503, 'lobster_refresh_unconfirmed');
+    lost.retryable = true; lost.upstreamCode = Number.isFinite(code) ? code : null; throw lost;
+  }
+  const data = envelope.data ?? {};
+  const accessToken = typeof data.accessToken === 'string' ? data.accessToken.trim() : '';
+  const refreshToken = typeof data.refreshToken === 'string' && data.refreshToken.trim() ? data.refreshToken.trim() : state.refreshToken;
+  if (!accessToken) {
+    const lost = new AppError('LobsterAI 续期响应缺少登录态，结果待确认', 503, 'lobster_refresh_unconfirmed');
+    lost.retryable = true; throw lost;
+  }
+  rememberSecret(accessToken); rememberSecret(refreshToken);
+  const expiresIn = Number(data.expiresIn);
+  return {
+    accessToken,
+    refreshToken,
+    expiresAtMs: jwtExp(accessToken) ?? (Number.isFinite(expiresIn) && expiresIn > 0 ? now + expiresIn * 1000 : null),
+    refreshExpiresAtMs: jwtExp(refreshToken),
+    userId: data.userId === undefined || data.userId === null ? state.userId ?? '' : String(data.userId),
+    rotated: refreshToken !== state.refreshToken,
+    refreshedAt: new Date(now).toISOString(),
+  };
+}
+
+/**
+ * The desktop database is the ONLY owner of the refresh token: writing our rotation back would sign the
+ * running client out (its copy is now stale). So a renewed pair is held in a gateway-owned snapshot under
+ * dataDir/accounts/<id>/lobster-session.json and never written into lobsterai.sqlite.
+ */
+export function lobsterSnapshotPath(config, accountId) {
+  const dataDir = config?.dataDir;
+  return dataDir && accountId ? join(dataDir, 'accounts', accountId, 'lobster-session.json') : null;
+}
+
+export async function readLobsterSnapshot(file) {
+  if (!file) return null;
+  try {
+    const data = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''));
+    return data && typeof data === 'object' ? data : null;
+  } catch { return null; }
+}
+
+/** Store a rotated pair. Atomic; the refresh token is the credential, so the file is created 0600. */
+export async function saveLobsterSnapshot(file, snapshot) {
+  if (!file) throw new AppError('未配置 LobsterAI 续期快照路径', 500, 'lobster_snapshot_path');
+  rememberSecret(snapshot?.accessToken); rememberSecret(snapshot?.refreshToken);
+  await atomicJson(file, {
+    schemaVersion: 1,
+    platform: 'lobster',
+    managedBy: 'ai-credit-gateway',
+    accessToken: snapshot.accessToken,
+    refreshToken: snapshot.refreshToken,
+    expiresAtMs: snapshot.expiresAtMs ?? null,
+    refreshExpiresAtMs: snapshot.refreshExpiresAtMs ?? null,
+    userId: snapshot.userId ?? null,
+    firstKeyfrom: snapshot.firstKeyfrom ?? null,
+    latestKeyfrom: snapshot.latestKeyfrom ?? null,
+    uuid: snapshot.uuid ?? null,
+    rotatedAt: snapshot.refreshedAt ?? new Date().toISOString(),
+  });
+  return file;
+}
+
+/**
+ * Choose the live credential source. A gateway snapshot that is still valid wins over the desktop database
+ * ONLY when it is newer: the desktop app keeps refreshing on its own, and a fresh login there always
+ * supersedes our rotation. `source` names the winner so the caller can record it.
+ */
+export function chooseLobsterTokens({desktop, snapshot, now = Date.now()}) {
+  const fresh = !!desktop?.accessToken;
+  if (!fresh) return snapshot?.accessToken ? {source: 'gateway_snapshot', accessToken: snapshot.accessToken, refreshToken: snapshot.refreshToken ?? '', expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken)} : {source: null};
+  const expiresAtMs = desktop.expiresAtMs ?? jwtExp(desktop.accessToken);
+  return {source: 'desktop_sqlite_kv', accessToken: desktop.accessToken, expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : null};
+}
+
+/**
+ * True when a silent renewal is worth attempting: either the live token is inside the lead window, or the
+ * snapshot is the source and it has expired. Unknown expiry never triggers a speculative rotation.
+ */
+export function shouldRenewLobster({expiresAtMs, now = Date.now(), leadMs = LOBSTER_RENEW_LEAD_MS}) {
+  if (!Number.isFinite(expiresAtMs)) return false;
+  return expiresAtMs - now <= leadMs;
+}
+
 /**
  * Read the real access token from the desktop app's SQLite store. READ-ONLY, re-read on every call
  * (the running desktop app may rotate tokens at any time). `auth_user` is parsed in memory only to
@@ -147,12 +323,25 @@ export async function lobsterResolve(account, config = {}) {
     } catch (error) { throw new AppError(error.code === 'ENOENT' ? 'LobsterAI 凭据配置未找到（按路径引用）' : 'LobsterAI 凭据配置无法解析', 401, 'lobster_credential_file_unavailable'); }
   }
   const dbFile = (refPath && /\.(sqlite|sqlite3|db)$/i.test(refPath) ? refPath : null) ?? settings.dbFile ?? config?.dbFile ?? defaultLobsterDbPath();
-  const secret = await readLobsterToken({dbFile});
-  if (!secret.accessToken) throw new AppError('本机 LobsterAI 未登录（auth_tokens 缺少 accessToken）', 401, 'lobster_credential_missing');
+  let secret;
+  try { secret = await readLobsterToken({dbFile}); }
+  catch (error) {
+    // The desktop client may be gone; a still-valid gateway snapshot keeps working without it.
+    const snapshot = await readLobsterSnapshot(lobsterSnapshotPath(config, account?.id));
+    if (!snapshot?.accessToken) throw error;
+    secret = {accessToken: snapshot.accessToken, refreshTokenPresent: !!snapshot.refreshToken, principal: null, principalField: null, accountMode: null, expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken), source: 'gateway_snapshot'};
+  }
+  if (!secret.accessToken) {
+    // Expired-but-present desktop token still resolves; the renewal path owns the "expired" decision.
+    const snapshot = await readLobsterSnapshot(lobsterSnapshotPath(config, account?.id));
+    if (!snapshot?.accessToken) throw new AppError('本机 LobsterAI 未登录（auth_tokens 缺少 accessToken）', 401, 'lobster_credential_missing');
+    secret = {accessToken: snapshot.accessToken, refreshTokenPresent: !!snapshot.refreshToken, principal: null, principalField: null, accountMode: null, expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken), source: 'gateway_snapshot'};
+  }
   rememberSecret(secret.accessToken); // register for redaction before any upstream message can echo it
   return {
     ...secret,
     credential: lobsterCredentialView(secret),
+    dbFile,
     clientVersion: settings.clientVersion ?? config?.clientVersion ?? LOBSTER_CLIENT_VERSION,
     capabilitiesHeader: settings.capabilities ?? config?.capabilities ?? LOBSTER_CLIENT_CAPABILITIES,
   };
@@ -267,11 +456,19 @@ async function boundedJson(response) {
 }
 
 // Official envelope {code,message,data}; code 0 = success. Activity error codes map to stable errors.
+// 51103/51105/51106 are deterministic validations of the request envelope itself (idempotency key,
+// payload config, revision): the server validated the request, discarded it and claimed nothing, so a
+// later attempt cannot double-credit. Those are retryable the same day (retryableRejection). They are
+// still definitive in the ClaimService sense — the outcome is known, not a lost submission.
+// 51100/51101/51102/51104 describe activity/auth state and keep their existing routing.
+const DEFINITIVE_ACTIVITY_ERROR = new Set(['action_invalid', 'config_invalid', 'revision_mismatch']);
 function unwrap(data) {
   if (typeof data?.code === 'number' && data.code !== 0) {
     const mapping = ACTIVITY_ERROR[data.code] ?? null;
-    const error = new AppError(`LobsterAI 业务接口返回 ${data.code}${data.message ? `: ${redact(String(data.message)).slice(0, 120)}` : ''}`, mapping === 'login_required' ? 401 : 502, mapping ? `lobster_${mapping}` : 'lobster_business_error');
+    const retryableRejection = mapping !== null && DEFINITIVE_ACTIVITY_ERROR.has(mapping);
+    const error = new AppError(`LobsterAI 业务接口返回 ${data.code}${data.message ? `: ${redact(String(data.message)).slice(0, 120)}` : ''}`, mapping === 'login_required' ? 401 : retryableRejection ? 503 : 502, mapping ? `lobster_${mapping}` : 'lobster_business_error');
     error.upstreamCode = data.code;
+    if (retryableRejection) { error.definitiveRejection = true; error.beforeSubmission = true; error.retryable = true; }
     throw error;
   }
   return data?.data ?? data;
@@ -312,6 +509,14 @@ export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signa
     const thinkingOptions = Array.isArray(entry?.thinkingConfig?.options) ? entry.thinkingConfig.options.map(o => o?.level).filter(v => typeof v === 'string') : [];
     thinkingProfiles.set(id,thinkingOptions);
     const accessible = entry?.accessible !== false;
+    const reasoningDefault = typeof entry?.thinkingConfig?.defaultLevel === 'string' ? entry.thinkingConfig.defaultLevel : null;
+    // A model with declared native levels really is selectable — the earlier
+    // `reasoning:null` withheld that fact and published an all-null map, so the
+    // client drew no reasoning control although `thinking.options` existed.
+    // `reasoningEfforts` mirrors the native levels 1:1 (never aliases) so the
+    // relay contract's native-option filter keeps exactly the declared tiers.
+    // No declared levels stays non-selectable: capability is never invented.
+    const reasoning = thinkingOptions.length ? {supportedEfforts: thinkingOptions, defaultEffort: reasoningDefault, source: 'official_catalog'} : null;
     return {
       id,
       name: typeof entry?.modelName === 'string' && entry.modelName ? entry.modelName : id,
@@ -323,11 +528,12 @@ export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signa
       toolsSource:id === 'deepseek-flash'?'live_four_link_verified':'official_catalog',
       toolsField: id==='deepseek-flash'?'live_verified':entry?.supportsToolCalling === null || entry?.supportsToolCalling === undefined ? 'unproven' : (entry.supportsToolCalling === true ? 'true' : 'false'),
       multimodal: entry?.supportsImage === true,
-      reasoning: null, isReasoning:entry?.supportsThinking===true,
+      reasoning, isReasoning:reasoning !== null || entry?.supportsThinking===true,
       reasoningOptions: thinkingOptions,
+      reasoningEfforts: thinkingOptions.length?Object.fromEntries(thinkingOptions.map(level=>[level,level])):null,
       reasoningEffortMapping: lobsterReasoningMapping(thinkingOptions),
       reasoningMappingSource: "gateway_aliases_of_official_options",
-      reasoningDefault: typeof entry?.thinkingConfig?.defaultLevel === 'string' ? entry.thinkingConfig.defaultLevel : null,
+      reasoningDefault,
       costMultiplier: Number.isFinite(entry?.costMultiplier) ? entry.costMultiplier : null,
       accessible,
       callable: accessible && contextWindow !== null,
@@ -469,9 +675,13 @@ export async function lobsterStatus(secret, task = 'daily-checkin', options = {}
   };
 }
 
-function idempotencyKey(activityCode) {
-  const suffix = Math.random().toString(16).slice(2).padEnd(16, '0');
-  return `ai-credit-${activityCode}-${Date.now().toString(36)}-${suffix}`.slice(0, 80);
+// Official client format (src/renderer/components/useDailyCheckInActivity.ts):
+//   `daily-check-in-${crypto.randomUUID()}`.slice(0, 64)
+// The server rejects anything else with 51103 "Invalid idempotency key", so the prefix and the
+// UUID body are both part of the contract — a self-invented key is never accepted.
+function idempotencyKey() {
+  const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `daily-check-in-${suffix}`.slice(0, 64);
 }
 
 /**
@@ -492,12 +702,12 @@ export async function lobsterClaimCheckin(secret, task = 'daily-checkin', option
   const fresh = before.configRevision === null ? await lobsterActivitySlot(secret, options).catch(error => { error.beforeSubmission = true; throw error; }) : null;
   const configRevision = before.configRevision ?? fresh?.activity?.configRevision ?? null;
   if (!Number.isSafeInteger(configRevision)) throw Object.assign(new AppError('LobsterAI 活动版本号未知，拒绝提交', 502, 'lobster_revision_unknown'), {beforeSubmission: true});
-  const body = {configRevision, idempotencyKey: idempotencyKey(before.activityCode), payload: {}};
+  const body = {configRevision, idempotencyKey: idempotencyKey(), payload: {}};
   let failure = null;
   try {
     await lobsterRequest(secret, {path: `/api/client-activities/${encodeURIComponent(before.activityCode)}/actions/${encodeURIComponent(actionId)}`, method: 'POST', body, fetchImpl, timeoutMs: options.timeoutMs ?? 20000, signal: options.signal});
   } catch (error) {
-    failure = {code: error.code ?? 'lobster_claim_error', status: error.status ?? 502, upstreamCode: error.upstreamCode ?? null, message: redact(error.message ?? '').slice(0, 200)};
+    failure = {code: error.code ?? 'lobster_claim_error', status: error.status ?? 502, upstreamCode: error.upstreamCode ?? null, definitive: error.definitiveRejection === true, retryable: error.retryable === true, message: redact(error.message ?? '').slice(0, 200)};
   }
   // Always re-verify against the context: the POST response is not a receipt.
   const after = await lobsterStatus(secret, task, options);
@@ -505,6 +715,12 @@ export async function lobsterClaimCheckin(secret, task = 'daily-checkin', option
   if (failure) {
     const error = new AppError(`LobsterAI 签到未获服务端确认: ${failure.message}`, failure.status, failure.code);
     error.failure = failure; error.after = after;
+    if (failure.definitive === true) {
+      error.definitiveRejection = true;
+      // A request-envelope rejection proves the claim never landed, so only that class of refusal is
+      // replayable. The server state re-read above still owns the final verdict.
+      if (failure.retryable === true) { error.beforeSubmission = true; error.retryable = true; }
+    }
     throw error;
   }
   throw new AppError('LobsterAI 签到提交后服务端状态未变化', 502, 'lobster_claim_unconfirmed');

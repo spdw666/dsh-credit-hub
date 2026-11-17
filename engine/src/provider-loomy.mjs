@@ -144,7 +144,36 @@ export async function loomyResolve(account, config = {}) {
   }
   const secret = await readLoomySession({file: file ?? undefined});
   rememberSecret(secret.accessToken);
-  return {...secret, credential: loomyCredentialView(secret), baseUrl: baseUrl ?? config?.baseUrl ?? LOOMY_POINTS_ORIGIN};
+  return {...secret, ...loomySessionExpiry(secret), credential: loomyCredentialView(secret), baseUrl: baseUrl ?? config?.baseUrl ?? LOOMY_POINTS_ORIGIN};
+}
+
+// ------------------------------------------------------------------ session lifetime (no renewal exists)
+// Loomy has NO refresh endpoint (verified live: /auth/refresh, /login/refresh, /user/refresh all 404). The
+// service issues the session at login with `expire: 1209600` (14 days) and the response carries no expiry
+// timestamp, so the deadline is derived locally from the file's updatedAt — the same 14-day constant the
+// official client and magpie-plugin-loomy-auth / anye-99/dsh-codearts-auth use. When it lapses only a fresh
+// SMS login helps, so this adapter reports the deadline and probes validity instead of faking a renewal.
+export const LOOMY_SESSION_TTL_MS = 1209600 * 1000;
+export function loomySessionExpiry(secret, {ttlMs = LOOMY_SESSION_TTL_MS} = {}) {
+  const base = secret?.updatedAt ? Date.parse(secret.updatedAt) : NaN;
+  const expiresAtMs = Number.isFinite(base) ? base + ttlMs : null;
+  return {expiresAtMs, renewLeadMs: ttlMs, renewable: false};
+}
+
+/** Best-effort lifetime probe: a 2xx answer proves the session is live; 100002/020002 proves it is dead. */
+export async function loomySessionState(secret, {fetchImpl = globalThis.fetch, signal} = {}) {
+  const {expiresAtMs} = loomySessionExpiry(secret);
+  if (!secret?.accessToken) return {alive: false, expiresAtMs, reason: 'credential_missing'};
+  if (expiresAtMs !== null && expiresAtMs <= Date.now()) return {alive: false, expiresAtMs, reason: 'credential_expired'};
+  if (typeof fetchImpl !== 'function') return {alive: null, expiresAtMs, reason: 'probe_unavailable'};
+  try {
+    // loomyFetch's allowlist requires full '/api/...' paths.
+    const response = await loomyFetch(fetchImpl, '/api/v1/points/balance', {method: 'GET', token: secret.accessToken, signal});
+    const payload = await response.json().catch(() => null);
+    const code = String(payload?.code ?? '');
+    if (code === '000000') return {alive: true, expiresAtMs, reason: null};
+    return {alive: false, expiresAtMs, reason: code === '100002' || code === '020002' ? 'credential_expired' : `loomy_${code || response.status}`};
+  } catch (error) { return {alive: null, expiresAtMs, reason: 'probe_failed', detail: error?.code ?? null}; }
 }
 
 // ------------------------------------------------------------------ transport
