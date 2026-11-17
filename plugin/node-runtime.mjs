@@ -82,6 +82,10 @@ export async function resolveWorkerNode({
       attempts.push({source,result:'unsupported',version:result.version??null});
     }catch(error){signal?.throwIfAborted();attempts.push({source,result:error.code??'probe_failed',...(error.details?.version?{version:error.details.version}:{})})}
   }
-  const detected=attempts.length?attempts.map(a=>`${a.source}=${a.version??a.result}`).join(', '):'no candidates';
+  // Cap the inline list: a full PATH scan can produce dozens of identical entries that bloat the log
+  // line without adding information. The complete list still travels in `details.attempts`.
+  const shown=attempts.slice(0,3).map(a=>`${a.source}=${a.version??a.result}`);
+  if(attempts.length>shown.length)shown.push(`... ${attempts.length-shown.length} more`);
+  const detected=attempts.length?shown.join(', '):'no candidates';
   throw failure('worker_node_unavailable',`No standalone Node >=${MINIMUM_WORKER_NODE} with working node:sqlite was found (${detected}); set nodeExecutable or DSH_CREDIT_HUB_NODE`,{attempts,minimum:MINIMUM_WORKER_NODE});
 }
