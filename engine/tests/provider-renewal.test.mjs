@@ -9,9 +9,10 @@
 //  - a lost/ambiguous answer is retryable but NOT beforeSubmission (nothing was consumed for sure).
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, rm, readFile, writeFile} from 'node:fs/promises';
+import {mkdtemp, rm, readFile, writeFile, stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {
   lobsterRefreshBody, refreshLobsterToken, chooseLobsterTokens, shouldRenewLobster,
   lobsterSnapshotPath, saveLobsterSnapshot, readLobsterSnapshot, LOBSTER_RENEW_LEAD_MS,
@@ -20,9 +21,11 @@ import {
 import {
   buddyExpiryMs, jwtExpiryMs, refreshBuddyCredential, withBuddyTokens, shouldRenewBuddy,
   buddySnapshotPath, saveBuddySnapshot, readBuddySnapshot, BUDDY_REFRESH_PATH, BUDDY_RENEW_LEAD_MS,
-  normalizeBuddyCredential,
+  normalizeBuddyCredential, chooseBuddyCredential,
 } from '../src/provider-buddy.mjs';
 import {loomySessionExpiry, LOOMY_SESSION_TTL_MS} from '../src/provider-loomy.mjs';
+import {CredentialManager} from '../src/credentials.mjs';
+import {encryptTraeAuthValue} from '../src/trae-refresh.mjs';
 
 const jsonResponse = (data, status = 200) => new Response(JSON.stringify(data), {status, headers: {'content-type': 'application/json'}});
 const jwt = (claims) => ['h', Buffer.from(JSON.stringify(claims)).toString('base64url'), 's'].join('.');
@@ -89,9 +92,30 @@ test('lobster: renewal lead window and token-source precedence', () => {
   assert.equal(shouldRenewLobster({expiresAtMs: now + LOBSTER_RENEW_LEAD_MS + 1000, now}), false);
   assert.equal(shouldRenewLobster({expiresAtMs: now + LOBSTER_RENEW_LEAD_MS - 1000, now}), true);
   assert.equal(shouldRenewLobster({expiresAtMs: null, now}), false, 'unknown expiry never triggers a speculative rotation');
-  // The desktop database always wins while it holds a token: a fresh desktop login supersedes our rotation.
-  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a'}, snapshot: {accessToken: 's'}, now}).source, 'desktop_sqlite_kv');
+  // A fresh desktop token with a later expiry beats a snapshot whose expiry is earlier (or unknown).
+  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a', expiresAtMs: now + 5000}, snapshot: {accessToken: 's', expiresAtMs: now + 1000}, now}).source, 'desktop_sqlite_kv');
+  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a', expiresAtMs: now + 5000}, snapshot: {accessToken: 's'}, now}).source, 'desktop_sqlite_kv');
+  // The snapshot wins only when its expiry is strictly later than the desktop token's.
+  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a', expiresAtMs: now + 1000}, snapshot: {accessToken: 's', expiresAtMs: now + 5000}, now}).source, 'gateway_snapshot');
+  // A desktop token with no recoverable expiry never beats a snapshot with a known one.
+  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a'}, snapshot: {accessToken: 's', expiresAtMs: now + 5000}, now}).source, 'gateway_snapshot');
   assert.equal(chooseLobsterTokens({desktop: {accessToken: ''}, snapshot: {accessToken: 's'}, now}).source, 'gateway_snapshot');
+  assert.equal(chooseLobsterTokens({desktop: null, snapshot: null, now}).source, null);
+  // Identity guard: a snapshot from a different principal never overrides a fresh desktop login, even when
+  // its numeric expiry is later (account switch must not leak the old account's token).
+  assert.equal(chooseLobsterTokens({desktop: {accessToken: 'a', expiresAtMs: now + 1000, principal: 'account-A'}, snapshot: {accessToken: 's', expiresAtMs: now + 2000, principal: 'account-B'}, now}).source, 'desktop_sqlite_kv');
+});
+
+test('lobster: a rotated snapshot outlives the desktop token, so the next resolve selects it and no renewal is due', () => {
+  // Simulate: desktop still holds an (older) token; a rotation landed a later-expiring snapshot.
+  const snapshot = {accessToken: 'rotated', refreshToken: 'rt2', expiresAtMs: now + 30 * 86400e3};
+  const desktop = {accessToken: 'stale', expiresAtMs: now + 1000};
+  const choice = chooseLobsterTokens({desktop, snapshot, now});
+  assert.equal(choice.source, 'gateway_snapshot');
+  assert.equal(choice.accessToken, 'rotated');
+  // After that rotation the snapshot's expiry is far beyond the lead window → no renewal.
+  assert.equal(shouldRenewLobster({expiresAtMs: choice.expiresAtMs, now}), false);
+  assert.equal(shouldRenewLobster({expiresAtMs: desktop.expiresAtMs, now}), true, 'the stale desktop token alone would be renewed');
 });
 
 test('lobster: the snapshot round-trips and stays outside the desktop store', async () => {
@@ -179,6 +203,145 @@ test('buddy: lead window, snapshot path and round-trip', async () => {
     assert.equal(back.accessToken, 'a2');
     assert.equal(back.uid, 'u-1');
     assert.equal(back.managedBy, 'ai-credit-gateway');
+  } finally { await rm(dir, {recursive: true, force: true}); }
+});
+
+test('buddy: chooseBuddyCredential honours the same strict-later expiry rule and reports a clean source', () => {
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd', expiresAtMs: now + 5000}, snapshot: {accessToken: 's', expiresAtMs: now + 1000}, now}).source, 'desktop');
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd', expiresAtMs: now + 1000}, snapshot: {accessToken: 's', expiresAtMs: now + 5000}, now}).source, 'gateway_snapshot');
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd'}, snapshot: {accessToken: 's', expiresAtMs: now + 5000}, now}).source, 'gateway_snapshot');
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd', expiresAtMs: now + 5000}, snapshot: {accessToken: 's'}, now}).source, 'desktop');
+  assert.equal(chooseBuddyCredential({desktop: null, snapshot: {accessToken: 's', expiresAtMs: now + 5000}, now}).source, 'gateway_snapshot');
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd', expiresAtMs: now + 5000}, snapshot: null, now}).source, 'desktop');
+  assert.equal(chooseBuddyCredential({desktop: null, snapshot: null, now}).source, null);
+  // Identity guard: a snapshot from a different uid never overrides a fresh desktop login, even when its
+  // numeric expiry is later (account switch must not leak the old account's token).
+  assert.equal(chooseBuddyCredential({desktop: {accessToken: 'd', expiresAtMs: now + 1000, uid: 'account-A'}, snapshot: {accessToken: 's', expiresAtMs: now + 2000, uid: 'account-B'}, now}).source, 'desktop');
+});
+
+test('buddy: a rotated snapshot outlives the desktop token, so the next resolve selects it and no renewal is due', () => {
+  const snapshot = {accessToken: 'rotated', refreshToken: 'rt2', expiresAtMs: now + 30 * 86400e3, uid: 'u-1', domain: 'www.codebuddy.cn'};
+  const desktop = {accessToken: 'stale', expiresAtMs: now + 1000};
+  const choice = chooseBuddyCredential({desktop, snapshot, now});
+  assert.equal(choice.source, 'gateway_snapshot');
+  assert.equal(choice.snapshot.accessToken, 'rotated');
+  assert.equal(shouldRenewBuddy({expiresAtMs: choice.expiresAtMs, now}), false);
+  assert.equal(shouldRenewBuddy({expiresAtMs: desktop.expiresAtMs, now}), true, 'the stale desktop token alone would be renewed');
+});
+
+// ------------------------------------------------------------------ LobsterAI integration: real renewDesktopSession
+
+test('lobster: renewDesktopSession rotates into the snapshot, cleans its lock, and the next read selects the snapshot without a renewal', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'lobster-integration-'));
+  try {
+    // 1. A real desktop SQLite store: an old (expired) access token + refresh token, and an auth_user row
+    //    that carries the stable identity (yid). No JWT exp on the old token → its expiry is unknown.
+    const dbPath = join(dir, 'lobsterai.sqlite');
+    const db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)');
+    const insert = db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)');
+    insert.run('auth_tokens', JSON.stringify({accessToken: 'old-access', refreshToken: 'old-refresh'}), 1);
+    insert.run('auth_user', JSON.stringify({yid: 'fixture-account-id-987654321', nickname: 'FixtureUser', accountMode: 'personal'}), 1);
+    db.close();
+
+    const account = {id: 'lb', platform: 'lobster', credentials: {kind: 'file', file: dbPath}};
+    const config = {dataDir: dir, value: {accounts: [account]}, path: (x) => x};
+    const ledger = {bind: (id, platform, principal) => ({ok: true, fingerprint: 'fp:' + principal})};
+    const manager = new CredentialManager(config, ledger);
+    // The refresh request body names the refresh token it rotated FROM; C1 required that the second
+    // renewal use the snapshot's RT1, never the desktop DB's stale RT0.
+    const seenRefreshTokens = [];
+    manager.fetch = async (_url, init) => {
+      const rt = JSON.parse(init.body).refreshToken;
+      seenRefreshTokens.push(rt);
+      return rt === 'old-refresh'
+        ? jsonResponse({code: 0, message: 'success', data: {accessToken: 'new-access-1', refreshToken: 'new-refresh-1', expiresIn: 2592000, userId: 'fixture-user'}})
+        : jsonResponse({code: 0, message: 'success', data: {accessToken: 'new-access-2', refreshToken: 'new-refresh-2', expiresIn: 2592000, userId: 'fixture-user'}});
+    };
+
+    // 2. Rotate through the real renewDesktopSession path (the code path that previously crashed with
+    //    `ReferenceError: rotated is not defined`).
+    const result = await manager.renewDesktopSession(account, {trigger: 'schedule'});
+    assert.equal(result.accessToken, 'new-access-1');
+    assert.equal(result.refreshToken, 'new-refresh-1');
+    assert.ok(result.principal, 'renewed credential must carry a stable principal');
+    assert.equal(result.source, 'gateway_snapshot');
+
+    // 3. The snapshot is persisted with a non-null principal, and the per-account lock is cleaned up.
+    const snapFile = lobsterSnapshotPath(config, 'lb');
+    const snap = await readLobsterSnapshot(snapFile);
+    assert.equal(snap.accessToken, 'new-access-1');
+    assert.equal(snap.refreshToken, 'new-refresh-1');
+    assert.ok(snap.principal, 'snapshot principal must be non-empty');
+    await assert.rejects(stat(snapFile + '.refresh.lock'), (e) => e.code === 'ENOENT');
+
+    // 4. The next read selects the snapshot (its expiry is strictly later than the desktop token's unknown
+    //    expiry) and no renewal is due within the lead window.
+    const live = await manager.read(account);
+    assert.equal(live.accessToken, 'new-access-1');
+    assert.equal(live.source, 'gateway_snapshot');
+    assert.ok(live.principal);
+    assert.equal(shouldRenewLobster({expiresAtMs: live.expiresAtMs}), false);
+
+    // 5. C1 regression: a SECOND renewal must rotate from the snapshot's RT1, not the desktop DB's stale RT0.
+    const second = await manager.renewDesktopSession(account, {trigger: 'schedule'});
+    assert.equal(second.accessToken, 'new-access-2');
+    assert.equal(second.refreshToken, 'new-refresh-2');
+    const snap2 = await readLobsterSnapshot(snapFile);
+    assert.equal(snap2.accessToken, 'new-access-2');
+    assert.equal(snap2.refreshToken, 'new-refresh-2');
+    assert.deepEqual(seenRefreshTokens, ['old-refresh', 'new-refresh-1'], 'second renewal must send the snapshot RT, not the stale DB RT');
+  } finally { await rm(dir, {recursive: true, force: true}); }
+});
+
+// ------------------------------------------------------------------ Trae (inline renewal through read())
+
+test('trae: a cached expired credential re-routes through read() inline renewal instead of surfacing credential_expired', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'trae-renewal-'));
+  try {
+    const file = join(dir, 'storage.json');
+    const account = {id: 'trae-1', platform: 'trae', edition: 'cn', credentials: {kind: 'desktop', file}};
+    const config = {dataDir: dir, value: {accounts: [account]}, path: (x) => x};
+    const ledger = {bind: () => ({ok: true, fingerprint: 'fp'})};
+    const manager = new CredentialManager(config, ledger);
+
+    // The refresh exchange is exercised through global fetch (refreshTraeToken uses it directly).
+    let refreshCalls = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      refreshCalls++;
+      return new Response(JSON.stringify({Result: {Token: 'new-access', TokenExpireAt: Date.parse('2027-01-01T00:00:00Z'), RefreshToken: 'rt-1'}}), {status: 200, headers: {'content-type': 'application/json'}});
+    };
+
+    t.mock.timers.enable({apis: ['Date']});
+    const T0 = Date.parse('2026-11-16T12:00:00Z');
+    // A real Trae storage.json: the auth record is encrypted like the client stores it, and the identity
+    // block carries a machine id + device id so readTraeIdentity can resolve.
+    // The token is 30h out: farther than the 24h lead, so the first read caches it WITHOUT an eager renewal.
+    const record2 = {token: 'old-access', refreshToken: 'rt-0', userId: 'trae-user', host: 'https://trae.example', expiredAt: T0 + 30 * 3600 * 1000};
+    const doc2 = {
+      'iCubeAuthInfo://icube.cloudide': encryptTraeAuthValue(JSON.stringify(record2)),
+      'telemetry.machineId': 'machine-123',
+      'telemetry.devDeviceId': 'device-456',
+    };
+    await writeFile(file, JSON.stringify(doc2));
+
+    try {
+      t.mock.timers.setTime(T0);
+      const first = await manager.read(account);
+      assert.equal(first.accessToken, 'old-access');
+      assert.equal(refreshCalls, 0, 'a token 30h out must not renew eagerly');
+
+      // 48h later the cached credential is expired but the file (and its fingerprint) is unchanged:
+      // resolve() must re-route through read({renew:true})'s inline renewal, not surface credential_expired.
+      t.mock.timers.setTime(T0 + 48 * 3600 * 1000);
+      const second = await manager.resolve('trae-1');
+      assert.equal(second.accessToken, 'new-access');
+      assert.equal(refreshCalls, 1);
+    } finally {
+      globalThis.fetch = realFetch;
+      t.mock.timers.reset();
+    }
   } finally { await rm(dir, {recursive: true, force: true}); }
 });
 

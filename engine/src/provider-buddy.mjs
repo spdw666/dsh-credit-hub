@@ -53,7 +53,42 @@ async function readBuddyCredential(account,config={}){
   let raw;if(account.credentials?.kind==='file'||ai){raw=JSON.parse(await readFile(file));if(ai&&typeof raw.auth?.accessToken==='object'){raw.auth.accessToken=await runNativeHelper(account.credentials?.executable??'D:/WorkBuddyAI/WorkBuddyAI.exe',raw.auth.accessToken)}}else raw=await readCodeBuddy(file,edition,localState);
   return normalizeBuddyCredential(raw,{expectedDomain:domain,filePath:file,proxyUrl:account.credentials?.proxyUrl});
 }
-export async function resolveBuddyCredential(account,config={}){try{return await readBuddyCredential(account,config)}catch(e){if(e.code==='ENOENT'||e.code==='ERR_SQLITE_ERROR')throw new AppError('Buddy本机登录文件待就绪',401,'provider_login_required');throw e}}
+/** Expected billing domain for an account, matching readBuddyCredential's region mapping. */
+function buddyExpectedDomain(account){const ai=account.platform==='workbuddyai',edition=ai?'global':account.edition;return ai?'www.workbuddy.ai':edition==='cn'?'www.codebuddy.cn':'www.codebuddy.ai'}
+/**
+ * Choose the live Buddy credential source. A gateway snapshot wins ONLY when its expiry is strictly
+ * later than the desktop token's (a fresh desktop login always supersedes our rotation). Missing
+ * expiries fall back to the JWT `exp`; an unrecoverable expiry never beats the other side.
+ */
+export function chooseBuddyCredential({desktop,snapshot,now=Date.now()}){
+  const expiryMs=c=>Number(c?.expiresAtMs)||jwtExpiryMs(c?.accessToken);
+  const snap=snapshot?.accessToken?snapshot:null,desk=desktop?.accessToken?desktop:null;
+  if(!snap&&!desk)return {source:null};
+  if(!desk)return {source:'gateway_snapshot',snapshot:snap,expiresAtMs:expiryMs(snap)??null};
+  if(!snap)return {source:'desktop',snapshot:null,expiresAtMs:expiryMs(desk)??null};
+  const se=expiryMs(snap),de=expiryMs(desk);
+  // Identity guard: a snapshot from a different uid must never override a fresh desktop login, even when
+  // its numeric expiry is later. Missing uid is treated as same-identity for back-compat.
+  const sameIdentity=!desk?.uid||!snap?.uid||String(desk.uid)===String(snap.uid);
+  return sameIdentity&&se!==null&&(de===null||se>de)?{source:'gateway_snapshot',snapshot:snap,expiresAtMs:se}:{source:'desktop',snapshot:null,expiresAtMs:de};
+}
+export async function resolveBuddyCredential(account,config={}){
+  const expectedDomain=buddyExpectedDomain(account);
+  const snapshot=await readBuddySnapshot(buddySnapshotPath(config,account.id));
+  let desktop=null,desktopError=null;
+  try{desktop=await readBuddyCredential(account,config)}catch(e){desktopError=e}
+  const choice=chooseBuddyCredential({desktop:desktop??undefined,snapshot:snapshot??undefined});
+  if(choice.source==='gateway_snapshot'){
+    const snap=choice.snapshot,uid=String(snap.uid??desktop?.uid??'');
+    if(snap.domain&&snap.domain!==expectedDomain)throw new AppError('Buddy登录区域与账号配置不符',401,'provider_region_mismatch');
+    const domain=snap.domain??expectedDomain;
+    rememberSecret(snap.accessToken);if(snap.refreshToken)rememberSecret(snap.refreshToken);
+    return {accessToken:snap.accessToken,refreshToken:snap.refreshToken??'',refreshTokenPresent:typeof snap.refreshToken==='string'&&snap.refreshToken.length>0,expiresAtMs:choice.expiresAtMs??null,refreshExpiresAtMs:Number(snap.refreshExpiresAtMs)||null,uid,principal:uid,domain,filePath:desktop?.filePath,proxyUrl:desktop?.proxyUrl??account.credentials?.proxyUrl,source:'gateway_snapshot',billingPlatform:domain.endsWith('.cn')?'workbuddy':domain,billingPrincipal:uid};
+  }
+  if(choice.source==='desktop')return desktop;
+  if(desktopError){if(desktopError.code==='ENOENT'||desktopError.code==='ERR_SQLITE_ERROR')throw new AppError('Buddy本机登录文件待就绪',401,'provider_login_required');throw desktopError}
+  throw new AppError('Buddy登录态待解密或已退出',401,'provider_login_required');
+}
 function headers(c){const global=endpoints(c).global,base={Authorization:'Bearer '+c.accessToken,Accept:'application/json','Content-Type':'application/json','X-User-Id':c.uid,'X-Domain':c.domain,'X-Product':'SaaS','X-Requested-With':'XMLHttpRequest','User-Agent':global?'WorkBuddy/5.5.2':'CLI/2.63.2 CodeBuddy/2.63.2'};if(global){base['X-Conversation-ID']=randomUUID();base['X-Conversation-Request-ID']=randomUUID();base['X-Conversation-Message-ID']=randomUUID()}return base}
 async function api(c,path,body,options={},surface='billing'){const data=await providerJson(endpoints(c)[surface]+path,c,{...options,body,headers:headers(c)});if(data.code!==0){const e=new AppError(`Buddy业务接口返回 ${typeof data.code==='number'?data.code:'异常'}`,502,'provider_business_error');e.upstreamCode=data.code;throw e}return data.data}
 export async function buddyModels(c,options={}){const data=await api(c,'/v3/config',undefined,options,'chat');return selectCliModels(data?.models,data?.agents).map(m=>({...m,tools:m.supportsToolCall===true,multimodal:m.supportsImages===true,callable:true,source:'buddy-official-config'}))}

@@ -346,9 +346,16 @@ function credentialFromCodeArtsAuth(base,auth,source) {
 }
 async function publishCodeArtsCache(file,data){const temp=file+'.'+randomBytes(6).toString('hex')+'.tmp';await writeFile(temp,JSON.stringify(data),{mode:0o600});await rename(temp,file);}
 function codeartsBlockedRefresh(cached){const pending=cached?.loginRequired===false||/(?:unconfirmed|invalid|pending)$/.test(cached?.refreshFailure??'');return Object.assign(new AppError(pending?'CodeArts 续期结果待核验；检测到新本机登录态后自动恢复':'CodeArts 上次续期未确认；等待本机登录态更新',pending?503:401,'codearts_refresh_needs_login'),{loginRequired:!pending,refreshPending:pending});}
+/** Default private-refresh cache path, derived per principal so hand-added .enc accounts sharing one
+ *  source file cannot leak each other's rotated AK/SK through a shared cache. An explicit cacheFile wins. */
+export function codeartsCachePath(file,principal,{localAppData}={}) {
+  const root=localAppData??process.env.LOCALAPPDATA??dirname(file);
+  const base='codearts-'+sha256Hex(Buffer.from(String(file))).slice(0,16);
+  return principal?join(root,'AI Credit Gateway','private-cache',base+'-'+sha256Hex(Buffer.from(String(principal))).slice(0,16)+'.json'):join(root,'AI Credit Gateway','private-cache',base+'.json');
+}
 async function resolveCodeArtsFresh(base,file,options={}) {
  const stored=await nativeCodeArtsStored(file);if(!stored)return base;
- const cacheFile=options.cacheFile??join(process.env.LOCALAPPDATA??dirname(file),'AI Credit Gateway','private-cache','codearts-'+sha256Hex(Buffer.from(file)).slice(0,16)+'.json');
+ const cacheFile=options.cacheFile??codeartsCachePath(file,base?.principal);
  const now=options.now??Date.now();
  const localState=options.localState??join(isCodeArtsDesktopFile(file)?dirname(dirname(file)):dirname(dirname(dirname(file))),'Local State');
  const original=codeArtsAuthFromNative(await (options.decryptAuthImpl??decryptCodeArtsAuth)(stored,localState));

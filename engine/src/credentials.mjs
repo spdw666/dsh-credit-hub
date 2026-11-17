@@ -1,7 +1,7 @@
 import {desktopProvider,desktopProviderKinds} from './provider-registry.mjs';
 import {resolveFreeCredential} from './free-providers.mjs';
 import {bigModelCredential} from './bigmodel.mjs';
-import {readFile, writeFile, rename, stat, access, open, unlink} from 'node:fs/promises';
+import {readFile, writeFile, rename, stat, access, open, unlink, mkdir} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
 import {join, dirname, resolve} from 'node:path';
 import {homedir, userInfo} from 'node:os';
@@ -91,13 +91,16 @@ export class CredentialManager {
     const account=this.account(id);
     if(force)this.cache.delete(id);
     if(this.flights.has(id))return this.flights.get(id);
-    const p=this.read(account,{renew}).catch(e=>{if(/^(codearts|raccoon)_refresh_source_changed$/.test(e.code??''))return this.read(account,{renew});if(account.platform==='qwenwork'&&e.code==='credential_expired')return this.refreshQwen(id);if(account.platform==='trae'&&e.code==='credential_expired')return this.refreshTrae(id);
+    const p=this.read(account,{renew}).catch(e=>{if(/^(codearts|raccoon)_refresh_source_changed$/.test(e.code??''))return this.read(account,{renew});if(account.platform==='qwenwork'&&e.code==='credential_expired')return this.refreshQwen(id);
       // Desktop stores that carry a refresh token (LobsterAI, CodeBuddy) renew on an expired access token
       // instead of failing: the rotated pair lands in a gateway-owned snapshot, never in the client's files.
       if((account.platform==='lobster'||account.platform==='codebuddy'||account.platform==='workbuddyai')&&(e.code==='credential_expired'||e.code==='provider_login_required'||e.code==='provider_auth_rejected'||e.code==='credential_missing'))return this.renewDesktopSession(account,{trigger:e.code});
       // Qoder's file snapshot carries its own refresh token, so an expired access
       // token is renewed from the device-token endpoint instead of demanding a login.
       if(account.platform==='qoder'&&(e.code==='credential_expired'||e.code==='provider_login_required'||e.code==='provider_auth_rejected'||e.code==='credential_missing'))return this.renewQoder(account,{trigger:e.code});
+      // Trae has no scheduler slot; a cached expired credential must still route back through read()'s
+      // inline renewal (renew:true bypasses the cache) rather than surfacing a bare credential_expired.
+      if(account.platform==='trae'&&e.code==='credential_expired'){this.cache.delete(id);return this.read(account,{renew:true});}
       throw e;}).finally(()=>this.flights.delete(id));this.flights.set(id,p);return p;
   }
   /**
@@ -113,10 +116,16 @@ export class CredentialManager {
       const file=lobsterSnapshotPath(this.config,id);      const base=await lobsterResolve(account,this.config).catch(()=>null);
       const state=await readLobsterRenewalState({dbFile:base?.dbFile}).catch(()=>null);
       const snap=await readLobsterSnapshot(file);
-      const refreshToken=state?.refreshToken||snap?.refreshToken||'';
+      const refreshToken=(base?.source==='gateway_snapshot'?snap?.refreshToken:state?.refreshToken)||state?.refreshToken||snap?.refreshToken||'';
       const seed={...state,refreshToken,userId:state?.userId||snap?.userId||'',uuid:state?.uuid||snap?.uuid||null,firstKeyfrom:state?.firstKeyfrom??snap?.firstKeyfrom??null,latestKeyfrom:state?.latestKeyfrom??snap?.latestKeyfrom??null};
-      const rotated=await refreshLobsterToken(seed,{fetchImpl:this.fetch??globalThis.fetch}).catch(async e=>{await this.recordRenewal(id,{kind:'renew',ok:false,error:e.code??'lobster_refresh_failed',message:String(e.message??'').slice(0,160),loginRequired:e.loginRequired===true,trigger});throw e});
-      await saveLobsterSnapshot(file,{...rotated,firstKeyfrom:seed.firstKeyfrom,latestKeyfrom:seed.latestKeyfrom,uuid:seed.uuid});
+      // Per-account renewal lock: only one rotation may land in the snapshot at a time.
+      await mkdir(dirname(file),{recursive:true});
+      let lock;try{lock=await open(file+'.refresh.lock','wx',0o600);}catch(e){if(e.code==='EEXIST')throw new AppError('LobsterAI 续期正在处理',409,'lobster_renewal_locked');throw e;}
+      let rotated;
+      try{
+        rotated=await refreshLobsterToken(seed,{fetchImpl:this.fetch??globalThis.fetch}).catch(async e=>{await this.recordRenewal(id,{kind:'renew',ok:false,error:e.code??'lobster_refresh_failed',message:String(e.message??'').slice(0,160),loginRequired:e.loginRequired===true,trigger});throw e});
+        await saveLobsterSnapshot(file,{...rotated,firstKeyfrom:seed.firstKeyfrom,latestKeyfrom:seed.latestKeyfrom,uuid:seed.uuid,principal:base?.principal,principalField:base?.principalField});
+      }finally{await lock.close();await unlink(file+'.refresh.lock').catch(()=>{});}
       await this.recordRenewal(id,{kind:'renew',ok:true,trigger,expiresAt:rotated.expiresAtMs?new Date(rotated.expiresAtMs).toISOString():null,refreshExpiresAt:rotated.refreshExpiresAtMs?new Date(rotated.refreshExpiresAtMs).toISOString():null,rotated:rotated.rotated===true,snapshot:'accounts/'+id+'/lobster-session.json'});
       const live=await lobsterResolve(account,this.config).catch(()=>null);
       if(!live)throw new AppError('LobsterAI 续期后无法读取登录态',401,'credential_missing');
@@ -128,8 +137,14 @@ export class CredentialManager {
     const {resolveBuddyCredential,refreshBuddyCredential,saveBuddySnapshot,buddySnapshotPath,shouldRenewBuddy}=await import('./provider-buddy.mjs');
     const base=await resolveBuddyCredential(account,this.config);
     if(!base.refreshTokenPresent)throw new AppError('Buddy续期凭据缺失，请先在原客户端重新登录',401,'provider_refresh_login_required');
-    const rotated=await refreshBuddyCredential(base,{fetchImpl:this.fetch??globalThis.fetch}).catch(async e=>{await this.recordRenewal(id,{kind:'renew',ok:false,error:e.code??'buddy_refresh_failed',message:String(e.message??'').slice(0,160),loginRequired:e.loginRequired===true,trigger});throw e});
-    await saveBuddySnapshot(buddySnapshotPath(this.config,id),{...rotated,uid:base.principal,domain:base.domain});
+    const file=buddySnapshotPath(this.config,id);
+    // Per-account renewal lock: only one rotation may land in the snapshot at a time.
+    await mkdir(dirname(file),{recursive:true});
+    let lock;try{lock=await open(file+'.refresh.lock','wx',0o600);}catch(e){if(e.code==='EEXIST')throw new AppError('Buddy续期正在处理',409,'buddy_renewal_locked');throw e;}
+    let rotated;
+    try{rotated=await refreshBuddyCredential(base,{fetchImpl:this.fetch??globalThis.fetch}).catch(async e=>{await this.recordRenewal(id,{kind:'renew',ok:false,error:e.code??'buddy_refresh_failed',message:String(e.message??'').slice(0,160),loginRequired:e.loginRequired===true,trigger});throw e});
+      await saveBuddySnapshot(file,{...rotated,uid:base.principal,domain:base.domain});
+    }finally{await lock.close();await unlink(file+'.refresh.lock').catch(()=>{});}
     await this.recordRenewal(id,{kind:'renew',ok:true,trigger,expiresAt:rotated.expiresAtMs?new Date(rotated.expiresAtMs).toISOString():null,refreshExpiresAt:rotated.refreshExpiresAtMs?new Date(rotated.refreshExpiresAtMs).toISOString():null,rotated:rotated.rotated===true,snapshot:'accounts/'+id+'/buddy-session.json'});
     const merged={...base,accessToken:rotated.accessToken,refreshToken:rotated.refreshToken,expiresAtMs:rotated.expiresAtMs??base.expiresAtMs,refreshExpiresAtMs:rotated.refreshExpiresAtMs??base.refreshExpiresAtMs,source:'gateway_snapshot',renewedAt:rotated.refreshedAt};
     const binding=this.ledger.bind(id,account.platform,merged.principal);
@@ -294,21 +309,26 @@ export class CredentialManager {
   async renewTraeFile(account,file,text,{syncClient=true}={}) {
     const raw=parseTraeStorageDocument(text);
     if(typeof raw.refreshToken!=='string'||!raw.refreshToken)throw new AppError('Trae 快照缺少 refreshToken，请在 Trae 客户端重新登录一次',401,'trae_refresh_missing');
-    const next=await refreshTraeToken({host:raw.host,edition:account.edition??raw.edition??'cn',refreshToken:raw.refreshToken,userId:String(raw.userId??'')});
-    const updated={...raw,token:next.accessToken,expiredAt:new Date(next.expiresAtMs).toISOString(),...(next.refreshToken?{refreshToken:next.refreshToken}:{})};
-    const draft=rewriteTraeStorageAuth(text,updated);
-    const check=parseTraeStorageDocument(draft);
-    if(check.token!==updated.token||(next.refreshToken&&check.refreshToken!==next.refreshToken))throw new AppError('Trae 新凭据回写自检失败，已放弃写入',500,'trae_refresh_write_failed');
-    const current=await readFile(file,'utf8').catch(()=>null);
-    if(current!==text)throw new AppError('Trae 快照在续期期间被重新抓取，本次续期结果已丢弃',409,'trae_refresh_conflict');
-    const temp=`${file}.${process.pid}.tmp`;
-    await writeFile(temp,draft,{mode:0o600});
-    await rename(temp,file);
-    this.cache.delete(account.id);
-    let synced=null;
-    if(syncClient&&account.credentials?.syncClient===true)synced=await this.syncTraeClient(account,updated).catch(()=>null);
-    await this.recordRenewal(account.id,{kind:'renew',ok:true,expiresAt:new Date(next.expiresAtMs).toISOString(),rotated:!!next.refreshToken,synced:synced?.synced===true});
-    return {accessToken:next.accessToken,refreshToken:next.refreshToken??raw.refreshToken,expiresAtMs:next.expiresAtMs,renewedAt:new Date().toISOString(),synced:synced?.synced===true};
+    const lockPath=join(this.config.dataDir,'accounts',String(account.id),'trae-refresh.lock');
+    await mkdir(dirname(lockPath),{recursive:true});
+    let lock;try{lock=await open(lockPath,'wx',0o600);}catch(e){if(e.code==='EEXIST')throw new AppError('Trae 续期正在处理',409,'trae_refresh_locked');throw e;}
+    try{
+      const current=await readFile(file,'utf8').catch(()=>null);
+      if(current!==text)throw new AppError('Trae 快照在续期期间被重新抓取，本次续期结果已丢弃',409,'trae_refresh_conflict');
+      const next=await refreshTraeToken({host:raw.host,edition:account.edition??raw.edition??'cn',refreshToken:raw.refreshToken,userId:String(raw.userId??'')});
+      const updated={...raw,token:next.accessToken,expiredAt:new Date(next.expiresAtMs).toISOString(),...(next.refreshToken?{refreshToken:next.refreshToken}:{})};
+      const draft=rewriteTraeStorageAuth(text,updated);
+      const check=parseTraeStorageDocument(draft);
+      if(check.token!==updated.token||(next.refreshToken&&check.refreshToken!==next.refreshToken))throw new AppError('Trae 新凭据回写自检失败，已放弃写入',500,'trae_refresh_write_failed');
+      const temp=`${file}.${process.pid}.tmp`;
+      await writeFile(temp,draft,{mode:0o600});
+      await rename(temp,file);
+      this.cache.delete(account.id);
+      let synced=null;
+      if(syncClient&&account.credentials?.syncClient===true)synced=await this.syncTraeClient(account,updated).catch(()=>null);
+      await this.recordRenewal(account.id,{kind:'renew',ok:true,expiresAt:new Date(next.expiresAtMs).toISOString(),rotated:!!next.refreshToken,synced:synced?.synced===true});
+      return {accessToken:next.accessToken,refreshToken:next.refreshToken??raw.refreshToken,expiresAtMs:next.expiresAtMs,renewedAt:new Date().toISOString(),synced:synced?.synced===true};
+    }finally{await lock.close();await unlink(lockPath).catch(()=>{});}
   }
   /**
    * Optional (opt-in per account via credentials.syncClient): write the renewed
@@ -330,12 +350,5 @@ export class CredentialManager {
       try{await writeFile(temp,draft,{mode:0o600});await rename(temp,target);return {synced:true,file:target};}catch{continue;}
     }
     return {synced:false};
-  }
-  async refreshTrae(id) {
-    const account=this.account(id);if(account.platform!=='trae')throw new AppError('Trae account required',400,'invalid_account');
-    const file=await resolveCredentialFile(account,this.config);
-    const text=await readFile(file,'utf8');
-    try{await this.renewTraeFile(account,file,text);}catch(error){await this.recordRenewal(account.id,{kind:'renew',ok:false,error:error.code??'trae_refresh_failed',message:String(error.message??'').slice(0,160)});throw error;}
-    return this.read(account,{renew:true});
   }
 }

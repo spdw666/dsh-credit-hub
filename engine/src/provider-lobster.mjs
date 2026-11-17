@@ -230,6 +230,8 @@ export async function saveLobsterSnapshot(file, snapshot) {
     expiresAtMs: snapshot.expiresAtMs ?? null,
     refreshExpiresAtMs: snapshot.refreshExpiresAtMs ?? null,
     userId: snapshot.userId ?? null,
+    principal: snapshot.principal ?? null,
+    principalField: snapshot.principalField ?? null,
     firstKeyfrom: snapshot.firstKeyfrom ?? null,
     latestKeyfrom: snapshot.latestKeyfrom ?? null,
     uuid: snapshot.uuid ?? null,
@@ -239,15 +241,29 @@ export async function saveLobsterSnapshot(file, snapshot) {
 }
 
 /**
- * Choose the live credential source. A gateway snapshot that is still valid wins over the desktop database
- * ONLY when it is newer: the desktop app keeps refreshing on its own, and a fresh login there always
- * supersedes our rotation. `source` names the winner so the caller can record it.
+ * Choose the live credential source. A gateway snapshot wins over the desktop database ONLY when its
+ * expiry is strictly later than the desktop token's: the desktop app keeps refreshing on its own, and a
+ * fresh login there always supersedes our rotation. `source` names the winner so the caller can record it.
+ * Missing expiries fall back to the JWT `exp`; a token with no recoverable expiry is treated as expiring
+ * now (so it never beats the other side on the comparison).
  */
 export function chooseLobsterTokens({desktop, snapshot, now = Date.now()}) {
-  const fresh = !!desktop?.accessToken;
-  if (!fresh) return snapshot?.accessToken ? {source: 'gateway_snapshot', accessToken: snapshot.accessToken, refreshToken: snapshot.refreshToken ?? '', expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken)} : {source: null};
-  const expiresAtMs = desktop.expiresAtMs ?? jwtExp(desktop.accessToken);
-  return {source: 'desktop_sqlite_kv', accessToken: desktop.accessToken, expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : null};
+  const tokenExpiryMs = token => Number(token?.expiresAtMs) || jwtExp(token?.accessToken);
+  const snapshotToken = snapshot?.accessToken ? snapshot : null;
+  const desktopToken = desktop?.accessToken ? desktop : null;
+  if (!desktopToken && !snapshotToken) return {source: null};
+  if (!desktopToken) return {source: 'gateway_snapshot', accessToken: snapshotToken.accessToken, refreshToken: snapshotToken.refreshToken ?? '', expiresAtMs: tokenExpiryMs(snapshotToken) ?? null};
+  if (!snapshotToken) return {source: 'desktop_sqlite_kv', accessToken: desktopToken.accessToken, expiresAtMs: tokenExpiryMs(desktopToken) ?? null};
+  const snapshotExpiry = tokenExpiryMs(snapshotToken);
+  const desktopExpiry = tokenExpiryMs(desktopToken);
+  // Identity guard: a snapshot from a different account must never override a fresh desktop login, even
+  // when its numeric expiry is later. Missing principal (legacy snapshot) is treated as same-identity for
+  // back-compat; userId is deliberately NOT compared because its hashing differs across sources.
+  const sameIdentity = !desktopToken?.principal || !snapshotToken?.principal || desktopToken.principal === snapshotToken.principal;
+  const snapshotWins = sameIdentity && snapshotExpiry !== null && (desktopExpiry === null || snapshotExpiry > desktopExpiry);
+  return snapshotWins
+    ? {source: 'gateway_snapshot', accessToken: snapshotToken.accessToken, refreshToken: snapshotToken.refreshToken ?? '', expiresAtMs: snapshotExpiry}
+    : {source: 'desktop_sqlite_kv', accessToken: desktopToken.accessToken, expiresAtMs: desktopExpiry};
 }
 
 /**
@@ -323,20 +339,38 @@ export async function lobsterResolve(account, config = {}) {
     } catch (error) { throw new AppError(error.code === 'ENOENT' ? 'LobsterAI 凭据配置未找到（按路径引用）' : 'LobsterAI 凭据配置无法解析', 401, 'lobster_credential_file_unavailable'); }
   }
   const dbFile = (refPath && /\.(sqlite|sqlite3|db)$/i.test(refPath) ? refPath : null) ?? settings.dbFile ?? config?.dbFile ?? defaultLobsterDbPath();
-  let secret;
-  try { secret = await readLobsterToken({dbFile}); }
-  catch (error) {
-    // The desktop client may be gone; a still-valid gateway snapshot keeps working without it.
-    const snapshot = await readLobsterSnapshot(lobsterSnapshotPath(config, account?.id));
-    if (!snapshot?.accessToken) throw error;
-    secret = {accessToken: snapshot.accessToken, refreshTokenPresent: !!snapshot.refreshToken, principal: null, principalField: null, accountMode: null, expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken), source: 'gateway_snapshot'};
+  const snapshotPath = lobsterSnapshotPath(config, account?.id);
+  const snapshot = await readLobsterSnapshot(snapshotPath);
+  let desktop = null;
+  let desktopError = null;
+  try { desktop = await readLobsterToken({dbFile}); }
+  catch (error) { desktopError = error; }
+  const choice = chooseLobsterTokens({desktop: desktop ?? undefined, snapshot: snapshot ?? undefined});
+  if (choice.source === null) {
+    // Neither the desktop DB nor a gateway snapshot has a usable token.
+    if (desktopError) throw desktopError;
+    throw new AppError('本机 LobsterAI 未登录（auth_tokens 缺少 accessToken）', 401, 'lobster_credential_missing');
   }
-  if (!secret.accessToken) {
-    // Expired-but-present desktop token still resolves; the renewal path owns the "expired" decision.
-    const snapshot = await readLobsterSnapshot(lobsterSnapshotPath(config, account?.id));
-    if (!snapshot?.accessToken) throw new AppError('本机 LobsterAI 未登录（auth_tokens 缺少 accessToken）', 401, 'lobster_credential_missing');
-    secret = {accessToken: snapshot.accessToken, refreshTokenPresent: !!snapshot.refreshToken, principal: null, principalField: null, accountMode: null, expiresAtMs: Number(snapshot.expiresAtMs) || jwtExp(snapshot.accessToken), source: 'gateway_snapshot'};
+  let principal = null, principalField = null, accountMode = null;
+  if (choice.source === 'desktop_sqlite_kv') {
+    principal = desktop.principal; principalField = desktop.principalField; accountMode = desktop.accountMode;
+  } else {
+    // Snapshot won. Prefer the desktop identity (DB may still be readable), else the snapshot's own
+    // principal; when neither is present, derive a stable hash from the snapshot userId as a fallback
+    // so the credential always carries a principal.
+    if (desktop?.principal) { principal = desktop.principal; principalField = desktop.principalField; }
+    else if (snapshot?.principal) { principal = snapshot.principal; principalField = snapshot.principalField ?? null; }
+    else if (snapshot?.userId) { principal = stableHash(snapshot.userId); principalField = 'userId'; }
   }
+  const secret = {
+    accessToken: choice.accessToken,
+    refreshTokenPresent: choice.source === 'gateway_snapshot' ? !!snapshot?.refreshToken : desktop?.refreshTokenPresent === true,
+    principal,
+    principalField,
+    accountMode,
+    expiresAtMs: choice.expiresAtMs ?? null,
+    source: choice.source,
+  };
   rememberSecret(secret.accessToken); // register for redaction before any upstream message can echo it
   return {
     ...secret,
