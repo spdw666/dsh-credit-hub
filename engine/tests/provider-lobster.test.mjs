@@ -328,10 +328,41 @@ test('claim: submits to whitelisted action, then proves via context re-read (no 
   assert.ok(posts[0].url.endsWith('/api/client-activities/daily-check-in-evergreen-prod-20260814/actions/check_in'));
   assert.equal(posts[0].body.configRevision, 1);
   assert.equal(posts[0].body.payload && typeof posts[0].body.payload === 'object', true);
-  assert.equal(typeof posts[0].body.idempotencyKey, 'string');
+  // Official client contract: `daily-check-in-${uuid}` truncated to 64 chars. Any other shape is
+  // rejected by the live server with 51103 "Invalid idempotency key" (observed 2026-11-16).
+  assert.match(posts[0].body.idempotencyKey, /^daily-check-in-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.ok(posts[0].body.idempotencyKey.length <= 64);
+  assert.equal(posts[0].body.idempotencyKey.includes('ai-credit'), false);
   assert.equal(result.submitted, true);
   assert.equal(result.rechecked, true);
   assert.equal(result.claimed, true);
+});
+
+test('claim: a deterministic envelope rejection (51103) is marked definitive so the day is not lost', async () => {
+  // Live server answer for a malformed idempotency key: HTTP 200 with a 51103 envelope. The server
+  // discarded the submission, so nothing was claimed and a later attempt cannot double-credit.
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/slot')) return jsonResponse(slotFixture);
+    if ((init.method ?? 'GET') === 'POST') return jsonResponse({code: 51103, message: 'Invalid idempotency key'});
+    return jsonResponse(contextFixture(false)); // never claimed
+  };
+  await assert.rejects(lobsterClaimCheckin(SECRET_CRED, 'daily-checkin', {fetchImpl}), error => {
+    assert.equal(error.code, 'lobster_action_invalid');
+    assert.equal(error.definitiveRejection, true);
+    assert.equal(error.after.claimed, false);
+    return true;
+  });
+});
+
+test('claim: a transient upstream 5xx is never marked definitive', async () => {
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/slot')) return jsonResponse(slotFixture);
+    if ((init.method ?? 'GET') === 'POST') return jsonResponse({code: 500, message: 'busy'}, {status: 502});
+    return jsonResponse(contextFixture(false));
+  };
+  await assert.rejects(lobsterClaimCheckin(SECRET_CRED, 'daily-checkin', {fetchImpl}), error => error.definitiveRejection !== true);
 });
 
 test('claim: business 51104 already-claimed race + context confirms -> success with recorded note', async () => {
