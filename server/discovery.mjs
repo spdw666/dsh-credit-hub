@@ -54,6 +54,12 @@ export function nativeCandidates(host={}) {
     ...['cn','global'].map(edition=>make('qoder-'+edition,'qoder','Qoder '+(edition==='cn'?'国内':'国际'),[join(app,edition==='cn'?'com.qodercn.app.stable':'com.qoder.app.stable','auth.v1.dat')],{edition,requiresSetup:'qoder_native_identity_required'})),
     ...['cn','global'].map(edition=>make('codebuddy-'+edition,'codebuddy','CodeBuddy '+(edition==='cn'?'国内':'国际'),[join(app,'CodeBuddy'+(edition==='cn'?' CN':''),'User/globalStorage/state.vscdb')],{edition,layout:'vscode'})),
     make('codearts','codearts','CodeArts Agent',[join(app,'codearts-agent/User/globalStorage/state.vscdb')],{layout:'vscode'}),
+    // CodeArts 0.2.x DESKTOP (Electron) keeps the identical IAM session somewhere else:
+    // <userData>/secretStorage/sha256('authSession:<region>').enc, wrapped by Electron
+    // safeStorage (DPAPI + AES-256-GCM, base64 on disk) next to <userData>/Local State.
+    // The file name is derived from the auth region, so every region of the desktop
+    // product is listed; primary() picks the one this installation actually wrote.
+    make('codearts-desktop','codearts','CodeArts 桌面版',['cn-north-4','cn-east-3','cn-south-1','cn-north-1','cn-east-2','ap-southeast-1','ap-southeast-3'].map(region=>join(app,'codearts/secretStorage/'+sha('authSession:'+region)+'.enc')),{layout:'electron'}),
     make('cline','cline','Cline',[join(home,'.cline/data/settings/providers.json')]),
     make('lobster','lobster','LobsterAI',[join(app,'LobsterAI/lobsterai.sqlite')]),
     make('loomy','loomy','Loomy',[host.LOOMY_AUTH_SESSION_FILE,join(publicRoot,'Loomy',sha(username).slice(0,12),'userData/auth-session.json'),join(app,'Loomy/auth-session.json')]),
@@ -69,7 +75,7 @@ export function nativeCandidates(host={}) {
     'cline':[join(home,'.cline')],
     'raccoon':[join(home,'.box-agent')],
   };
-  return rows.map(row=>({...row,markers:[...row.paths.map(file=>row.layout==='vscode'?dirname(dirname(dirname(file))):dirname(file)),...(installedMarkers[row.id]??[])]}));
+  return rows.map(row=>({...row,markers:[...new Set(row.paths.map(file=>row.layout==='vscode'?dirname(dirname(dirname(file))):row.layout==='electron'?dirname(dirname(file)):dirname(file))),...(installedMarkers[row.id]??[])]}));
 }
 
 function normalizeSettings(value={}) {
@@ -143,8 +149,17 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     return {file:null,present};
   }
   async function stableBundle(candidate,file,limit){
-    const profile=candidate.layout==='vscode'?dirname(dirname(dirname(file))):dirname(file),name=relative(profile,file);
+    const profile=candidate.layout==='vscode'?dirname(dirname(dirname(file))):candidate.layout==='electron'?dirname(dirname(file)):dirname(file),name=relative(profile,file);
     const entries=[{file,name,required:true},...['Local State','machineid','auth.machine-id','telemetry-state.json'].filter(n=>n!==name).map(n=>({file:join(profile,n),name:n}))];
+    if(candidate.layout==='electron'){
+      // Desktop secret names are opaque hashes of `authSession:<region>`; snapshot every
+      // sibling secret so the adapter can still locate the live session after a region
+      // change (the adapter only ever trusts the file it was handed or a sibling in the
+      // same owned copy, never the native directory itself).
+      const dir=dirname(file);
+      for(const entry of await readdir(dir,{withFileTypes:true}).catch(error=>{if(error.code==='ENOENT')return [];throw error;}))
+        if(entry.isFile()&&entry.name.endsWith('.enc')&&entry.name!==basename(file))entries.push({file:join(dir,entry.name),name:join(dirname(name),entry.name)});
+    }
     if(candidate.platform==='trae'){
       // readTraeIdentity resolves historical dc records using the latest native
       // session's active-device metadata. Preserve its existing three-level
@@ -246,6 +261,11 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     }
     const isolated=await snapshot(candidate,bundle);
     const credential=await probeCredential(isolated.account,{engineRoot,dataDir:isolated.dataDir,now:now(),offline:true,allowExpired:true});
+    // An Electron secret name is derived from the product, not from the account, so two
+    // signed-in CodeArts accounts live in the same file name and differ only in content.
+    // A candidate-wide refresh cache would hold one rotating refresh token at a time and
+    // invalidate whichever account refreshed last, so scope this cache by identity.
+    if(candidate.layout==='electron')isolated.account.credentials.cacheFile=join(isolated.dataDir,'private-cache','discovery-'+candidate.id+'-'+sha(identityKey(isolated.account,credential.principal)).slice(0,16)+'.json');
     if(isRemovedAccount(service.config.value,isolated.account,credential.principal)){
       await removeOwnedCredentialAssets(service,isolated.account,{taskRoot:root});return deleted();
     }

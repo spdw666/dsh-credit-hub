@@ -42,12 +42,17 @@ export class ClaimService {
       if(account.platform==='workbuddy')this.ledger.set('wb-pool-cooldown:'+accountId,{until:0,reason:'checkin_confirmed'});
       return finish('success',{credits:claim.credit??after.credits,serverConfirmed:true,...(claim.unit?{unit:claim.unit}:{}),...(claim.planId?{planId:claim.planId,details:claim.details}: {})});
     }catch(e){
-      const beforeSubmission=!priorUncertain&&(!wrote||e.beforeSubmission===true);
       // Retry only a known pre-submission failure. A timeout after a claim was
       // sent remains uncertain and is never converted into a second POST.
+      // A provider may itself declare a deterministic refusal as safe to resend
+      // (e.g. LobsterAI's 51103 request-envelope rejection: it flagged beforeSubmission).
+      const beforeSubmission=!priorUncertain&&(!wrote||e.beforeSubmission===true);
       const loginRequired=e.loginRequired===true||e.status===401;
-      const retryable=beforeSubmission&&!e.actionRequired&&!e.definitiveRejection&&(loginRequired||e.retryable===true||e.status===429||e.status>=500||/^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR_)/.test(e.code??'')||['TimeoutError','TypeError'].includes(e.name));
-      return finish(priorUncertain?'uncertain':e.actionRequired||loginRequired?'action_required':e.definitiveRejection?'rejected':beforeSubmission?'error':'uncertain',{reason:e.code??'upstream_error',error:errorView(e),beforeSubmission,retryable,...(e.retryAt?{retryAt:e.retryAt}:{})});
+      // A provider-declared resendable refusal still has a known outcome, so it must not be recorded
+      // as 'uncertain' (that would fence the day). It is reported as a retryable 'error' instead.
+      const resendable=beforeSubmission&&e.definitiveRejection===true&&e.retryable===true&&!e.actionRequired;
+      const retryable=beforeSubmission&&!e.actionRequired&&!e.definitiveRejection&&(loginRequired||e.retryable===true||e.status===429||e.status>=500||/^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR_)/.test(e.code??'')||['TimeoutError','TypeError'].includes(e.name))||resendable;
+      return finish(priorUncertain?'uncertain':e.actionRequired||loginRequired?'action_required':e.definitiveRejection&&!resendable?'rejected':beforeSubmission?'error':'uncertain',{reason:e.code??'upstream_error',error:errorView(e),beforeSubmission,retryable,...(e.retryAt?{retryAt:e.retryAt}:{})});
     }
   }
   async all() {

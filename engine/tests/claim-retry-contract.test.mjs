@@ -21,3 +21,20 @@ test('a failing read cannot erase an earlier uncertain submission fence',async t
  s.platforms.status=async()=>({known:true,active:true,claimed:false});
  assert.equal((await s.run('SAMPLE')).reason,'previous_submission_unconfirmed');assert.equal(posts,1);
 });
+// A deterministic envelope rejection is an ANSWER (the server validated and discarded the request,
+// claiming nothing), so it is safe to resend later the same day and cannot double-credit. Distinct
+// from a post-submission timeout, which stays uncertain forever. LobsterAI 51103 previously locked
+// the account for the whole day; it now reports not_available + retryable so the scheduler replays it.
+test('deterministic rejection is retryable while a timeout stays fenced',async t=>{
+ const s=await fixture(t,{errorAt:'none'});let posts=0;
+ s.platforms.claim=async()=>{posts++;if(posts===1)throw Object.assign(new AppError('refused',503,'lobster_action_invalid'),{definitiveRejection:true,beforeSubmission:true,retryable:true});return {submitted:true,claimed:true};};
+ s.platforms.status=async()=>({known:true,active:true,claimed:posts>=2});
+ const first=await s.run('SAMPLE');assert.equal(first.status,'error');assert.equal(first.retryable,true);assert.equal(first.beforeSubmission,true);
+ const second=await s.run('SAMPLE');assert.equal(second.status,'success');assert.equal(posts,2);
+});
+test('a deterministic rejection never escapes an earlier uncertain fence',async t=>{
+ const s=await fixture(t,{errorAt:'none'});let posts=0;
+ s.platforms.claim=async()=>{posts++;if(posts===1)return {submitted:true,claimed:false};throw Object.assign(new AppError('refused',502,'lobster_action_invalid'),{definitiveRejection:true});};
+ assert.equal((await s.run('SAMPLE')).status,'uncertain');
+ const fenced=await s.run('SAMPLE');assert.equal(fenced.status,'uncertain');assert.equal(fenced.reason,'previous_submission_unconfirmed');assert.equal(posts,1);
+});

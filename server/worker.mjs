@@ -23,7 +23,7 @@ const send=message=>{if(process.connected)process.send?.(message);};
 const problem=error=>({code:error.code??'hub_worker_error',message:error.message??'Worker operation failed',status:error.status??500});
 function defaultConfig(){return {schemaVersion:1,dataDir:'./data',server:{host:'127.0.0.1',port:0,allowRemote:false,requestTimeoutMs:180000,bodyLimitBytes:67108864},scheduler:{enabled:false,startup:false,timezone:'Asia/Shanghai',hour:10,minute:0,jitterSeconds:600,retryMinutes:60},workbuddy:{autoMigrateSessions:false,autoTasks:false},clientUpdates:{enabled:false},accounts:[],upstreams:[],routes:[]};}
 function routeView(route){return {id:route.id,name:route.name??route.id,enabled:route.enabled!==false,targetCount:route.targets?.length??0,targets:(route.targets??[]).map(({model,upstreamId})=>({model,upstreamId}))};}
-const accountView=(account,index)=>publicAccount(account,index,{blockedKinds:service.config.value.pluginIsolation?.blockedUpstreamKinds??['antigravity','opencode']});
+const accountView=(account,index)=>{const health=service.credentials.renewalState?.(account.id)??service.sessionHealth?.(account.id)??null;return publicAccount(account,index,{blockedKinds:service.config.value.pluginIsolation?.blockedUpstreamKinds??['antigravity','opencode'],credentialHealth:health});};
 function snapshot(){
   const c=service.config.value,accounts=c.accounts.map(accountView),routes=c.routes.map(routeView),usage=service.ledger.usage({limit:100});
   const cache=service.balanceCache instanceof Map?[...service.balanceCache.entries()].map(([accountId,value])=>({accountId,...value})):[];

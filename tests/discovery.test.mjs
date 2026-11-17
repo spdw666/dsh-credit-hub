@@ -168,3 +168,50 @@ test('explicit updateConfig callback merges a concurrent latest user edit',async
 test('manual scan without connect is detection only and targeted import returns its candidate',async()=>{
   const f=await fixture();try{await write(f.file,auth());assert.equal(row(await f.d.scan({connect:false})).status,'installed');assert.equal(f.config.value.accounts.length,0);assert.equal(f.catalogs.length,0);assert.equal((await f.d.importCandidate('sample-agent')).status,'imported');await assert.rejects(f.d.importCandidate('missing-id'),{code:'discovery_candidate_not_found'});}finally{await f.clean();}
 });
+
+test('CodeArts desktop Electron layout is its own candidate rooted at the product userData directory',()=>{
+  const host=captureHostEnvironment({APPDATA:'D:/SAMPLE/Roaming',LOCALAPPDATA:'D:/SAMPLE/Local',USERPROFILE:'D:/SAMPLE',PUBLIC:'D:/Public'},{home:'D:/SAMPLE',username:'SAMPLE'});
+  const all=nativeCandidates(host),legacy=all.find(c=>c.id==='codearts'),desktop=all.find(c=>c.id==='codearts-desktop');
+  assert.equal(legacy.layout,'vscode');
+  assert.equal(legacy.paths[0],join('D:/SAMPLE/Roaming','codearts-agent/User/globalStorage/state.vscdb'));
+  assert.equal(desktop.platform,'codearts');assert.equal(desktop.layout,'electron');
+  assert.equal(desktop.paths.length,7);
+  assert.equal(desktop.paths[0],join('D:/SAMPLE/Roaming','codearts','secretStorage',createHash('sha256').update('authSession:cn-north-4').digest('hex')+'.enc'));
+  assert.deepEqual(desktop.markers,[join('D:/SAMPLE/Roaming','codearts')]);
+});
+
+test('CodeArts desktop safeStorage session is detected while the extension-era SQLite candidate stays missing',async()=>{
+  const f=await fixture();
+  try{
+    const profile=join(f.hostEnvironment.APPDATA,'codearts');
+    const enc=join(profile,'secretStorage',createHash('sha256').update('authSession:cn-north-4').digest('hex')+'.enc');
+    await write(enc,'djEwc2FtcGxlLW9wYXF1ZS1jaXBoZXJ0ZXh0');
+    await write(join(profile,'Local State'),JSON.stringify({os_crypt:{encrypted_key:'SAMPLE'}}));
+    const result=await f.d.scan({connect:false});
+    const desktop=row(result,'codearts-desktop'),legacy=row(result,'codearts');
+    assert.equal(desktop.status,'installed');assert.equal(desktop.installed,true);assert.equal(desktop.reason,'connection_not_requested');
+    assert.equal(legacy.status,'missing');assert.equal(legacy.installed,false);assert.equal(legacy.reason,'agent_not_detected');
+    assert.equal(f.config.value.accounts.length,0);
+  }finally{await f.clean();}
+});
+
+test('two signed-in CodeArts desktop accounts never share one rotating refresh cache',async()=>{
+  const f=await fixture({extraCandidates:[],fetchModels:async()=>sampleModels,
+    probeCredential:async account=>({principal:(await readFile(account.credentials.file,'utf8')).includes('SESSION_TWO')?'codearts:two':'codearts:one',expiresAtMs:Date.now()+3600000})});
+  try{
+    const profile=join(f.hostEnvironment.APPDATA,'codearts'),enc=join(profile,'secretStorage',createHash('sha256').update('authSession:cn-north-4').digest('hex')+'.enc');
+    await write(enc,'SESSION_ONE');await write(join(profile,'Local State'),JSON.stringify({os_crypt:{encrypted_key:'SAMPLE'}}));
+    const first=row(await f.d.scan(),'codearts-desktop');assert.equal(first.status,'imported');
+    // The desktop product keeps one secret per product, not per account: signing in as
+    // a second account overwrites the same file name with different content.
+    await write(enc,'SESSION_TWO');
+    const second=row(await f.d.scan(),'codearts-desktop');assert.equal(second.status,'imported');
+    assert.notEqual(second.accountId,first.accountId);
+    const [a,b]=[first.accountId,second.accountId].map(id=>f.config.value.accounts.find(x=>x.id===id));
+    assert.equal(f.config.value.accounts.length,2);
+    assert.notEqual(a.credentials.cacheFile,b.credentials.cacheFile);
+    assert.notEqual(a.credentials.cacheFile,join(f.dataDir,'private-cache','discovery-codearts-desktop.json'));
+    assert.notEqual(a.credentials.file,b.credentials.file);
+    assert.equal(await readFile(b.credentials.file,'utf8'),'SESSION_TWO');
+  }finally{await f.clean();}
+});

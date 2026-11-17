@@ -33,7 +33,7 @@ async function readQoderCredential(account,config={}){
  const edition=account.edition;region({edition});const {dir,file,localState}=qoderStoragePaths(account,config);
  let c;if(account.credentials?.kind==='file'){c=JSON.parse(await readFile(file));if(c.edition!==edition)throw new AppError('Qoder文件区域不匹配',401,'provider_region_mismatch')}
  else {const raw=await decryptElectronJson(file,localState);const helper=account.credentials?.executable??(edition==='cn'?'D:/Qoder CN':'D:/Qoder')+'/resources/umid/runtime-info.exe';const identity=readQoderNativeIdentity(helper,raw.user?.id,{authMtimeMs:(await stat(file)).mtimeMs});c={edition,accessToken:raw.token,uid:raw.user?.id,principal:raw.user?.id,expiresAt:raw.expiresAt,machineId:(await readFile(join(dir,'auth.machine-id'),'utf8')).trim(),identity}}
- if(!c.accessToken||!c.uid||!c.machineId||!c.identity?.machineToken||!c.identity?.machineCode)throw new AppError('Qoder本机登录与身份信息不完整',401,'provider_login_required');rememberSecret(c.accessToken);rememberSecret(c.identity.machineToken);return {...c,proxyUrl:account.credentials?.proxyUrl??c.proxyUrl,filePath:file,source:'desktop'};
+ if(!c.accessToken||!c.uid||!c.machineId||!c.identity?.machineToken||!c.identity?.machineCode)throw new AppError('Qoder本机登录与身份信息不完整',401,'provider_login_required');rememberSecret(c.accessToken);rememberSecret(c.identity.machineToken);return {...c,expiresAtMs:Date.parse(c.expiresAt)||null,proxyUrl:account.credentials?.proxyUrl??c.proxyUrl,filePath:file,source:'desktop'};
 }
 export async function resolveQoderCredential(account,config={}){try{return await readQoderCredential(account,config)}catch(e){if(e.code==='ENOENT')throw new AppError('Qoder本机登录文件待就绪',401,'provider_login_required');throw e}}
 function bearer(c){return {Authorization:'Bearer '+c.accessToken,Accept:'application/json','Content-Type':'application/json','User-Agent':'Qoder','Cosy-ClientType':'10','Cosy-MachineId':c.machineId,'Cosy-MachineToken':c.identity.machineToken,'Cosy-MachineCode':c.identity.machineCode,'Cosy-MachineType':String(c.identity.machineType),'Cosy-MachineOS':'win32','Cosy-MachineHostname':hostname()}}
@@ -44,7 +44,32 @@ export function signQoder(url,plain,c,{model,encode=true}={}){
  return {body,headers:{...bearer(c),Authorization:`Bearer COSY.${payload}.${signature}`,'Cosy-Version':VERSION,'Cosy-ClientType':'5','Cosy-Data-Policy':'agree','Cosy-Date':ts,'Cosy-Key':cosyKey,'Cosy-Scene':'assistant','Cosy-User':c.uid,'Cosy-Business-Product':'cli','Cosy-Business-Type':'agent','Login-Version':'v2',...(model?{'X-Model-Key':model,'X-Model-Source':'system'}:{})}};
 }
 function cacheKey(c){return c.edition+':'+c.uid}
-export function parseQoderModels(data){const seen=new Map();for(const scene of ['chat','developer','assistant','app'])for(const m of Array.isArray(data?.[scene])?data[scene]:[]){if(!m?.key||m.enable===false||seen.has(m.key)||(m.source&&m.source!=='system'))continue;const ctx=Number.isSafeInteger(m.max_input_tokens)&&m.max_input_tokens>0?m.max_input_tokens:null,out=Number.isSafeInteger(m.max_output_tokens)&&m.max_output_tokens>0?m.max_output_tokens:1024;seen.set(m.key,{id:m.key,name:m.display_name??m.key,contextWindow:ctx,maxTokens:out,maxTokensSource:m.max_output_tokens>0?'official_catalog':'configured_default',officialMaxTokens:m.max_output_tokens>0?m.max_output_tokens:null,tools:true,multimodal:m.is_vl===true,reasoning:null,isReasoning:m.is_reasoning===true,callable:!!ctx,source:'qoder-official-signed-catalog',priceFactor:m.price_factor??null})}return [...seen.values()]}
+// The official client and its agent SDK declare an adjustable thinking level as
+// top-level reasoningEffort plus parameters.reasoning_effort. The catalogue's
+// thinking_config is that same declaration; a bare is_reasoning boolean is not.
+const THINKING_LEVELS=['minimal','low','medium','high','xhigh','max'],OFF_LEVELS=new Set(['off','none','disabled']);
+export function parseQoderThinking(config){
+ const enabled=config&&typeof config==='object'&&!Array.isArray(config)?config.enabled:null,source=enabled&&typeof enabled==='object'&&!Array.isArray(enabled)?enabled.efforts:null;
+ // Keys arrive in no declared order; publish them in the canonical level order.
+ const declared=source&&typeof source==='object'&&!Array.isArray(source)?Object.keys(source):[],efforts=THINKING_LEVELS.filter(level=>declared.includes(level));
+ const marked=declared.find(key=>{const entry=source[key];return entry&&typeof entry==='object'&&!Array.isArray(entry)&&entry.is_default===true;});
+ return {efforts,defaultEffort:marked&&efforts.includes(marked)?marked:null,canDisable:!!config&&config.disabled!==undefined&&config.disabled!==null,supported:efforts.length>0};
+}
+export function qoderReasoningEfforts(thinking){if(!thinking?.supported)return null;const map=Object.fromEntries(thinking.efforts.map(level=>[level,level]));if(thinking.canDisable)map.off='none';return map}
+export function resolveQoderEffort(model,requested){
+ if(typeof requested!=='string'||!requested)return null;const declared=model?.reasoningEfforts;
+ // An undeclared level is dropped, never sent as a guess: a caller's optional
+ // knob must not turn a whole turn into a rejected request.
+ if(OFF_LEVELS.has(requested))return typeof declared?.off==='string'?declared.off:null;
+ return typeof declared?.[requested]==='string'?declared[requested]:null;
+}
+export function applyQoderEffort(payload,effort){
+ if(!effort)return payload;const reasoning=!OFF_LEVELS.has(effort);
+ return {...payload,reasoningEffort:effort,parameters:{...(payload.parameters??{}),reasoning_effort:effort},
+  model_config:{...payload.model_config,is_reasoning:reasoning},
+  chat_context:{...payload.chat_context,extra:{...payload.chat_context?.extra,modelConfig:{...payload.chat_context?.extra?.modelConfig,is_reasoning:reasoning}}}};
+}
+export function parseQoderModels(data){const seen=new Map();for(const scene of ['chat','developer','assistant','app'])for(const m of Array.isArray(data?.[scene])?data[scene]:[]){if(!m?.key||m.enable===false||seen.has(m.key)||(m.source&&m.source!=='system'))continue;const ctx=Number.isSafeInteger(m.max_input_tokens)&&m.max_input_tokens>0?m.max_input_tokens:null,out=Number.isSafeInteger(m.max_output_tokens)&&m.max_output_tokens>0?m.max_output_tokens:1024,thinking=parseQoderThinking(m.thinking_config),efforts=qoderReasoningEfforts(thinking);seen.set(m.key,{id:m.key,name:m.display_name??m.key,contextWindow:ctx,maxTokens:out,maxTokensSource:m.max_output_tokens>0?'official_catalog':'configured_default',officialMaxTokens:m.max_output_tokens>0?m.max_output_tokens:null,tools:true,multimodal:m.is_vl===true,reasoning:thinking.supported?{supportedEfforts:thinking.efforts,defaultEffort:thinking.defaultEffort,canDisableThinking:thinking.canDisable,alwaysEnabled:!thinking.canDisable}:null,reasoningEfforts:efforts,isReasoning:m.is_reasoning===true||thinking.supported,callable:!!ctx,source:'qoder-official-signed-catalog',priceFactor:m.price_factor??null})}return [...seen.values()]}
 export async function qoderModels(c,options={}){const cached=catalogCache.get(cacheKey(c));if(!options.force&&!options.refresh&&cached&&Date.now()-cached.at<300000)return cached.models;const url=region(c).infer+'/algo/api/v2/model/list?Encode=1',s=signQoder(url,'',c,{encode:false}),data=await providerJson(url,c,{...options,headers:s.headers});const models=parseQoderModels(data);if(!models.length)throw new AppError('Qoder官方目录未返回可核验模型',502,'provider_catalog_empty');catalogCache.set(cacheKey(c),{at:Date.now(),models});return models}
 async function openapi(c,path,options={}){return providerJson(region(c).openapi+path,c,{...options,headers:bearer(c)})}
 export function qoderCampaignStatus(data,c,now=Date.now()){
@@ -61,7 +86,26 @@ export function unwrapQoderSSE(body){
 export function normalizeQoderMessages(messages){return messages.map(m=>{let out={...m};if(out.tool_calls&&out.content==null)out.content='';if(out.role==='developer'){out.role='system';delete out.tool_calls}return out})}
 export async function qoderChat(upstream,c,input,signal,options={}){
  const models=await qoderModels(c,{...options,signal}),m=models.find(x=>x.id===input.model);if(!m?.callable)throw new AppError('Qoder模型缺失已核验容量',400,'provider_model_unverified');const max=input.max_tokens??input.max_completion_tokens??m.maxTokens;if(!Number.isSafeInteger(max)||max<=0||max>m.maxTokens)throw new AppError('Qoder输出超过配置上限',400,'provider_output_limit');
- const request=randomUUID(),set=randomUUID(),session=randomUUID(),messages=input.messages??[],text=messages.filter(x=>x.role==='user').at(-1)?.content??'',prompt=typeof text==='string'?text:'';let p={model:m.id,stream:true,stream_options:{include_usage:true},max_tokens:max};for(const k of ['messages','tools','tool_choice','temperature','top_p','stop','presence_penalty','frequency_penalty','reasoning_effort'])if(input[k]!==undefined)p[k]=input[k];p.messages=normalizeQoderMessages(messages);p={...p,request_id:request,request_set_id:set,chat_record_id:request,session_id:session,chat_task:'FREE_INPUT',chat_context:{text:prompt,features:[],extra:{context:[],modelConfig:{key:m.id,is_reasoning:m.isReasoning===true},originalContent:prompt},chatPrompt:'',imageUrls:null},is_reply:true,is_retry:false,source:1,version:'3',agent_id:'agent_common',task_id:'common',session_type:'qoderclicn',aliyun_user_type:'',model_config:{key:m.id,display_name:m.name,model:'',format:'openai',is_vl:m.multimodal,is_reasoning:m.isReasoning===true,api_key:'',url:'',source:'system',max_input_tokens:m.contextWindow},business:{product:'cli',version:VERSION,type:'agent',id:set,name:prompt.slice(0,10),begin_at:Date.now(),stage:'processing'}};
+ const request=randomUUID(),set=randomUUID(),session=randomUUID(),messages=input.messages??[],text=messages.filter(x=>x.role==='user').at(-1)?.content??'',prompt=typeof text==='string'?text:'';let p={model:m.id,stream:true,stream_options:{include_usage:true},max_tokens:max};for(const k of ['messages','tools','tool_choice','temperature','top_p','stop','presence_penalty','frequency_penalty'])if(input[k]!==undefined)p[k]=input[k];p.messages=normalizeQoderMessages(messages);p={...p,request_id:request,request_set_id:set,chat_record_id:request,session_id:session,chat_task:'FREE_INPUT',chat_context:{text:prompt,features:[],extra:{context:[],modelConfig:{key:m.id,is_reasoning:m.isReasoning===true},originalContent:prompt},chatPrompt:'',imageUrls:null},is_reply:true,is_retry:false,source:1,version:'3',agent_id:'agent_common',task_id:'common',session_type:'qoderclicn',aliyun_user_type:'',model_config:{key:m.id,display_name:m.name,model:'',format:'openai',is_vl:m.multimodal,is_reasoning:m.isReasoning===true,api_key:'',url:'',source:'system',max_input_tokens:m.contextWindow},business:{product:'cli',version:VERSION,type:'agent',id:set,name:prompt.slice(0,10),begin_at:Date.now(),stage:'processing'}};const effort=resolveQoderEffort(m,input.reasoning_effort??input.reasoningEffort);if(effort)p=applyQoderEffort(p,effort);
  const url=region(c).infer+'/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1',signed=signQoder(url,JSON.stringify(p),c,{model:m.id}),r=await(options.fetchImpl??providerFetch)(url,{method:'POST',...signed,headers:{...signed.headers,Accept:'text/event-stream'},signal,proxyUrl:c.proxyUrl,redirect:'error'});if(!r.ok){await r.body?.cancel();throw new AppError(`Qoder聊天 HTTP ${r.status}`,r.status,'provider_chat_rejected')}if(!r.body)throw new AppError('Qoder响应为空',502,'provider_stream_error');return {response:new Response(unwrapQoderSSE(r.body),{status:200,headers:{'Content-Type':'text/event-stream'}})};
 }
-export const qoderProvider={resolve:resolveQoderCredential,models:qoderModels,health:qoderHealth,status:qoderStatus,claim:qoderClaim,chat:qoderChat};
+// Device-token refresh, available to both editions. The endpoint is chosen from
+// the edition's openapi host (never hard-coded): the body carries only the
+// refresh token and no client header, so the refresh works while the desktop
+// client is absent. The refresh token rotates on every success; callers must
+// treat the returned family as exclusive (see CredentialManager.renewQoder).
+export async function refreshQoderDeviceToken(c,options={}){
+  const url=region(c).openapi+'/api/v1/deviceToken/refresh';
+  const data=await providerJson(url,c,{...options,method:'POST',body:{refresh_token:c.refreshToken},headers:{Accept:'application/json','Content-Type':'application/json'}});
+  const accessToken=data.device_token??data.accessToken??data.token,refreshToken=data.refresh_token??data.refreshToken;
+  if(typeof accessToken!=='string'||!accessToken)throw new AppError('Qoder续期响应缺少令牌',502,'provider_refresh_rejected');
+  const refreshTokenExpiresAt=data.refresh_token_expires_at??data.refreshTokenExpiresAt??null,expiresAt=data.expires_at??data.expiresAt??null;
+  return {accessToken,refreshToken:typeof refreshToken==='string'&&refreshToken?refreshToken:null,rotated:typeof refreshToken==='string'&&refreshToken!==c.refreshToken,expiresAt,refreshTokenExpiresAt,createdAt:data.created_at??data.createdAt??null};
+}
+export function qoderCredentialWriteback(latest,renewed,now=new Date().toISOString()){
+  if(!latest||typeof latest!=='object')return null;
+  // Only the token family changes; identity, machine binding and edition stay
+  // with the original snapshot so a refresh cannot silently rotate the machine.
+  return {...latest,accessToken:renewed.accessToken,refreshToken:renewed.refreshToken??latest.refreshToken,expiresAt:renewed.expiresAt??latest.expiresAt,refreshTokenExpiresAt:renewed.refreshTokenExpiresAt??latest.refreshTokenExpiresAt,renewedAt:now,renewalSource:'deviceToken_refresh_api'};
+}
+export const qoderProvider={resolve:resolveQoderCredential,models:qoderModels,health:qoderHealth,status:qoderStatus,claim:qoderClaim,chat:qoderChat,refresh:refreshQoderDeviceToken};

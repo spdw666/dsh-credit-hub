@@ -21,13 +21,16 @@ test('automatic CodeArts check-in recovers a committed claim whose response was 
   }});
   assert.equal(result.claimed,true);assert.equal(result.confirmed,true);
   assert.equal(result.rechecked,true);assert.equal(result.submissionResponseLost,true);
-  assert.deepEqual(posts,['/v1/ops/claim','/v1/ops/confirm']);
+  // The lost claim acknowledgement left no userBenefitId behind, and CLAIMED already means
+  // 「今日已领」, so recovery must not replay either write.
+  assert.deepEqual(posts,['/v1/ops/claim']);
 });
 
-test('automatic CodeArts check-in accepts only settled delivery after a lost confirm response',async()=>{
-  let state='CLAIMED',confirmCalls=0;
-  const result=await codeartsClaim(codearts,'daily-checkin',{fetchImpl:async(_url,init)=>{
+test('automatic CodeArts check-in accepts a settled delivery after a lost confirm response',async()=>{
+  let state='ELIGIBLE',confirmCalls=0;
+  const result=await codeartsClaim(codearts,'daily-checkin',{fetchImpl:async(url,init)=>{
     if(init.method==='GET')return delivery(state);
+    if(new URL(url).pathname==='/v1/ops/claim'){state='CLAIMED';return json({userBenefitId:'ub-1'});}
     confirmCalls++;state='CONFIRMED';throw new TypeError('SAMPLE disconnected confirm acknowledgement');
   }});
   assert.equal(result.claimed,true);assert.equal(result.confirmed,true);
@@ -38,11 +41,13 @@ test('automatic CodeArts check-in reads through eventual delivery without replay
   let state='ELIGIBLE',readsAfterConfirm=0;const posts=[];
   const result=await codeartsClaim(codearts,'daily-checkin',{fetchImpl:async(url,init)=>{
     if(init.method==='GET'){
+      // The claim state propagates with a delay: one stale ELIGIBLE read before CLAIMED.
       if(state==='CONFIRM_SENT'&&++readsAfterConfirm>=2)state='CONFIRMED';
-      return delivery(state==='CONFIRM_SENT'?'CLAIMED':state);
+      return delivery(state==='CONFIRM_SENT'?'ELIGIBLE':state);
     }
     const path=new URL(url).pathname;posts.push(path);
-    state=path==='/v1/ops/claim'?'CLAIMED':'CONFIRM_SENT';return json({});
+    if(path==='/v1/ops/claim'){state='CLAIMED';return json({userBenefitId:'ub-1'});}
+    state='CONFIRM_SENT';return json({});
   }});
   assert.equal(result.confirmed,true);assert.equal(readsAfterConfirm,2);
   assert.deepEqual(posts,['/v1/ops/claim','/v1/ops/confirm']);

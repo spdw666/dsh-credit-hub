@@ -328,10 +328,41 @@ test('claim: submits to whitelisted action, then proves via context re-read (no 
   assert.ok(posts[0].url.endsWith('/api/client-activities/daily-check-in-evergreen-prod-20260814/actions/check_in'));
   assert.equal(posts[0].body.configRevision, 1);
   assert.equal(posts[0].body.payload && typeof posts[0].body.payload === 'object', true);
-  assert.equal(typeof posts[0].body.idempotencyKey, 'string');
+  // Official client contract: `daily-check-in-${uuid}` truncated to 64 chars. Any other shape is
+  // rejected by the live server with 51103 "Invalid idempotency key" (observed 2026-11-16).
+  assert.match(posts[0].body.idempotencyKey, /^daily-check-in-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.ok(posts[0].body.idempotencyKey.length <= 64);
+  assert.equal(posts[0].body.idempotencyKey.includes('ai-credit'), false);
   assert.equal(result.submitted, true);
   assert.equal(result.rechecked, true);
   assert.equal(result.claimed, true);
+});
+
+test('claim: a deterministic envelope rejection (51103) is marked definitive so the day is not lost', async () => {
+  // Live server answer for a malformed idempotency key: HTTP 200 with a 51103 envelope. The server
+  // discarded the submission, so nothing was claimed and a later attempt cannot double-credit.
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/slot')) return jsonResponse(slotFixture);
+    if ((init.method ?? 'GET') === 'POST') return jsonResponse({code: 51103, message: 'Invalid idempotency key'});
+    return jsonResponse(contextFixture(false)); // never claimed
+  };
+  await assert.rejects(lobsterClaimCheckin(SECRET_CRED, 'daily-checkin', {fetchImpl}), error => {
+    assert.equal(error.code, 'lobster_action_invalid');
+    assert.equal(error.definitiveRejection, true);
+    assert.equal(error.after.claimed, false);
+    return true;
+  });
+});
+
+test('claim: a transient upstream 5xx is never marked definitive', async () => {
+  const fetchImpl = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes('/slot')) return jsonResponse(slotFixture);
+    if ((init.method ?? 'GET') === 'POST') return jsonResponse({code: 500, message: 'busy'}, {status: 502});
+    return jsonResponse(contextFixture(false));
+  };
+  await assert.rejects(lobsterClaimCheckin(SECRET_CRED, 'daily-checkin', {fetchImpl}), error => error.definitiveRejection !== true);
 });
 
 test('claim: business 51104 already-claimed race + context confirms -> success with recorded note', async () => {
@@ -551,7 +582,12 @@ test('reasoning mapping uses real native levels, exact names first, never invent
 
 test('reasoning metadata and real request medium share the same official-options mapping',async()=>{
  const models=await lobsterModels(SECRET_CRED,{fetchImpl:async()=>jsonResponse({code:0,data:modelsFixture})});
- const flash=models.find(m=>m.id==='deepseek-flash');assert.equal(flash.reasoning,null);assert.equal(flash.reasoningDefault,'high');assert.equal(flash.reasoningEffortMapping.medium,'high');assert.equal(flash.reasoningMappingSource,'gateway_aliases_of_official_options');
+ const flash=models.find(m=>m.id==='deepseek-flash');
+ // Declared native levels are a published capability now (was `reasoning:null`, which made the client draw no control).
+ assert.deepEqual(flash.reasoning,{supportedEfforts:['off','high','max'],defaultEffort:'high',source:'official_catalog'});
+ assert.equal(flash.isReasoning,true);
+ assert.deepEqual(flash.reasoningEfforts,{off:'off',high:'high',max:'max'});
+ assert.equal(flash.reasoningDefault,'high');assert.equal(flash.reasoningEffortMapping.medium,'high');assert.equal(flash.reasoningMappingSource,'gateway_aliases_of_official_options');
  for(const [requested,expected]of Object.entries({minimal:'high',low:'high',medium:'high',none:'off',xhigh:'max'})){
   let body;const {response}=await lobsterChat(null,SECRET_CRED,{model:'deepseek-flash',messages:[{role:'user',content:'fixture'}],reasoning_effort:requested,stream:false},undefined,{fetchImpl:async(u,o)=>{body=JSON.parse(o.body);return sseResponse(['data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n']);}});
   assert.equal((await response.json()).choices[0].message.content,'ok');assert.equal(body.lobsterai_options.thinking.level,expected);assert.equal('reasoning_effort' in body,false);
@@ -575,4 +611,44 @@ test('nullable reasoning effort is omitted, keeps product default off, and prese
   const {response}=await lobsterChat(null,SECRET_CRED,{model:testCase.model,messages:[{role:'user',content:'fixture'}],reasoning_effort:testCase.effort,...(testCase.native?{lobsterai_options:testCase.native}:{})},undefined,{fetchImpl:async(u,o)=>{calls++;body=JSON.parse(o.body);return sseResponse(['data: [DONE]\n\n']);}});
   await response.text();assert.equal(calls,1,'null does not trigger a catalog lookup');assert.equal('reasoning_effort' in body,false);assert.equal(body.lobsterai_options?.thinking?.level,testCase.expected);
  }
+});
+
+test('lobster catalog with native levels publishes an adjustable thinking map end to end',async()=>{
+ const {thinkingMetadata}=await import('../src/reasoning.mjs');
+ const models=await lobsterModels(SECRET_CRED,{fetchImpl:async()=>jsonResponse({code:0,data:modelsFixture})});
+ const flash=models.find(m=>m.id==='deepseek-flash');
+ const metadata=thinkingMetadata(flash);
+ // This is the exact payload the plugin spreads into the DSH descriptor (plugin/provider.mjs:49).
+ assert.equal(metadata.reasoning,true,'a model with official levels must be adjustable');
+ assert.equal(metadata.compat.supportsReasoningEffort,true);
+ for(const level of ['off','high','max']) assert.equal(metadata.thinkingLevelMap[level],level,'declared level must be selectable');
+ for(const level of ['minimal','low','medium','xhigh']) assert.equal(metadata.thinkingLevelMap[level]??null,null,`undeclared level ${level} must stay null`);
+});
+
+test('lobster catalog without any declared level stays non-adjustable (capability is never invented)',async()=>{
+ const {thinkingMetadata}=await import('../src/reasoning.mjs');
+ const models=await lobsterModels(SECRET_CRED,{fetchImpl:async()=>jsonResponse({code:0,data:modelsFixture})});
+ const mystery=models.find(m=>m.id==='mystery-model');
+ assert.equal(mystery.reasoning,null);assert.equal(mystery.reasoningEfforts,null);assert.equal(mystery.isReasoning,false);
+ const metadata=thinkingMetadata(mystery);
+ assert.equal(metadata.reasoning,false);assert.equal(metadata.compat.supportsReasoningEffort,false);
+ assert.ok(Object.values(metadata.thinkingLevelMap).every(v=>v===null),'no level may be advertised without an official one');
+});
+
+test('publishing lobster levels leaves other sources\' thinking metadata byte-identical',async()=>{
+ const {thinkingMetadata}=await import('../src/reasoning.mjs');
+ const cases=[
+  {label:'loomy',model:{id:'deepseek-v4.1-flash',reasoning:{supportedEfforts:['low','high']},reasoningEfforts:{low:'low',high:'high'}}},
+  {label:'workbuddy',model:{id:'deepseek-v4.1-flash',reasoning:{supportedEfforts:['low','high','max']},reasoningEfforts:{low:'low',high:'high',max:'max'}}},
+  {label:'bigmodel',model:{id:'glm-5.3',reasoning:{supportedEfforts:['low','high','max']},reasoningEfforts:{low:'low',high:'high',max:'max'}}},
+  {label:'plain',model:{id:'deepseek-v4.1-flash',reasoning:true,isReasoning:true}},
+ ];
+ for(const {label,model} of cases){
+  const metadata=thinkingMetadata(model);
+  assert.equal(metadata.reasoning,Boolean(model.reasoningEfforts),`${label}: reasoning flag`);
+  assert.equal(metadata.compat.supportsReasoningEffort,Boolean(model.reasoningEfforts),`${label}: adjustability`);
+  for(const level of ['low','high','max']) assert.equal(metadata.thinkingLevelMap[level],model.reasoningEfforts?.[level]??null,`${label}: ${level}`);
+ }
+ const plain=thinkingMetadata(cases[3].model);
+ assert.equal(plain.reasoning,false);assert.ok(Object.values(plain.thinkingLevelMap).every(v=>v===null),'boolean-only source still advertises nothing');
 });

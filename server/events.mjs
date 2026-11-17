@@ -102,9 +102,21 @@ export function createEventRouter({ledger,settings={},now=Date.now,fetch:fetcher
       // reset the edge, otherwise an expired cache would create repeated alerts.
       if(fresh&&supported)edge('balance:'+opaque('account',id),low,()=>({...context(id),type:'balance.low',id:'balance:'+id+':'+row.checkedAt,data:{value:row.value,total,unit:row.unit,threshold:config.balanceThreshold.credits,thresholdPercent:config.balanceThreshold.percent}}));
     }
+    // Only platforms with no renewal path (Loomy) are announced. A credential
+    // that renews itself is never escalated: its expiry hint would just be noise.
     for(const row of list(credentials)){
+      if(row.renewable!==false)continue;
       const id=accountKey(row),expiry=instant(row.expiresAtMs??row.expiresAt??row.credentialExpiresAt),known=Number.isFinite(expiry);
       if(known)edge('credential:'+opaque('account',id),expiry-at<=config.credentialWarnDays*DAY,()=>({...context(id),type:'credential.expiring',id:'credential:'+id+':'+expiry,data:{expiresAt:new Date(expiry).toISOString(),remainingDays:Math.max(0,(expiry-at)/DAY)}}));
+    }
+    // A provider that has no renewal path at all (Loomy) can only be repaired by
+    // logging in again. Announce it as soon as its session is known to be gone,
+    // so the operator does not wait for a silent check-in failure.
+    for(const row of list(accounts)){
+      // Only a positively known dead session is announced here.
+      const id=accountKey(row),expiresAt=instant(row.sessionExpiresAtMs);
+      if(row.renewable!==false||row.sessionState!=='invalid'||!Number.isFinite(expiresAt))continue;
+      edge('login:'+opaque('account',id),true,()=>({...context(id),type:'credential.expiring',id:'login:'+id+':'+expiresAt,data:{expiresAt:new Date(expiresAt).toISOString(),remainingDays:0,reasonCode:'relogin_required'}}));
     }
     const ordered=(Array.isArray(records)?records:records.records??[]).slice().sort((a,b)=>timeOf(a.time??a.at,0)-timeOf(b.time??b.at,0)||Number(a.id??0)-Number(b.id??0));
     for(const row of ordered){
