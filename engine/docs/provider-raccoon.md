@@ -48,8 +48,8 @@
 
 原生路径之外新增一条**网页授权**通路：走厂商官方登录页 `https://xiaohuanxiong.com/code/authorize`，本机 `127.0.0.1` 随机端口做一次性回调（10 分钟窗口、state 单次、Host 校验、重复回调 409、回调页 `no-store`/`no-referrer`/CSP `default-src 'none'`），换取 `/api/web/auth/v1/login_with_authorization_code` 的令牌对；也支持粘贴 `office-raccoon://auth/callback?code=...`、裸 IAM 令牌或 JSON 令牌对，粘贴内容永不回连。凭据写入 `<stateRoot>/private/raccoon-oauth/raccoon-oauth-<sha12(platform\0principal)>.json`（0600、`.tmp` + rename 原子替换），**不**写回 `~/.office-raccoon`，也不在 `~/.box-agent` 下建任何文件。
 
-- **模型路由（0.4.0）**：网页授权账号虽然没有原生文件与 binding，仍由 `server/discovery.mjs` 的 `refreshOauthRoutes` 按 `discovery.modelRefreshMinutes` 节流读取官方 `GET /api/web/llm/v2/model_catalog`，并为其 upstream 建路由：id `oauth-route-<sha24(upstreamId\0modelId)>`（与桌面的 `discovered-route-*` 区分）、`name='小浣熊 · <模型名>'`、`targets=[{upstreamId,model}]`、`enabled` 跟随 `discovery.autoEnableRoutes`、`discovered:true`。写盘只经过 routes 合并：`credentials.*`、bindings、`identityKey`、`data/discovered/` 全部不动，所以重复扫描后 oauth 凭据文件逐字节不变、`data\discovered\` 不新增任何文件（N3）。
-- **幂等/不覆盖用户改动**：已存在覆盖同一 `upstream+model` 的路由（无论 id、名称、启用状态是用户改的还是上次生成的）一律跳过，重复刷新路由数不变；`discovery.status().oauthRoutes[]` 暴露每个账号的 `routeCount`/`catalogStatus`/`catalogReason`/`checkedAt`，客户端只读展示，不新增按钮。
+- **模型路由（0.4.0 起）**：网页授权账号虽然没有原生文件与 binding，仍由 `server/discovery.mjs` 的 `refreshOauthRoutes` 按 `discovery.modelRefreshMinutes` 节流读取官方 `GET /api/web/llm/v2/model_catalog`，并为其 upstream 建路由：id `oauth-route-<sha24(upstreamId\0modelId)>`（与桌面的 `discovered-route-*` 区分）、`name='小浣熊(网页) · <模型名>'`（0.4.1 起；0.4.0 曾用与桌面账号完全相同的 `'小浣熊 · <模型名>'`，而模型列表只显示名称，两个账号在下拉里不可区分）、`targets=[{upstreamId,model}]`、`enabled` 跟随 `discovery.autoEnableRoutes`、`discovered:true`。写盘只经过 routes 合并：`credentials.*`、bindings、`identityKey`、`data/discovered/` 全部不动，所以重复扫描后 oauth 凭据文件逐字节不变、`data\discovered\` 不新增任何文件（N3）。
+- **幂等/不覆盖用户改动**：已存在覆盖同一 `upstream+model` 的路由一律跳过，重复刷新路由数不变（唯一例外：标题仍是本插件写下的默认名 `'小浣熊 · <模型名>'` 时会被就地改成 `'小浣熊(网页) · <模型名>'`；用户自己改过的标题不动，重命名只动 `routes[].name`）；`discovery.status().oauthRoutes[]` 暴露每个账号的 `routeCount`/`catalogStatus`/`catalogReason`/`checkedAt`，客户端只读展示，不新增按钮。
 - **触发时机**：①授权提交成功（`onAccountCommitted`）立即刷新一次该账号；②周期扫描在候选循环之后统一刷新所有网页授权账号。
 
 

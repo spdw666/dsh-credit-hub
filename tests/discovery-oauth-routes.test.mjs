@@ -48,7 +48,7 @@ test('A-1 a web-authorized account gets oauth routes that call its own upstream'
     assert.ok(f.catalogs.includes(UPSTREAM),'the catalog is fetched through the account upstream, so the adapter picks the OAuth bearer');
     const route=routes.find(r=>r.targets[0].model==='SAMPLE_MODEL');
     assert.match(route.id,/^oauth-route-[a-f0-9]{24}$/,'oauth routes stay distinguishable from discovered-route-* ids');
-    assert.equal(route.name,'小浣熊 · Sample model');
+    assert.equal(route.name,'小浣熊(网页) · Sample model','the source is tagged in the title so it cannot be confused with the desktop account route of the same model');
     assert.deepEqual(route.targets,[{upstreamId:UPSTREAM,model:'SAMPLE_MODEL'}]);
     assert.equal(route.enabled,true);
     assert.equal(route.discovered,true);
@@ -80,6 +80,23 @@ test('A-2 a second refresh is idempotent and never overwrites a user-edited rout
     assert.equal(kept.enabled,false);
     assert.equal(status.oauthRoutes.find(row=>row.accountId===ACCOUNT).routeCount,2);
     assert.equal(f.catalogs.filter(id=>id===UPSTREAM).length,2,'the second scan really refreshed the catalog');
+  }finally{await f.clean();}
+});
+
+test('A-2b a title still carrying the pre-0.4.1 default is retagged, a user title is not',async()=>{
+  const f=await fixture();try{
+    await f.d.scan();
+    const legacy=f.config.value.routes.find(r=>r.targets[0].model==='SAMPLE_MODEL');
+    const mine=f.config.value.routes.find(r=>r.targets[0].model==='SAMPLE_OTHER');
+    legacy.name='小浣熊 · Sample model'; // exactly what 0.4.0 wrote, and what the desktop account still uses
+    mine.name='我的主力模型';
+    await f.config.save(structuredClone(f.config.value));
+    f.hour();
+    await f.d.scan();
+    const routes=f.config.value.routes;
+    assert.equal(routes.length,2,'retagging never adds a route');
+    assert.equal(routes.find(r=>r.id===legacy.id).name,'小浣熊(网页) · Sample model','the untouched default is retagged with its source');
+    assert.equal(routes.find(r=>r.id===mine.id).name,'我的主力模型','a user title is never rewritten');
   }finally{await f.clean();}
 });
 

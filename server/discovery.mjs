@@ -446,9 +446,30 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
         const usable=usableModels(models,cfg);
         if(!usable.length){catalog.catalogStatus='needs_setup';catalog.catalogReason='catalog_no_verified_callable_models';continue;}
         // Idempotent and non-destructive: a route already covering this
-        // upstream+model is never touched, so a user's renamed/disabled route and a
-        // second identical refresh both stay exactly as they are.
-        await commit(value=>{if(epoch!==generation)throw problem('discovery_stopped');let added=0;for(const model of usable){if(value.routes.some(r=>(r.targets??[]).some(t=>t.upstreamId===upstream.id&&t.model===model.id)))continue;const id='oauth-route-'+sha(upstream.id+'\0'+model.id).slice(0,24);if(value.routes.some(r=>r.id===id))continue;value.routes.push({id,name:'小浣熊 · '+String(model.name??model.id).slice(0,160),enabled:cfg.autoEnableRoutes,targets:[{upstreamId:upstream.id,model:model.id}],discovered:true});added++;}return added>0;});
+        // upstream+model is never duplicated, so a user's renamed/disabled route and a
+        // second identical refresh both stay exactly as they are. The one exception is
+        // a title that is still the exact default this owner gave it (the pre-0.4.1
+        // `小浣熊 · ` form, identical to the desktop account's routes) — that is
+        // renamed to the source-tagged form so two same-model routes stay tellable
+        // apart in the model list. A user's own title never matches and is untouched.
+        const title=model=>'小浣熊(网页) · '+String(model.name??model.id).slice(0,160);
+        await commit(value=>{
+          if(epoch!==generation)throw problem('discovery_stopped');
+          let changed=false;
+          for(const model of usable){
+            const legacy='小浣熊 · '+String(model.name??model.id).slice(0,160),name=title(model);
+            const existing=value.routes.find(r=>(r.targets??[]).some(t=>t.upstreamId===upstream.id&&t.model===model.id));
+            if(existing){
+              if(existing.name===legacy&&legacy!==name){existing.name=name;changed=true;}
+              continue;
+            }
+            const id='oauth-route-'+sha(upstream.id+'\0'+model.id).slice(0,24);
+            if(value.routes.some(r=>r.id===id))continue;
+            value.routes.push({id,name,enabled:cfg.autoEnableRoutes,targets:[{upstreamId:upstream.id,model:model.id}],discovered:true});
+            changed=true;
+          }
+          return changed;
+        });
         delete catalog.catalogReason;catalog.catalogStatus='ready';
       }catch(error){
         if(error.code==='discovery_stopped')throw error;

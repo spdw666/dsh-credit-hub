@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- **网页授权的模型路由改名，以便和桌面账号的同名模型区分**：0.4.0 给 oauth 账号建路由时用的默认名是 `小浣熊 · <model>`，与桌面账号复用登录态时建的路由名**完全相同**；而模型列表只显示名称（`plugin/provider.mjs` 只暴露 `{id,name}`），两个账号在「模型」下拉里不可区分。0.4.1 起 oauth 路由的默认名改为 `小浣熊(网页) · <model>`（桌面账号仍是 `小浣熊 · <model>`）。
+- 已存在的 oauth 路由会被**就地改名**，但只改「仍然是本插件写下的那个默认名」的那些：`refreshOauthRoutes` 在跳过已存在路由之前多看一眼，`name === '小浣熊 · ' + modelName` 才重命名为 `小浣熊(网页) · <model>`；用户自己改过的标题（包括自己改成 `小浣熊 · xxx` 之外的任意文本）永远不会被覆盖。重命名只动 `routes[].name`，不新增/不删除路由、不动 `enabled`/`targets`/`discovered`、不碰凭据与 binding。
+- 只影响新装与下一次刷新；升级后重启 worker（或等一次 `discovery.modelRefreshMinutes` 周期刷新）即可看到新名字，已重命名过的机器不会反复改动（第二次刷新无变化即返回 `changed=false`）。
+
 ## 0.4.0
 
 - 小浣熊网页授权账号现在会获得**模型路由**：oauth 账号不是发现候选（无原生文件、无快照、无 binding），但 discovery 新增的 `refreshOauthRoutes` 会按同一节流周期读 `/api/web/llm/v2/model_catalog` 并为它建 `oauth-route-<sha24>` 路由（`name='小浣熊 · <model>'`、`targets=[{upstreamId,model}]`、`enabled` 跟随 `discovery.autoEnableRoutes`、`discovered:true`）。只写 `routes`：`credentials.*`、bindings、`identityKey`、`data/discovered/` 全部不写，oauth 凭据文件跨扫描逐字节不变。授权提交完成后立即触发一次（`onAccountCommitted` → `refreshOauthAccount`），周期扫描也覆盖。

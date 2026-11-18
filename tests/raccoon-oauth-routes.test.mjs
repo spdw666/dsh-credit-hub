@@ -112,7 +112,7 @@ test('A-0 a committed web authorization builds its model routes through the real
   const routes=config.routes.filter(route=>String(route.id).startsWith('oauth-route-'));
   assert.equal(routes.length,1);
   assert.deepEqual(routes[0].targets,[{upstreamId:'up-'+account.id,model:'SAMPLE_OAUTH_MODEL'}]);
-  assert.equal(routes[0].name,'小浣熊 · OAuth model');
+  assert.equal(routes[0].name,'小浣熊(网页) · OAuth model');
   const snapshot=await hub.snapshot();
   const summaries=snapshot.operations.discovery.oauthRoutes;
   assert.equal(summaries.length,1,'exactly the committed account is summarised');
