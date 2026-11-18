@@ -156,3 +156,60 @@ test('row action checkbox names include account or route identity', async () => 
   assert.match(source, /ariaLabel=\{`\$\{account\.label[\s\S]*? · 账户状态`\}/);
   assert.match(source, /ariaLabel=\{`\$\{route\.name \|\| route\.id\} · 路由启用`\}/);
 });
+
+test('settleAcceptedRun drains running/queue then stops polling exactly at drain', async () => {
+  const { api } = await loadClient();
+  const statuses = [
+    { running: ['a', 'b'], queue: ['c'] },
+    { running: ['a'], queue: [] },
+    { running: [], queue: [] },
+    { running: ['late'], queue: [] }, // must never be polled once drained
+  ];
+  let polls = 0;
+  const outcome = await api.settleAcceptedRun({
+    poll: () => ({ schedule: { status: statuses[polls++] } }),
+    sleep: () => Promise.resolve(),
+    now: () => 0, // clock never advances; only drain ends the loop
+  });
+  assert.equal(outcome.settled, true);
+  assert.equal(polls, 3);
+});
+
+test('settleAcceptedRun reports settled:false when the deadline expires while still running', async () => {
+  const { api } = await loadClient();
+  let polls = 0;
+  let t = 0;
+  const outcome = await api.settleAcceptedRun({
+    poll: () => { polls += 1; return { schedule: { status: { running: ['a'], queue: [] } } }; },
+    sleep: () => Promise.resolve(),
+    now: () => { t += 1000; return t; },
+    deadlineMs: 5000,
+  });
+  assert.equal(outcome.settled, false);
+  assert.ok(polls > 1, 'should keep polling until the deadline');
+});
+
+test('settleAcceptedRun swallows a poll error and stops polling', async () => {
+  const { api } = await loadClient();
+  let polls = 0;
+  const outcome = await api.settleAcceptedRun({
+    poll: () => { polls += 1; throw new Error('SAMPLE poll failure'); },
+    sleep: () => Promise.resolve(),
+  });
+  assert.equal(outcome.settled, false);
+  assert.equal(outcome.error, 'SAMPLE poll failure');
+  assert.equal(polls, 1);
+});
+
+test('settleAcceptedRun cancels immediately when alive() is false without polling', async () => {
+  const { api } = await loadClient();
+  let polls = 0;
+  const outcome = await api.settleAcceptedRun({
+    poll: () => { polls += 1; return { schedule: { status: {} } }; },
+    alive: () => false,
+    sleep: () => Promise.resolve(),
+  });
+  assert.equal(outcome.settled, false);
+  assert.equal(outcome.cancelled, true);
+  assert.equal(polls, 0);
+});

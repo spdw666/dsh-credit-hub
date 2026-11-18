@@ -1,11 +1,11 @@
 // Native Agent discovery is read-only at the source. Every mutable artifact is
 // owned by this plugin; model catalog discovery never submits a chat or claim.
-import {readFile,writeFile,mkdir,rename,lstat,realpath,rm,readdir} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,rename,lstat,realpath,rm,readdir,access} from 'node:fs/promises';
 import {createHash,randomUUID} from 'node:crypto';
 import {join,resolve,relative,dirname,basename,isAbsolute,sep} from 'node:path';
 import {homedir,userInfo} from 'node:os';
 import {pathToFileURL} from 'node:url';
-import {assertInsideRoot} from '../scripts/import-local.mjs';
+import {assertInsideRoot,raccoonAuthCandidates} from '../scripts/import-local.mjs';
 import {isRemovedAccount,removeOwnedCredentialAssets} from './account-removal.mjs';
 
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -37,14 +37,37 @@ export function captureHostEnvironment(env=process.env,{home=homedir(),username=
   return Object.fromEntries(Object.entries({HOME:home,USERPROFILE:env.USERPROFILE??home,USERNAME:username,APPDATA:env.APPDATA,LOCALAPPDATA:env.LOCALAPPDATA,PUBLIC:env.PUBLIC,BOX_AGENT_CONFIG_DIR:env.BOX_AGENT_CONFIG_DIR,LOOMY_AUTH_SESSION_FILE:env.LOOMY_AUTH_SESSION_FILE,WORKBUDDY_AUTH_FILE:env.WORKBUDDY_AUTH_FILE}).filter(([,v])=>typeof v==='string'&&v));
 }
 
+/** An extra, independently addressable raccoon credential source for the enterprise build:
+ *  `%APPDATA%\raccoon-enterprise-<id>` plus `~/.box-agent-<id>/config/auth.json`. The id cannot be
+ *  derived from the environment, so callers pass the ids they know (nativeCandidates option or the
+ *  createDiscovery `extraCandidates` entry point); nothing is scanned. `edition` keeps an enterprise
+ *  login separate from the personal edition even when both belong to the same principal.
+ *  This only guarantees that two *sources* never overwrite each other. It does not make two desktop
+ *  seats usable at once: the service revokes the previous desktop session when a second account logs
+ *  in on the same machine (external evidence: magpie-community/opencode-raccoon-auth README and
+ *  PR #166 report 401 code 200003 for the evicted seat; not reproduced locally). */
+export function raccoonEnterpriseCandidate(host={}, {enterpriseId}={}) {
+  const home=host.HOME??host.USERPROFILE??homedir(),app=host.APPDATA??join(home,'AppData/Roaming');
+  const slug=typeof enterpriseId==='string'?enterpriseId.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,40):'';
+  const key=slug||'default';
+  return {id:'raccoon-enterprise-'+key,platform:'raccoon',label:'小浣熊 企业版'+(slug?' '+slug:''),edition:'enterprise',
+    paths:[join(home,'.box-agent-'+key,'config','auth.json')],
+    markers:[join(home,'.box-agent-'+key),join(app,'raccoon-enterprise-'+key)]};
+}
+
 /** Exact known locations only: no recursive home/profile/drive scan, no DSH or
  * gateway configuration as a native credential source. Multiple alternatives
- * represent spellings of ONE application edition, not distinct accounts. */
-export function nativeCandidates(host={}) {
+ * represent spellings of ONE application edition, not distinct accounts.
+ *  `raccoonDesktopReuse=false` (0.4.0 default) drops the personal Raccoon desktop
+ *  candidate — `.office-raccoon` / `.box-agent` — so a fresh scan never adopts a
+ *  client login again; web authorization is the supported path. The enumerator
+ *  still returns the full list when the caller asks for it (manual import,
+ *  diagnostics, tests), because only discovery owns the policy decision. */
+export function nativeCandidates(host={}, {enterpriseIds=[], raccoonDesktopReuse=true}={}) {
   const home=host.HOME??host.USERPROFILE??homedir(),app=host.APPDATA??join(home,'AppData/Roaming'),local=host.LOCALAPPDATA??join(home,'AppData/Local');
   const publicRoot=host.PUBLIC??'C:/Users/Public',username=host.USERNAME??userInfo().username;
   const make=(id,platform,label,paths,extra={})=>({id,platform,label,paths:paths.filter(Boolean),...extra});
-  const rows=[
+  const allRows=[
     make('workbuddy-cn','workbuddy','WorkBuddy 国内',[host.WORKBUDDY_AUTH_FILE,join(local,'CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'),join(home,'.local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info')]),
     make('workbuddy-ai','workbuddyai','WorkBuddy 国际',[join(local,'CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info')]),
     ...[['cn','TraeCode 国内',['Trae CN','trae-cn']],['solo','TraeWork 国内',['TRAE SOLO CN','trae-solo-cn']],['sg','TraeCode 国际',['Trae','trae']],['solo-sg','TraeWork 国际',['TRAE SOLO','trae-solo']]].map(([edition,label,names])=>make('trae-'+edition,'trae',label,names.map(n=>join(app,n,'User/globalStorage/storage.json')),{edition,layout:'vscode'})),
@@ -63,7 +86,12 @@ export function nativeCandidates(host={}) {
     make('cline','cline','Cline',[join(home,'.cline/data/settings/providers.json')]),
     make('lobster','lobster','LobsterAI',[join(app,'LobsterAI/lobsterai.sqlite')]),
     make('loomy','loomy','Loomy',[host.LOOMY_AUTH_SESSION_FILE,join(publicRoot,'Loomy',sha(username).slice(0,12),'userData/auth-session.json'),join(app,'Loomy/auth-session.json')]),
-    make('raccoon','raccoon','小浣熊',[join(host.BOX_AGENT_CONFIG_DIR??join(home,'.box-agent/config'),'auth.json')]),
+    // Client 1.2.x writes %USERPROFILE%\.office-raccoon\agent\config\auth.json; the legacy
+    // ~/.box-agent/config/auth.json stays as a fallback and BOX_AGENT_CONFIG_DIR keeps priority.
+    // Only homedir()-derived and validated absolute paths may enter `paths`: a malformed env value
+    // must never reach createDiscovery's constructor check (discovery_candidate_invalid).
+    make('raccoon','raccoon','小浣熊',raccoonAuthCandidates({env:host,home})),
+    ...enterpriseIds.map(enterpriseId=>raccoonEnterpriseCandidate(host,{enterpriseId})),
     make('opencode','opencode','OpenCode',[join(home,'.local/share/opencode/opencode.db')],{requiresSetup:'opencode_independent_service_required'}),
   ];
   const installedMarkers={
@@ -73,13 +101,20 @@ export function nativeCandidates(host={}) {
     'minimax-cn':[join(home,'.minimax')],
     'minimax-intl':[join(home,'.minimax')],
     'cline':[join(home,'.cline')],
-    'raccoon':[join(home,'.box-agent')],
+    'raccoon':[join(home,'.office-raccoon'),join(home,'.box-agent')],
   };
-  return rows.map(row=>({...row,markers:[...new Set(row.paths.map(file=>row.layout==='vscode'?dirname(dirname(dirname(file))):row.layout==='electron'?dirname(dirname(file)):dirname(file))),...(installedMarkers[row.id]??[])]}));
+  // N-B1: dropping the row also drops its `.office-raccoon` / `.box-agent` install
+  // markers, so a machine that still has the desktop client installed reports no
+  // candidate at all instead of a `not_logged_in` row nobody can act on.
+  const rows=raccoonDesktopReuse?allRows:allRows.filter(row=>row.id!=='raccoon');
+  return rows.map(row=>({...row,markers:[...new Set([...row.paths.map(file=>row.layout==='vscode'?dirname(dirname(dirname(file))):row.layout==='electron'?dirname(dirname(file)):dirname(file)),...(installedMarkers[row.id]??[]),...(row.markers??[])])]}));
 }
 
 function normalizeSettings(value={}) {
-  return {enabled:value.enabled!==false,intervalSeconds:Number.isFinite(value.intervalSeconds)?Math.max(5,Math.min(3600,value.intervalSeconds)):60,autoEnableRoutes:value.autoEnableRoutes!==false,fetchModels:value.fetchModels!==false,modelRefreshMinutes:Number.isFinite(value.modelRefreshMinutes)?Math.max(5,Math.min(1440,value.modelRefreshMinutes)):30,maxModels:Math.max(1,Math.min(500,Number.isInteger(value.maxModels)?value.maxModels:200)),maxSnapshotBytes:Math.max(1024,Math.min(256*1024*1024,Number.isSafeInteger(value.maxSnapshotBytes)?value.maxSnapshotBytes:64*1024*1024))};
+  // `raccoonDesktopReuse` is a strict opt-in: anything but an explicit `true` keeps
+  // the desktop client unread, so a hand-edited or legacy settings document cannot
+  // silently re-enable the retired path.
+  return {enabled:value.enabled!==false,intervalSeconds:Number.isFinite(value.intervalSeconds)?Math.max(5,Math.min(3600,value.intervalSeconds)):60,autoEnableRoutes:value.autoEnableRoutes!==false,fetchModels:value.fetchModels!==false,modelRefreshMinutes:Number.isFinite(value.modelRefreshMinutes)?Math.max(5,Math.min(1440,value.modelRefreshMinutes)):30,maxModels:Math.max(1,Math.min(500,Number.isInteger(value.maxModels)?value.maxModels:200)),maxSnapshotBytes:Math.max(1024,Math.min(256*1024*1024,Number.isSafeInteger(value.maxSnapshotBytes)?value.maxSnapshotBytes:64*1024*1024)),raccoonDesktopReuse:value.raccoonDesktopReuse===true};
 }
 
 async function atomicOwned(root,file,value) {
@@ -89,8 +124,13 @@ async function atomicOwned(root,file,value) {
 }
 
 /** Offline-only credential parser. In particular Cline/CodeArts/Raccoon refresh
- * is disabled and WorkBuddy's encrypted native helper is never launched. */
+ * is disabled and no native helper is launched here: WorkBuddy login states are
+ * opened once, in snapshot(), and discovery only ever reads the owned copy. */
 export async function probeIsolatedCredential(account,{engineRoot,dataDir,now=Date.now(),allowExpired=false}={}) {
+  // N3(d): a web-authorized account has no native auth file to adopt. Reading it
+  // through the desktop reader would either fail confusingly or, worse, hand back
+  // the desktop account's token. Report it as skipped instead.
+  if(account?.credentials?.authKind==='oauth_iam')throw Object.assign(new Error('raccoon_oauth_excluded'),{code:'raccoon_oauth_excluded',skipped:true,status:409});
   const mod=name=>import(pathToFileURL(join(engineRoot,'src',name)).href);
   // A WB file under data/accounts is refreshable in normal operation. Discovery
   // must not consume its rotating RT, including when deduplicating an expired
@@ -123,15 +163,49 @@ export async function probeIsolatedCredential(account,{engineRoot,dataDir,now=Da
   return {principal:String(value.principal),expiresAtMs:Number.isFinite(expiry)?expiry:null};
 }
 
-export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>{},settings,extraCandidates=[],probeCredential=probeIsolatedCredential,fetchModels,updateConfig,hooks={},now=Date.now,setIntervalImpl=setInterval,clearIntervalImpl=clearInterval}={}) {
+export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>{},settings,extraCandidates=[],enterpriseIds=[],probeCredential=probeIsolatedCredential,fetchModels,updateConfig,hooks={},now=Date.now,setIntervalImpl=setInterval,clearIntervalImpl=clearInterval,decryptWorkBuddy:injectedDecryptWorkBuddy}={}) {
   if(!service?.config||!options?.taskRoot)throw problem('discovery_options_required');
   const root=resolve(options.taskRoot),stateRoot=resolve(options.stateRoot??join(root,'runtime/profile')),engineRoot=resolve(options.engineRoot??join(root,'source/engine'));
   const stateFile=join(stateRoot,'discovery-state.json');
-  const candidates=[...nativeCandidates(hostEnvironment),...extraCandidates];
-  const ids=new Set();for(const candidate of candidates){if(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(candidate.id??'')||ids.has(candidate.id)||!Array.isArray(candidate.paths)||!candidate.paths.length||candidate.paths.some(p=>typeof p!=='string'||!isAbsolute(p)))throw problem('discovery_candidate_invalid');ids.add(candidate.id);}
+  // W2: the enterprise candidate builder used to be unreachable — nterpriseIds was
+  // never supplied by any caller. It is now a real createDiscovery parameter, so an
+  // embedder that knows the ids gets %APPDATA%\\raccoon-enterprise-<id> scanned while
+  // the default (no ids) keeps scanning nothing extra.
+  // The full candidate list is built once so a malformed entry fails at construction,
+  // but which rows a scan actually visits is decided per scan from the live settings:
+  // `discovery.raccoonDesktopReuse` is a runtime toggle and must apply to the next
+  // scan without restarting the worker. The desktop row is the only one gated.
+  const allCandidates=[...nativeCandidates(hostEnvironment,{enterpriseIds,raccoonDesktopReuse:true}),...extraCandidates];
+  const ids=new Set();for(const candidate of allCandidates){if(!/^[a-z0-9][a-z0-9-]{0,63}$/.test(candidate.id??'')||ids.has(candidate.id)||!Array.isArray(candidate.paths)||!candidate.paths.length||candidate.paths.some(p=>typeof p!=='string'||!isAbsolute(p)))throw problem('discovery_candidate_invalid');ids.add(candidate.id);}
+  // 0.4.0 — requirement B: the desktop client login is no longer read by default.
+  // Web authorization (`/hub/raccoon/oauth`) is the supported path; the desktop file
+  // is only inspected when an operator opts back in. Existing desktop accounts in the
+  // config are untouched either way: discovery simply stops proposing new captures.
+  const candidatesFor=cfg=>cfg.raccoonDesktopReuse===true?allCandidates:allCandidates.filter(candidate=>candidate.id!=='raccoon');
+  // WorkBuddy seals its desktop login state with a key only its own Electron
+  // runtime can unwrap. Discovery opens that seal exactly once per snapshot, in
+  // the parent-owned data directory, so the runtime never needs the native file
+  // (the worker's LOCALAPPDATA points at an owned sandbox) and never relaunches
+  // the client for a plain read. Executable lookup must use the captured host
+  // environment, not process.env, for the same reason.
+  const executableCandidates=()=>{
+    const hints=[options.workBuddyExecutable,hostEnvironment.WORKBUDDY_APP_EXECUTABLE,hostEnvironment.WORKBUDDY_EXE];
+    for(const dir of [hostEnvironment.LOCALAPPDATA,process.env.LOCALAPPDATA])if(typeof dir==='string'&&dir)hints.push(join(dir,'Programs','WorkBuddy','WorkBuddy.exe'));
+    return hints.filter(hint=>typeof hint==='string'&&hint&&hint!=='auto');
+  };
+  const decryptWorkBuddy=injectedDecryptWorkBuddy??(async sealed=>{
+    const {runNativeHelper}=await import(pathToFileURL(join(engineRoot,'src','credentials.mjs')).href);
+    const env=Object.fromEntries(Object.entries(hostEnvironment).filter(([key,v])=>typeof v==='string'&&/^(?:LOCALAPPDATA|APPDATA|HOME|USERPROFILE|USERNAME|PUBLIC)$/.test(key)));
+    for(const executable of executableCandidates()){try{await access(executable);}catch{continue;}return runNativeHelper(executable,sealed,{env});}
+    throw problem('native_decryption_setup_required');
+  });
+  const openWorkBuddySeal=async sealed=>{
+    try{const value=await decryptWorkBuddy(sealed);if(typeof value!=='string'||!value)throw problem('credential_decrypt_failed');return value;}
+    catch(error){if(error?.code==='native_decryption_setup_required')throw error;throw Object.assign(problem('native_decryption_setup_required'),{message:'WorkBuddy sealed login state: '+codeOf(error),cause:error});}
+  };
   let timer,flight,mutation=Promise.resolve(),loaded=false,state={schemaVersion:1,bindings:{}},rows=new Map(),running=false,generation=0,controller=new AbortController(),scanCount=0;
   const readSettings=()=>normalizeSettings(typeof settings==='function'?settings():settings??service.config.value.discovery??{});
-  const status=()=>({running,scanning:!!flight,checkedAt:state.checkedAt??null,settings:readSettings(),scanCount,candidates:candidates.map(c=>rows.get(c.id)??{id:c.id,platform:c.platform,label:c.label,status:'missing',installed:false,reason:'not_scanned'})});
+  const status=()=>({running,scanning:!!flight,checkedAt:state.checkedAt??null,settings:readSettings(),scanCount,candidates:candidatesFor(readSettings()).map(c=>rows.get(c.id)??{id:c.id,platform:c.platform,label:c.label,status:'missing',installed:false,reason:'not_scanned'}),oauthRoutes:oauthRouteStatus()});
   async function load(){if(loaded)return;await assertInsideRoot(root,stateFile);try{const stored=plain(await readFile(stateFile));if(stored.schemaVersion!==1||!stored.bindings||typeof stored.bindings!=='object'||Array.isArray(stored.bindings))throw problem('discovery_state_invalid');state=stored;}catch(error){if(error.code!=='ENOENT')throw error;}loaded=true;}
   async function emit(event){try{await onEvent({...event,at:new Date(now()).toISOString()});}catch{/* sink failure never invalidates a committed native snapshot */}}
   async function publishRow(candidate,value){const previous=rows.get(candidate.id),next={id:candidate.id,platform:candidate.platform,label:candidate.label,...value};rows.set(candidate.id,next);if(previous?.status!==next.status||previous?.sourceFingerprint!==next.sourceFingerprint){await emit({type:'agent.'+next.status,candidateId:next.id,platform:next.platform,status:next.status,...(next.reason?{code:next.reason}:{}),...(next.accountId?{accountId:next.accountId}:{})});}return next;}
@@ -188,15 +262,18 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     const final=await assertInsideRoot(root,join(dataDir,'discovered',candidate.id,bundle.fingerprint));
     const stage=await assertInsideRoot(root,join(dataDir,'discovered','.stage-'+randomUUID()));
     const account={id:'pending-'+candidate.id,platform:candidate.platform,label:candidate.label,enabled:true,inferenceEnabled:true,...(candidate.edition?{edition:candidate.edition}:{}),...(candidate.region?{region:candidate.region}:{}),credentials:{kind:candidate.credentialKind??'desktop',file:join(final,bundle.name),profileDir:final,localState:join(final,'Local State'),autoLaunch:false,cacheFile:join(dataDir,'private-cache','discovery-'+candidate.id+'.json')},tasks:defaultDiscoveryTasks(candidate)};
-    // The gateway's owned WorkBuddy format is normalized without launching the
-    // native decryptor; RTs remain local and preserve later explicit renewal.
+    // The gateway's owned WorkBuddy format stores readable tokens only. A sealed
+    // native value is opened through the client's own runtime once, here; the
+    // refresh token stays local and later explicit renewal still owns it.
     let workbuddy;
     if(candidate.platform==='workbuddy'){
-      const raw=plain(bundle.bundle[0].data),accessToken=raw.auth?.accessToken??raw.accessToken??raw.token;
-      if(typeof accessToken==='object')throw problem('native_decryption_setup_required');
+      const raw=plain(bundle.bundle[0].data);let accessToken=raw.auth?.accessToken??raw.accessToken??raw.token;
+      if(accessToken&&typeof accessToken==='object')accessToken=await openWorkBuddySeal(accessToken);
+      let refreshToken=raw.auth?.refreshToken??raw.refreshToken;
+      if(typeof refreshToken!=='string')refreshToken=refreshToken&&typeof refreshToken==='object'?(await openWorkBuddySeal(refreshToken).catch(()=>'')):'';
       const principal=raw.account?.uid??raw.uid??raw.principal??raw.userId;
       if(typeof accessToken!=='string'||!accessToken||principal===undefined||!String(principal))throw problem('credential_not_logged_in');
-      workbuddy={accessToken,principal:String(principal),uid:String(principal),refreshToken:typeof(raw.auth?.refreshToken??raw.refreshToken)==='string'?(raw.auth?.refreshToken??raw.refreshToken):'',domain:raw.auth?.domain??raw.domain??'www.workbuddy.cn',edition:raw.edition??candidate.edition??'cn',expiresAtMs:raw.auth?.expiresAt??raw.expiresAtMs,...(raw.account?{profileRaw:raw.account}:{})};
+      workbuddy={accessToken,principal:String(principal),uid:String(principal),refreshToken,domain:raw.auth?.domain??raw.domain??'www.workbuddy.cn',edition:raw.edition??candidate.edition??'cn',expiresAtMs:raw.auth?.expiresAt??raw.expiresAtMs,...(raw.account?{profileRaw:raw.account}:{})};
       account.credentials.kind='file';account.credentials.file=join(final,'owned-workbuddy-session.json');
     }
     try{
@@ -206,7 +283,13 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
       await mkdir(dirname(final),{recursive:true});await assertInsideRoot(root,final);
       try{await rename(stage,final);}catch(error){if(!['EEXIST','ENOTEMPTY','EPERM'].includes(error.code))throw error;const stat=await lstat(final);if(!stat.isDirectory()||stat.isSymbolicLink())throw problem('discovery_snapshot_conflict');
         for(const entry of bundle.bundle){if(entry.data===null)continue;if(sha(await readFile(join(final,entry.name)))!==entry.hash)throw problem('discovery_snapshot_conflict');}
-        if(workbuddy&&sha(await readFile(join(final,'owned-workbuddy-session.json')))!==sha(json(workbuddy)))throw problem('discovery_snapshot_conflict');
+        if(workbuddy&&sha(await readFile(join(final,'owned-workbuddy-session.json')))!==sha(json(workbuddy))){
+          // A renewal rotates the gateway-owned copy in place. That rotation holds the
+          // only live refresh token, so it outranks this read-only native capture and
+          // the existing snapshot is kept instead of being reported as a conflict.
+          const current=await readFile(join(final,'owned-workbuddy-session.json')).then(plain).catch(()=>null);
+          if(current?.managedBy!=='ai-credit-gateway')throw problem('discovery_snapshot_conflict');
+        }
       }
       return {account,dataDir};
     }finally{await rm(stage,{recursive:true,force:true});}
@@ -226,10 +309,15 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     };
     const pending=mutation.then(action,action);mutation=pending.catch(()=>{});return pending;
   }
+  // N3(a): web-authorized accounts are created and owned by the authorization
+  // path, never by discovery. They must be invisible to both the binding lookup
+  // and the equivalent-file scan, otherwise a desktop login with the same
+  // principal would silently overwrite a working web credential.
+  const discoveryOwned = account => account?.credentials?.kind!=='oauth';
   async function existingAccount(account,principal,bundle,cache){
     const key=identityKey(account,principal),binding=state.bindings[key];
-    if(binding){const found=service.config.value.accounts.find(a=>a.id===binding.accountId&&compatible(a,account));if(found)return found;}
-    for(const existing of service.config.value.accounts.filter(a=>compatible(a,account))){
+    if(binding){const found=service.config.value.accounts.find(a=>a.id===binding.accountId&&discoveryOwned(a)&&compatible(a,account));if(found)return found;}
+    for(const existing of service.config.value.accounts.filter(a=>discoveryOwned(a)&&compatible(a,account))){
       const file=existing.credentials?.file;if(typeof file!=='string'||file==='auto')continue;
       let resolved;try{resolved=service.config.path?service.config.path(file):resolve(file);await assertInsideRoot(root,resolved);}catch{continue;}
       let bytes;try{bytes=await readFile(resolved);}catch{continue;}
@@ -255,6 +343,9 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     }
     const prior=Object.entries(state.bindings).find(([,b])=>b.candidateId===candidate.id&&b.sourceFingerprint===bundle.fingerprint&&service.config.value.accounts.some(a=>a.id===b.accountId));
     if(prior){const account=service.config.value.accounts.find(a=>a.id===prior[1].accountId),expiry=prior[1].expiresAtMs;
+      // N3(b): a web-authorized account is never discovery's to republish, even when a
+      // stale binding from before the OAuth account was created still points at it.
+      if(account?.credentials?.kind==='oauth')return publishRow(candidate,{status:'skipped',installed:true,accountId:account.id,reason:'raccoon_oauth_excluded'});
       if(Number.isFinite(expiry)&&expiry<=now()+60000)return publishRow(candidate,{status:'needs_setup',installed:true,accountId:account.id,reason:'credential_expired_or_expiring',sourceFingerprint:bundle.fingerprint});
       await refreshRoutes(candidate,account,prior[1],cfg,epoch);
       return publishRow(candidate,{status:'imported',installed:true,accountId:account.id,upstreamId:prior[1].upstreamId,routeCount:prior[1].routeCount??0,sourceFingerprint:bundle.fingerprint,catalogStatus:prior[1].catalogStatus??'not_requested',...(prior[1].catalogReason?{catalogReason:prior[1].catalogReason}:{})});
@@ -273,16 +364,22 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     if(Number.isFinite(expiry)&&expiry<=now()+60000)throw problem('credential_expired_or_expiring');
     const existing=await existingAccount(isolated.account,credential.principal,bundle,cache),key=identityKey(isolated.account,credential.principal);
     const accountId=existing?.id??'discovered-'+candidate.platform+'-'+key.slice(0,20),upstreamId=service.config.value.upstreams.find(u=>u.accountId===accountId&&u.kind===candidate.platform)?.id??'discovered-up-'+key.slice(0,20);
+    // N3(b): depth guard for a merge that would otherwise adopt a live web
+    // credential. A desktop sign-in with the same principal must never rewrite it.
+    if(service.config.value.accounts.find(a=>a.id===accountId)?.credentials?.kind==='oauth')return publishRow(candidate,{status:'skipped',installed:true,reason:'raccoon_oauth_excluded'});
+    let oauthExcluded=false;
     if(epoch!==generation)throw problem('discovery_stopped');await verifyBundle(bundle.bundle);
     try{await commit(value=>{
       if(epoch!==generation)throw problem('discovery_stopped');
       if(isRemovedAccount(value,isolated.account,credential.principal))throw problem('discovery_account_deleted');
       const current=value.accounts.find(a=>a.id===accountId);
+      if(current?.credentials?.kind==='oauth'){oauthExcluded=true;return false;}
       if(current){current.credentials={...current.credentials,...isolated.account.credentials,cacheFile:current.credentials?.cacheFile??isolated.account.credentials.cacheFile};}
       else value.accounts.push({...isolated.account,id:accountId});
       if(!value.upstreams.some(u=>u.id===upstreamId))value.upstreams.push({id:upstreamId,kind:candidate.platform,accountId,enabled:true,discovered:true});
       return true;
     });}catch(error){if(error.code!=='discovery_account_deleted')throw error;await removeOwnedCredentialAssets(service,isolated.account,{taskRoot:root});return deleted();}
+    if(oauthExcluded)return publishRow(candidate,{status:'skipped',installed:true,reason:'raccoon_oauth_excluded'});
     service.credentials?.cache?.delete(accountId);service.platforms?.catalogs?.delete(upstreamId);
     const binding={candidateId:candidate.id,accountId,upstreamId,sourceFingerprint:bundle.fingerprint,expiresAtMs:expiry,importedAt:new Date(now()).toISOString(),catalogStatus:'not_requested'};
     state.bindings[key]=binding;
@@ -290,32 +387,96 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     await publishRow(candidate,{status:existing?'changed':'imported',installed:true,accountId,upstreamId,routeCount:binding.routeCount??0,sourceFingerprint:bundle.fingerprint,catalogStatus:binding.catalogStatus,...(binding.catalogReason?{catalogReason:binding.catalogReason}:{})});
     return rows.get(candidate.id);
   }
+  // One cancellation-aware catalog read shared by the desktop path and the web
+  // authorization path. `service.platforms.models` reaches the adapter, which picks
+  // the right credential kind on its own (N3: authKind, never `kind`).
+  async function catalogModels(upstreamId){
+    const signal=controller.signal;
+    let abort;
+    const cancelled=new Promise((_,reject)=>{abort=()=>reject(problem('discovery_stopped'));if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});});
+    try{return await Promise.race([(fetchModels??((id,args)=>service.platforms.models(id,args)))(upstreamId,{refresh:true,signal}),cancelled]);}
+    finally{signal.removeEventListener('abort',abort);}
+  }
+  function usableModels(models,cfg){
+    if(!Array.isArray(models))throw problem('discovery_catalog_invalid');
+    const seen=new Set(),usable=models.filter(model=>{if(typeof model?.id!=='string'||!model.id||model.id.length>512||seen.has(model.id)||model.callable===false||!Number.isSafeInteger(model.contextWindow)||model.contextWindow<=0||!Number.isSafeInteger(model.maxTokens)||model.maxTokens<=0)return false;seen.add(model.id);return true;}).slice(0,cfg.maxModels);
+    return usable;
+  }
   async function refreshRoutes(candidate,account,binding,cfg,epoch){
     if(!cfg.fetchModels||account?.enabled===false||account?.inferenceEnabled===false||service.config.value.upstreams.find(u=>u.id===binding.upstreamId)?.enabled===false){binding.catalogStatus='disabled';return;}
     const last=binding.catalogCheckedAt?Date.parse(binding.catalogCheckedAt):0;
     if(last&&now()-last<cfg.modelRefreshMinutes*60000)return;
     binding.catalogCheckedAt=new Date(now()).toISOString();
     try{
-      const signal=controller.signal;
-      let abort;
-      const cancelled=new Promise((_,reject)=>{abort=()=>reject(problem('discovery_stopped'));if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});});
-      let models;
-      try{models=await Promise.race([(fetchModels??((id,args)=>service.platforms.models(id,args)))(binding.upstreamId,{refresh:true,signal}),cancelled]);}finally{signal.removeEventListener('abort',abort);}
+      const models=await catalogModels(binding.upstreamId);
       if(epoch!==generation)throw problem('discovery_stopped');
-      if(!Array.isArray(models))throw problem('discovery_catalog_invalid');
-      const seen=new Set(),usable=models.filter(model=>{if(typeof model?.id!=='string'||!model.id||model.id.length>512||seen.has(model.id)||model.callable===false||!Number.isSafeInteger(model.contextWindow)||model.contextWindow<=0||!Number.isSafeInteger(model.maxTokens)||model.maxTokens<=0)return false;seen.add(model.id);return true;}).slice(0,cfg.maxModels);
+      const usable=usableModels(models,cfg);
       if(!usable.length){binding.catalogStatus='needs_setup';binding.catalogReason='catalog_no_verified_callable_models';return;}
       await commit(value=>{if(epoch!==generation)throw problem('discovery_stopped');let added=0;for(const model of usable){if(value.routes.some(r=>(r.targets??[]).some(t=>t.upstreamId===binding.upstreamId&&t.model===model.id)))continue;const id='discovered-route-'+sha(binding.upstreamId+'\0'+model.id).slice(0,24);if(value.routes.some(r=>r.id===id))continue;value.routes.push({id,name:candidate.label+' · '+String(model.name??model.id).slice(0,160),enabled:cfg.autoEnableRoutes,targets:[{upstreamId:binding.upstreamId,model:model.id}],discovered:true});added++;}return added>0;});
       binding.routeCount=service.config.value.routes.filter(r=>(r.targets??[]).some(t=>t.upstreamId===binding.upstreamId)).length;binding.catalogStatus='ready';delete binding.catalogReason;
     }catch(error){if(error.code==='discovery_stopped')throw error;binding.catalogStatus='error';binding.catalogReason=codeOf(error);await emit({type:'agent.catalog_failed',candidateId:candidate.id,platform:candidate.platform,accountId:account.id,code:codeOf(error)});}
   }
+  // Requirement A: a web-authorized Raccoon account is not a discovery candidate —
+  // it has no native file, no snapshot and no binding (N3/N8) — but it still owns a
+  // model upstream, so its catalog is refreshed here. Only routes are ever written:
+  // credentials, tasks, bindings, identityKey and `data/discovered/` are untouched,
+  // which is what keeps an OAuth account byte-identical across scans.
+  const oauthCatalog=new Map();
+  const oauthAccounts=()=>service.config.value.accounts.filter(account=>account?.credentials?.authKind==='oauth_iam');
+  const oauthRouteStatus=()=>oauthAccounts().map(account=>{
+    const catalog=oauthCatalog.get(account.id)??{},upstream=service.config.value.upstreams.find(u=>u.accountId===account.id&&u.kind==='raccoon');
+    const count=upstream?service.config.value.routes.filter(r=>(r.targets??[]).some(t=>t.upstreamId===upstream.id)).length:0;
+    return {accountId:account.id,upstreamId:upstream?.id??null,routeCount:count,catalogStatus:upstream?catalog.catalogStatus??'not_requested':'upstream_missing',...(catalog.catalogReason?{catalogReason:catalog.catalogReason}:{}),checkedAt:catalog.checkedAt??null};
+  });
+  async function refreshOauthRoutes(cfg,epoch,{accountId=null,force=false}={}){
+    if(!cfg.fetchModels)return;
+    for(const account of oauthAccounts()){
+      if(accountId&&account.id!==accountId)continue;
+      if(epoch!==generation)throw problem('discovery_stopped');
+      const state=oauthCatalog.get(account.id)??{},upstream=service.config.value.upstreams.find(u=>u.accountId===account.id&&u.kind==='raccoon');
+      if(!upstream){oauthCatalog.set(account.id,{...state,catalogStatus:'upstream_missing'});continue;}
+      const last=state.checkedAt?Date.parse(state.checkedAt):0;
+      if(!force&&last&&now()-last<cfg.modelRefreshMinutes*60000)continue;
+      if(account.enabled===false||account.inferenceEnabled===false||upstream.enabled===false){oauthCatalog.set(account.id,{...state,checkedAt:new Date(now()).toISOString(),catalogStatus:'disabled'});continue;}
+      const catalog={...state,checkedAt:new Date(now()).toISOString()};
+      oauthCatalog.set(account.id,catalog);
+      try{
+        const models=await catalogModels(upstream.id);
+        if(epoch!==generation)throw problem('discovery_stopped');
+        const usable=usableModels(models,cfg);
+        if(!usable.length){catalog.catalogStatus='needs_setup';catalog.catalogReason='catalog_no_verified_callable_models';continue;}
+        // Idempotent and non-destructive: a route already covering this
+        // upstream+model is never touched, so a user's renamed/disabled route and a
+        // second identical refresh both stay exactly as they are.
+        await commit(value=>{if(epoch!==generation)throw problem('discovery_stopped');let added=0;for(const model of usable){if(value.routes.some(r=>(r.targets??[]).some(t=>t.upstreamId===upstream.id&&t.model===model.id)))continue;const id='oauth-route-'+sha(upstream.id+'\0'+model.id).slice(0,24);if(value.routes.some(r=>r.id===id))continue;value.routes.push({id,name:'小浣熊 · '+String(model.name??model.id).slice(0,160),enabled:cfg.autoEnableRoutes,targets:[{upstreamId:upstream.id,model:model.id}],discovered:true});added++;}return added>0;});
+        delete catalog.catalogReason;catalog.catalogStatus='ready';
+      }catch(error){
+        if(error.code==='discovery_stopped')throw error;
+        catalog.catalogStatus='error';catalog.catalogReason=codeOf(error);
+        await emit({type:'agent.catalog_failed',candidateId:'raccoon-oauth',platform:'raccoon',accountId:account.id,code:codeOf(error)});
+      }
+    }
+  }
+  /** Refresh exactly one web-authorized account right after its credential commit.
+   *  Best-effort by contract: a catalog hiccup must never fail the authorization that
+   *  already succeeded, so callers await it but it returns a summary instead of throwing
+   *  (a stopped discovery still short-circuits). */
+  async function refreshOauthAccount(id){
+    const cfg=readSettings(),epoch=generation;
+    try{await refreshOauthRoutes(cfg,epoch,{accountId:id,force:true});}catch{/* a failed catalog refresh keeps the account */ }
+    return oauthRouteStatus().find(row=>row.accountId===id)??null;
+  }
   async function doScan({connect=true,only}={}){
     await load();const cfg=readSettings(),epoch=generation,cache=new Map();scanCount++;
-    for(const candidate of candidates){if(only&&candidate.id!==only)continue;if(epoch!==generation)break;
+    for(const candidate of candidatesFor(cfg)){if(only&&candidate.id!==only)continue;if(epoch!==generation)break;
       try{await connectCandidate(candidate,{connect,epoch,settings:cfg,cache});}
       catch(error){if(error.code==='discovery_stopped')break;const code=codeOf(error),notLoggedIn=/missing|not_logged|login_required|credential_unavailable/.test(code),setup=/credential|decrypt|identity|storage|personal_scope|region|session|source_changed|snapshot_conflict|metadata_required/.test(code)||error instanceof SyntaxError;
         await publishRow(candidate,{status:notLoggedIn?'not_logged_in':setup?'needs_setup':'error',installed:code!=='discovery_native_source_rejected',reason:code});}
     }
+    // Requirement A: web-authorized accounts are not candidates, but their model
+    // catalog is refreshed on the same cadence so a desktop-less account still has
+    // routes. An explicit single-candidate import does not sweep other accounts.
+    if(!only)try{await refreshOauthRoutes(cfg,epoch);}catch(error){if(error.code!=='discovery_stopped')await emit({type:'agent.catalog_failed',candidateId:'raccoon-oauth',platform:'raccoon',code:codeOf(error)});}
     state.checkedAt=new Date(now()).toISOString();await atomicOwned(root,stateFile,state);return status();
   }
   function scan(input={}){
@@ -328,6 +489,6 @@ export function createDiscovery({service,options,hostEnvironment={},onEvent=()=>
     timer=setIntervalImpl(run,readSettings().intervalSeconds*1000);timer?.unref?.();return status();
   }
   async function stop(){running=false;generation++;controller.abort(problem('discovery_stopped'));if(timer!==undefined)clearIntervalImpl(timer);timer=undefined;await flight?.catch(()=>{});await mutation.catch(()=>{});return status();}
-  async function importCandidate(id){if(!candidates.some(c=>c.id===id))throw problem('discovery_candidate_not_found');if(flight)await flight;await scan({connect:true,only:id});return rows.get(id);}
-  return {scan,status,start,stop,importCandidate,credentialMetadata:()=>Object.values(state.bindings).filter(b=>b.accountId&&Number.isFinite(b.expiresAtMs)).map(b=>({accountId:b.accountId,expiresAtMs:b.expiresAtMs,observedAtMs:Date.parse(b.importedAt)||0}))};
+  async function importCandidate(id){if(!candidatesFor(readSettings()).some(c=>c.id===id))throw problem('discovery_candidate_not_found');if(flight)await flight;await scan({connect:true,only:id});return rows.get(id);}
+  return {scan,status,start,stop,importCandidate,refreshOauthAccount,credentialMetadata:()=>Object.values(state.bindings).filter(b=>b.accountId&&Number.isFinite(b.expiresAtMs)).map(b=>({accountId:b.accountId,expiresAtMs:b.expiresAtMs,observedAtMs:Date.parse(b.importedAt)||0}))};
 }

@@ -3,7 +3,7 @@ import {resolveFreeCredential} from './free-providers.mjs';
 import {bigModelCredential} from './bigmodel.mjs';
 import {readFile, writeFile, rename, stat, access, open, unlink, mkdir} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
-import {join, dirname, resolve} from 'node:path';
+import {join, dirname, resolve, basename, relative, isAbsolute, sep} from 'node:path';
 import {homedir, userInfo} from 'node:os';
 import {createHash,createDecipheriv} from 'node:crypto';
 import {AppError, rememberSecret, readJson, hash,atomicJson} from './util.mjs';
@@ -47,9 +47,12 @@ export async function resolveWorkBuddyExecutable(account,config) {
   if(value&&value!=='auto')return config.path(value);
   return firstExisting([process.env.WORKBUDDY_APP_EXECUTABLE,process.env.WORKBUDDY_EXE,join(localData(),'Programs/WorkBuddy/WorkBuddy.exe'), ...(process.platform==='win32'?['D:/workbuddy/WorkBuddy.exe']:[]),...(process.platform==='darwin'?['/Applications/WorkBuddy.app/Contents/MacOS/Electron']:[])]);
 }
-export function runNativeHelper(executable,value,{timeout=12000}={}) {
+export function runNativeHelper(executable,value,{timeout=12000,env={}}={}) {
   return new Promise((resolve,reject)=>{
-    const child=spawn(executable,[join(projectRoot,'vendor/wb-auth-helper.cjs')],{env:{...process.env,ELECTRON_RUN_AS_NODE:'1'},windowsHide:true,stdio:['pipe','pipe','pipe']});
+    // The helper must see the real client profile directories. A sandboxed
+    // worker redirects LOCALAPPDATA/APPDATA to an owned copy, so the caller can
+    // pass the captured host values instead of inheriting process.env.
+    const child=spawn(executable,[join(projectRoot,'vendor/wb-auth-helper.cjs')],{env:{...process.env,...env,ELECTRON_RUN_AS_NODE:'1'},windowsHide:true,stdio:['pipe','pipe','pipe']});
     let result=Buffer.alloc(0), settled=false;
     const fail=(code)=>{if(settled)return;settled=true;clearTimeout(timer);child.kill();reject(new AppError(`WorkBuddy credential helper: ${code}`,401,code));};
     const timer=setTimeout(()=>fail('helper_timeout'),timeout);
@@ -66,6 +69,22 @@ export function runNativeHelper(executable,value,{timeout=12000}={}) {
     child.stdin.on('error',()=>fail('helper_input_failed'));
     child.stdin.end(JSON.stringify({version:1,operation:'decrypt',value}));
   });
+}
+/** A WorkBuddy snapshot is writable only when the gateway itself wrote it: an
+ * imported account snapshot (`data/accounts/<id>/workbuddy-session.json`) or the
+ * discovery-owned copy of a native login
+ * (`data/discovered/<candidate>/<fingerprint>/owned-workbuddy-session.json`).
+ * A native auth file, or any user-picked JSON, stays read-only even with an RT,
+ * so a rotated refresh token can never be written into a client's own store. */
+export function workBuddySnapshotOwned(config,account,file) {
+  const root=config?.dataDir;if(!root)return false;
+  const target=resolve(file);
+  if(target===resolve(root,'accounts',account.id,'workbuddy-session.json'))return true;
+  if(basename(target)!=='owned-workbuddy-session.json')return false;
+  const rel=relative(resolve(root,'discovered'),target);
+  if(!rel||rel.startsWith('..')||isAbsolute(rel))return false;
+  const parts=rel.split(sep);
+  return parts.length===3&&parts[2]==='owned-workbuddy-session.json';
 }
 export class CredentialManager {
   constructor(config,ledger){this.config=config;this.ledger=ledger;this.cache=new Map();this.flights=new Map();this.renewals=new Map();}
@@ -101,6 +120,10 @@ export class CredentialManager {
       // Trae has no scheduler slot; a cached expired credential must still route back through read()'s
       // inline renewal (renew:true bypasses the cache) rather than surfacing a bare credential_expired.
       if(account.platform==='trae'&&e.code==='credential_expired'){this.cache.delete(id);return this.read(account,{renew:true});}
+      // WorkBuddy's gateway-owned snapshot carries the same rotating RT as the
+      // desktop client, so an expired access token is renewed in place instead of
+      // demanding a desktop login that may no longer exist.
+      if(account.platform==='workbuddy'&&e.code==='credential_expired'){this.cache.delete(id);return this.read(account,{renew:true});}
       throw e;}).finally(()=>this.flights.delete(id));this.flights.set(id,p);return p;
   }
   /**
@@ -157,7 +180,9 @@ export class CredentialManager {
       for(const value of [c?.accessToken,c?.apiKey,c?.token,c?.refreshToken,c?.accessKey,c?.secretKey,c?.securityToken])if(typeof value==='string'&&value)rememberSecret(value);
       if(!c||typeof c.accessToken!=='string'||!c.accessToken||!c.principal)throw new AppError('桌面账号登录态待就绪',401,'credential_missing');
       const binding=this.ledger.bind(account.id,account.platform,c.principal);if(!binding.ok)throw new AppError('桌面账号已切换，请重新绑定此账号',409,'principal_changed');
-      if(Number.isFinite(c.expiresAtMs)&&c.expiresAtMs<=Date.now())throw new AppError('桌面登录态已过期，请在原客户端续期',401,'credential_expired');
+      // N6: the renewal advice must match where the credential came from. A
+      // web-authorized account cannot be repaired by restarting the client.
+      if(Number.isFinite(c.expiresAtMs)&&c.expiresAtMs<=Date.now())throw c.authKind==='oauth_iam'||account.credentials?.authKind==='oauth_iam'?new AppError('网页授权已到期，请点击『重新授权』',401,'raccoon_oauth_reauth_required'):new AppError('桌面登录态已过期，请在原客户端续期',401,'credential_expired');
       return {...c,principalHash:binding.fingerprint};
     }
     const file=await resolveCredentialFile(account,this.config);const info=await stat(file).catch(e=>{if(account.platform==='nvidia')throw new AppError('NVIDIA API Key 待填入本机凭据文件',401,'nvidia_credential_missing');if(account.platform==='minimax')throw new AppError('MiniMax Code 登录态待导入本机凭据文件',401,'minimax_login_required');throw e});
@@ -227,7 +252,7 @@ export class CredentialManager {
   async renewOwnedWorkBuddy(account,file,raw,{renew=false}={}) {
     // Only gateway-owned account snapshots are writable. A native auth file or
     // an arbitrary user-selected JSON remains read-only, even if it has an RT.
-    const owned=this.config.dataDir&&resolve(file)===resolve(this.config.dataDir,'accounts',account.id,'workbuddy-session.json');
+    const owned=workBuddySnapshotOwned(this.config,account,file);
     const expiry=raw.expiresAtMs??jwtClaims(raw.accessToken??raw.token??'').exp*1000;
     if(!owned||!raw.refreshToken||!renew&&(!Number.isFinite(expiry)||expiry>Date.now()+60000))return raw;
     const stateFile=file+'.refresh-state.json',fingerprint=auth=>hash(JSON.stringify([auth.principal??auth.uid,auth.accessToken??auth.token,auth.refreshToken]));

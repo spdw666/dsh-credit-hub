@@ -4,7 +4,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join, isAbsolute} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {createCipheriv, randomBytes} from 'node:crypto';
 import {
@@ -12,6 +12,7 @@ import {
   raccoonModels, raccoonCookiePresence, raccoonCredentialPresence, raccoonFetch, raccoonHealth,
   raccoonStatus, raccoonClaim, raccoonChat, raccoonResolve, raccoonCredentialView, decryptElectronCookie,
   readElectronCookieKey, RACCOON_ORIGIN, readRaccoonNativeAuth, raccoonServerModels, raccoonBearerHealth,
+  defaultRaccoonAuthPath, defaultRaccoonPaths, raccoonAuthCandidates,
 } from '../src/provider-raccoon.mjs';
 
 const llmFixture = {
@@ -235,3 +236,55 @@ test('daily login POST is fixed, then needs a same-day extended bill; no fabrica
 test('positive balance, old-day bill, default expiry or another reward is not a daily receipt',async()=>{const {raccoonDailyReceipt}=await import('../src/provider-raccoon.mjs');const now=Date.parse('2026-10-13T04:00:00Z');for(const row of [{biz_type:'daily_grant',points:300,grant_at:'2026-10-12T00:00:00+08:00',expire_at:'2026-10-18T23:59:59+08:00'},{biz_type:'daily_grant',points:300,grant_at:'2026-10-13T00:00:00+08:00',expire_at:'2026-10-13T23:59:59+08:00'},{biz_type:'reward_grant',points:3000,grant_at:'2026-10-13T00:00:00+08:00',expire_at:'2027-01-01T00:00:00Z'}])assert.equal(raccoonDailyReceipt({items:[row]},now).observed,false);await assert.rejects(raccoonClaim(nativeSecret,'daily-quota',{now,fetchImpl:async(url,i)=>jsonResponse({code:0,data:i.method==='POST'?{granted:true,popup:{points:3000}}:url.includes('/bills')?{items:[]}:{daily_points:900}})}),{code:'raccoon_daily_unconfirmed'});});
 
 test('health daily badge uses verified bill amount and date, not positive aggregate balance',async()=>{const now=Date.parse('2026-10-13T04:00:00Z');const h=await raccoonBearerHealth(nativeSecret,{now,fetchImpl:async url=>jsonResponse({code:0,data:url.includes('/balance')?{available_points:6897,daily_points:897}:url.includes('/bills')?{items:[{biz_type:'daily_grant',points:300,grant_at:'2026-10-13T00:00:00+08:00',expire_at:'2026-10-19T23:59:59+08:00'}]}:{categories:[]}})});assert.equal(h.balance.dailyQuotaObserved,true);assert.equal(h.balance.dailyCycleDate,'2026-10-13');assert.equal(h.balance.dailyQuota,300);assert.equal(h.balance.dailyQuotaObservedAt,new Date(now).toISOString());assert.equal(h.balance.dailyQuotaSource,'/api/web/points/v1/bills:daily_grant');});
+
+// ---------------------------------------------------------------- 1.2.x client profile paths
+const fakeHome='C:/Users/SAMPLE';
+const profileAuth=join(fakeHome,'.office-raccoon','agent','config','auth.json');
+const legacyAuth=join(fakeHome,'.box-agent','config','auth.json');
+
+test('defaultRaccoonAuthPath prefers BOX_AGENT_CONFIG_DIR and falls back to the 1.2.x profile',()=>{
+  const exists=(...files)=>({existsImpl:file=>files.includes(file)});
+  assert.equal(defaultRaccoonAuthPath({env:{},home:fakeHome,...exists(profileAuth)}),profileAuth);
+  // legacy is only used when the 1.2.x profile file is absent
+  assert.equal(defaultRaccoonAuthPath({env:{},home:fakeHome,...exists(legacyAuth)}),legacyAuth);
+  // env wins over both, as a directory or as a file, once it actually holds a login
+  const custom=join('C:/Custom','auth.json');
+  assert.equal(defaultRaccoonAuthPath({env:{BOX_AGENT_CONFIG_DIR:'C:/Custom'},home:fakeHome,...exists(profileAuth,custom)}),custom);
+  assert.equal(defaultRaccoonAuthPath({env:{BOX_AGENT_CONFIG_DIR:'C:/Custom/auth.json'},home:fakeHome,...exists(profileAuth,'C:/Custom/auth.json')}),'C:/Custom/auth.json');
+  // a configured path that does not exist yet never shadows the login that is already there
+  assert.equal(defaultRaccoonAuthPath({env:{BOX_AGENT_CONFIG_DIR:'C:/Custom'},home:fakeHome,...exists(profileAuth)}),profileAuth);
+  // nothing on disk: the highest-priority candidate is returned, malformed env is ignored
+  assert.equal(defaultRaccoonAuthPath({env:{BOX_AGENT_CONFIG_DIR:'C:/Custom'},home:fakeHome,existsImpl:()=>false}),custom);
+  assert.equal(defaultRaccoonAuthPath({env:{BOX_AGENT_CONFIG_DIR:'auth.json'},home:fakeHome,existsImpl:()=>false}),profileAuth);
+});
+
+test('raccoon candidate tolerates a malformed BOX_AGENT_CONFIG_DIR',()=>{
+  const fallback=[profileAuth,legacyAuth];
+  for(const bad of ['relative/config','','   ','a\u0000b','auth.json',null,undefined,42,{}])assert.deepEqual(raccoonAuthCandidates({env:{BOX_AGENT_CONFIG_DIR:bad},home:fakeHome}),fallback,String(bad));
+  // ~ is expanded against the captured home before the absolute check
+  assert.deepEqual(raccoonAuthCandidates({env:{BOX_AGENT_CONFIG_DIR:'~/.raccoon-cfg'},home:fakeHome}),[join(fakeHome,'.raccoon-cfg','auth.json'),...fallback]);
+  assert.deepEqual(raccoonAuthCandidates({env:{BOX_AGENT_CONFIG_DIR:'C:/Custom'},home:fakeHome}),[join('C:/Custom','auth.json'),...fallback]);
+  // an env value equal to a default path is not duplicated
+  assert.deepEqual(raccoonAuthCandidates({env:{BOX_AGENT_CONFIG_DIR:join(fakeHome,'.office-raccoon','agent','config')},home:fakeHome}),fallback);
+  assert.ok(raccoonAuthCandidates({env:{BOX_AGENT_CONFIG_DIR:'relative'},home:fakeHome}).every(file=>isAbsolute(file)));
+});
+
+test('defaultRaccoonPaths derives cookie/session/localState from the client profile',()=>{
+  const root=join(fakeHome,'.office-raccoon','user-data');
+  const paths=defaultRaccoonPaths({home:fakeHome,existsImpl:()=>false,programFiles:'C:/Program Files'});
+  assert.deepEqual(paths,{llmConfig:'',sessionBinding:join(root,'default-session-model-binding.json'),cookieDb:join(root,'Network','Cookies'),localState:join(root,'Local State')});
+  assert.ok(!JSON.stringify(paths).includes('raccoon-ai'));
+  assert.ok(!JSON.stringify(paths).includes('office-raccoon/default'));
+  // %APPDATA% must not participate: inside the worker it points at the taskRoot sandbox
+  const previous=process.env.APPDATA;process.env.APPDATA='D:/SAMPLE/Roaming';
+  try{assert.equal(defaultRaccoonPaths({home:fakeHome,existsImpl:()=>false}).cookieDb,join(root,'Network','Cookies'));}
+  finally{if(previous===undefined)delete process.env.APPDATA;else process.env.APPDATA=previous;}
+  // the shipped 1.2.x client no longer ships default-llm-config.json: the probe stays read-only
+  const probed=defaultRaccoonPaths({home:fakeHome,existsImpl:file=>file.endsWith('default-llm-config.json'),programFiles:'C:/Program Files'});
+  assert.equal(probed.llmConfig,join('C:/Program Files','@raccoonoffice-desktop','resources','default-llm-config.json'));
+});
+
+test('a missing probed LLM config is an explicit not-installed state, never a read error',async()=>{
+  await assert.rejects(raccoonLlmConfig({configFilePath:''}),{code:'raccoon_config_missing',status:404});
+  await assert.rejects(raccoonLlmConfig({configFilePath:'C:/absent/default-llm-config.json',readFileImpl:async()=>{throw Object.assign(new Error('ENOENT'),{code:'ENOENT'});}}),{code:'raccoon_config_missing'});
+});

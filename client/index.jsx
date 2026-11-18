@@ -64,7 +64,7 @@ export function renewalLabel(health) {
     ? `不可自动续期 · 有效至 ${day} · 剩 ${days} 天，到期需重新登录`
     : `不可自动续期 · 已于 ${day} 过期，请重新登录`;
 }
-export function Accounts({ snapshot, busy, perform }) {
+export function Accounts({ snapshot, api, busy, perform }) {
   const [query, setQuery] = useState('');
   const [platform, setPlatform] = useState('all');
   const [capture, setCapture] = useState(false);
@@ -80,10 +80,129 @@ export function Accounts({ snapshot, busy, perform }) {
     {transfer && <AccountTransfer key={transfer} mode={transfer} accounts={accounts} busy={busy} perform={perform} onClose={() => setTransfer('')}/>}
     {capture && <form className="credit-hub__inline-form" onSubmit={event => { event.preventDefault(); perform('添加当前 WorkBuddy 账户', { method: 'POST', path: '/admin/workbuddy/capture', body: { ...(captureLabel.trim() ? { label: captureLabel.trim() } : {}) } }).then(ok => { if (ok) setCapture(false); }); }}><input aria-label="新账户备注" placeholder="账户备注（可选）" value={captureLabel} onChange={event => setCaptureLabel(event.target.value)}/><button className="credit-hub__button credit-hub__button--primary" disabled={busy} type="submit">读取当前客户端并添加</button><Button onClick={() => setCapture(false)}>取消</Button></form>}
     <details className="credit-hub__operation-details"><summary>后装 Agent 自动发现与接入</summary><DiscoveryPanel snapshot={snapshot} busy={busy} perform={perform}/></details>
+    <RaccoonOAuth snapshot={snapshot} api={api} busy={busy}/>
     <p className="credit-hub__muted">“模型调用”只控制积分调用资格；停用模型调用后，自动签到与任务仍由独立排程控制。余额仅在点击刷新时请求上游。</p>
     {removal && <div role="alert" className="credit-hub__notice"><strong>删除账号：{removal.label || removal.platform}</strong><p>删除该账号、模型引用及独占的插件凭据快照，并阻止自动发现重新导入同一身份。原客户端与无凭据历史记录保留。</p><div className="credit-hub__toolbar"><Button disabled={busy} onClick={() => perform('删除账号', {method:'POST',path:'/hub/accounts/remove',body:{accountId:removal.id,confirm:true}}).then(ok=>{if(ok)setRemoval(null);})}>确认删除，不保留登录凭据</Button><Button disabled={busy} onClick={()=>setRemoval(null)}>取消</Button></div></div>}
-    <Table columns={['账户', '平台', '模型调用', '账户状态', '凭据方式 / 核验', '操作']} count={visible.length} empty={accounts.length ? '没有匹配的账户' : '还没有账户'}>{visible.map((account, index) => <tr key={account.id || index}><td><span className="credit-hub__cell-main">{account.label || `账户${index + 1}`}</span></td><td>{text(account.platform)}</td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 模型调用`} checked={account.inferenceEnabled !== false} disabled={busy} onChange={event => update(account, { inferenceEnabled: event.target.checked })}>{account.inferenceEnabled !== false ? '参与调用' : '已停用'}</Check></td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 账户状态`} checked={account.enabled !== false} disabled={busy} onChange={event => update(account, { enabled: event.target.checked })}>{account.enabled !== false ? '启用' : '停用'}</Check></td><td><span className="credit-hub__cell-detail">{({ file: '独立文件快照', desktop: '客户端快照', 'api-key': 'API Key' })[account.credentialMode] || text(account.credentialMode, '本地凭据')}</span><Badge pending={account.connectionState !== 'not_checked'}>{accountConnectionLabel(account)}</Badge>{account.credentialHealth ? <span className="credit-hub__cell-detail">{renewalLabel(account.credentialHealth)}</span> : null}</td><td><Button disabled={busy} aria-label={`删除 ${account.label || account.platform} 账号`} onClick={()=>setRemoval(account)}>删除账号</Button></td></tr>)}</Table>
+    <Table columns={['账户', '平台', '模型调用', '账户状态', '凭据方式 / 核验', '操作']} count={visible.length} empty={accounts.length ? '没有匹配的账户' : '还没有账户'}>{visible.map((account, index) => <tr key={account.id || index}><td><span className="credit-hub__cell-main">{account.label || `账户${index + 1}`}</span></td><td>{text(account.platform)}</td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 模型调用`} checked={account.inferenceEnabled !== false} disabled={busy} onChange={event => update(account, { inferenceEnabled: event.target.checked })}>{account.inferenceEnabled !== false ? '参与调用' : '已停用'}</Check></td><td><Check ariaLabel={`${account.label || `账户${index + 1}`} · 账户状态`} checked={account.enabled !== false} disabled={busy} onChange={event => update(account, { enabled: event.target.checked })}>{account.enabled !== false ? '启用' : '停用'}</Check></td><td><span className="credit-hub__cell-detail">{({ file: '独立文件快照', desktop: '客户端快照', 'api-key': 'API Key', oauth: '网页授权' })[account.credentialMode] || text(account.credentialMode, '本地凭据')}</span><Badge pending={account.connectionState !== 'not_checked'}>{accountConnectionLabel(account)}</Badge>{account.credentialHealth ? <span className="credit-hub__cell-detail">{renewalLabel(account.credentialHealth)}</span> : null}</td><td><Button disabled={busy} aria-label={`删除 ${account.label || account.platform} 账号`} onClick={()=>setRemoval(account)}>删除账号</Button></td></tr>)}</Table>
   </>;
+}
+
+/** N1(c): the authorize URL exists only in this local closure, only long enough to
+ * reach window.open. It is never rendered, logged, or written to storage. */
+async function beginRaccoonAuthorization(api, accountId) {
+  const response = await api.request({ method: 'POST', path: '/hub/raccoon/oauth/begin', body: accountId ? { accountId, reauth: true } : {} });
+  const url = response?.body?.authorizeUrl;
+  const sessionId = response?.body?.sessionId ?? null;
+  if (typeof url !== 'string' || !url.startsWith('https://xiaohuanxiong.com/')) return { opened: false, sessionId };
+  return { opened: !!window.open(url, '_blank', 'noopener'), sessionId };
+}
+
+function renewalSourceText(row) {
+  if (row?.state === 'missing') return '凭据文件缺失，需要重新授权';
+  if (row?.needsReauth || row?.renewalLevel === 'expired') return '网页授权已到期，请点击『重新授权』';
+  const label = ({ info: '距到期还有', warn: '即将到期', urgent: '很快到期' })[row?.renewalLevel] || '有效期';
+  return `${label} ${Number(row?.remainingDays) || 0} 天`;
+}
+
+export function RaccoonOAuth({ snapshot, api, busy }) {
+  const enabled = snapshot?.operations?.settings?.raccoonOauth?.enabled !== false;
+  const [sessionId, setSessionId] = useState('');
+  const [pasting, setPasting] = useState(false);
+  const [paste, setPaste] = useState('');
+  const [detail, setDetail] = useState(null);
+  const [note, setNote] = useState('');
+  const [done, setDone] = useState('');
+  useEffect(() => {
+    if (!enabled || !api?.request) return undefined;
+    let alive = true;
+    const load = async () => {
+      try {
+        const response = await api.request({ method: 'GET', path: '/hub/raccoon/oauth' });
+        if (alive) setDetail(response?.body || null);
+      } catch (failure) {
+        if (alive) setNote(failure?.message || '网页授权状态暂时无法读取');
+      }
+    };
+    void load();
+    const timer = setInterval(load, 30000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [enabled, api]);
+  useEffect(() => {
+    if (!sessionId || !api?.request) return undefined;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const response = await api.request({ method: 'GET', path: `/hub/raccoon/oauth/status?sessionId=${encodeURIComponent(sessionId)}` });
+        const body = response?.body || {};
+        if (!alive) return;
+        if (body.phase === 'done') {
+          setDone(body.accountId ? `授权完成，账号 ${body.accountId} 已就绪` : '授权完成');
+          setSessionId('');
+          setNote('');
+        } else if (['failed', 'expired', 'cancelled'].includes(body.phase)) {
+          setSessionId('');
+          setNote(body.message || '这次授权没有完成，请重新发起');
+        }
+      } catch { /* a failed poll is not a verdict: the session simply stays pending */ }
+    };
+    const timer = setInterval(poll, 3000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [sessionId, api]);
+  if (!enabled) return null;
+  const begin = async accountId => {
+    setNote('');
+    setDone('');
+    try {
+      const result = await beginRaccoonAuthorization(api, accountId);
+      setSessionId(result.sessionId || '');
+      setNote(result.opened ? '已在浏览器中打开小浣熊官方登录页，完成登录后回到本页。' : '浏览器窗口未能打开，请允许弹窗后重试，或改用粘贴授权码。');
+    } catch (failure) {
+      setNote(`发起授权失败：${failure?.message || '未知错误'}`);
+    }
+  };
+  const cancel = async () => {
+    try {
+      if (sessionId) await api.request({ method: 'POST', path: '/hub/raccoon/oauth/cancel', body: { sessionId } });
+    } catch { /* the session may already be settled */ }
+    setSessionId('');
+    setNote('已取消这次授权');
+  };
+  const submitPaste = async () => {
+    if (!paste.trim()) return;
+    try {
+      await api.request({ method: 'POST', path: '/hub/raccoon/oauth/paste', body: { input: paste } });
+      setPaste('');
+      setPasting(false);
+      setDone('已保存网页授权凭据');
+      setNote('');
+    } catch (failure) {
+      setNote(`粘贴的授权信息不可用：${failure?.message || '无法识别'}`);
+    }
+  };
+  const rows = array(detail?.accounts);
+  return <details className="credit-hub__operation-details">
+    <summary>小浣熊网页授权（浏览器 / 粘贴令牌）</summary>
+    <p className="credit-hub__muted">通过小浣熊官方登录页为插件单独授权一个账号：凭据只写入插件自有目录，不修改桌面客户端，也不在 <code>~/.box-agent</code>、<code>~/.office-raccoon</code> 下建立文件。该流程是第三方自行实现厂商登录页，未获厂商背书；服务条款是否许可、账号风险由你自行判断并承担。</p>
+    <div className="credit-hub__toolbar">
+      <Button primary disabled={busy || !!sessionId} onClick={() => begin('')}>在浏览器中授权</Button>
+      <Button disabled={busy || !!sessionId} onClick={() => setPasting(value => !value)}>粘贴授权码或令牌</Button>
+      {sessionId ? <Button disabled={busy} onClick={cancel}>取消这次授权</Button> : null}
+    </div>
+    <p className="credit-hub__muted">续期需要你在浏览器中确认，通常一次点击；浏览器会话过期时需要重新登录。</p>
+    {pasting ? <div className="credit-hub__form">
+      <label htmlFor="hub-raccoon-paste">授权码、回调链接或令牌</label>
+      <textarea id="hub-raccoon-paste" rows={3} value={paste} disabled={busy} onChange={event => setPaste(event.target.value)}/>
+      <div className="credit-hub__toolbar"><Button primary disabled={busy || !paste.trim()} onClick={submitPaste}>粘贴并完成</Button></div>
+      <p className="credit-hub__muted">支持 <code>office-raccoon://auth/callback?code=…</code>、IAM 访问令牌或 JSON 令牌对。粘贴内容只在本机处理，不会回连其中的地址。</p>
+    </div> : null}
+    {note ? <p className="credit-hub__notice" role="status">{note}</p> : null}
+    {done ? <p className="credit-hub__muted" role="status">{done}</p> : null}
+    {rows.length ? <ul>{rows.map(row => <li key={row.accountId}>
+      <strong>{row.label || row.accountId}</strong>
+      <span className="credit-hub__cell-detail">{renewalSourceText(row)}</span>
+      <Button disabled={busy} onClick={() => begin(row.accountId)}>{row.needsReauth ? '重新授权（需浏览器确认）' : '重新授权'}</Button>
+    </li>)}</ul> : <p className="credit-hub__muted">还没有网页授权账号。桌面客户端的只读复用不受影响。</p>}
+  </details>;
 }
 
 function Routes({ snapshot, busy, perform }) {
@@ -239,6 +358,27 @@ function receipt(response) {
   const message = typeof body.message === 'string' ? body.message.slice(0, 250) : '';
   return { accepted: response?.status === 202, status: response?.status, state: state ? jobState(state) : null, message };
 }
+
+/** Waits for an accepted background run to drain; reports whether it really drained. */
+export async function settleAcceptedRun({ poll, onTick, alive = () => true, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), intervalMs = 4000, deadlineMs = 900000, now = () => Date.now() }) {
+  const deadline = now() + deadlineMs;
+  let live, running = [], queue = [], settled = false;
+  do {
+    await sleep(intervalMs);
+    if (!alive()) return { settled: false, cancelled: true, live, running, queue };
+    let next;
+    try { next = await poll(); }
+    catch (error) { return { settled: false, live, running, queue, error: error.message }; }
+    if (!alive()) return { settled: false, cancelled: true, live, running, queue };
+    live = next?.schedule?.status;
+    running = array(live?.running);
+    queue = array(live?.queue);
+    settled = running.length === 0 && queue.length === 0;
+    onTick?.({ next, running, queue });
+  } while (!settled && now() < deadline);
+  return { settled, live, running, queue };
+}
+
 export function HubView({ api }) {
   const [tab, setTab] = useState('accounts');
   const [snapshot, setSnapshot] = useState(null);
@@ -256,10 +396,19 @@ export function HubView({ api }) {
   const perform = useCallback(async (label, input, onResult) => {
     setBusy(label); setError('');
     try {
-      const response = await api.request(input);
+      let response = await api.request(input);
       if (!alive.current) return false;
       onResult?.(response);
-      setResult({ label, ...receipt(response), at: Date.now() });
+      if (response.body?.accepted === true) {
+        const outcome = await settleAcceptedRun({
+          poll: () => api.snapshot(),
+          onTick: tick => { setSnapshot(tick.next); setBusy(`${label}（运行 ${tick.running.length} · 排队 ${tick.queue.length}）`); },
+          alive: () => alive.current,
+        });
+        if (!alive.current) return false;
+        response = { ...response, body: { ...response.body, settled: outcome.settled, status: outcome.live, ...(outcome.error ? { message: outcome.error } : {}) } };
+      }
+      setResult({ label, ...receipt(response), at: Date.now(), ...(response.body?.accepted ? { state: response.body?.settled ? '签到执行完毕' : '已受理，后台执行中' } : {}) });
       await refresh();
       return true;
     } catch (failure) { if (alive.current) setError(`${label}：${failure.message}`); return false; } finally { if (alive.current) setBusy(''); }

@@ -11,7 +11,10 @@ import {resolveWorkerNode} from './node-runtime.mjs';
 export const name='dsh-credit-hub';
 export const inject=['llm'];
 const rootDefault=join(process.env.DSH_HOME??join(homedir(),'.dsh'),'plugins','credit-hub');
-export const Config=z.object({taskRoot:z.string().default(rootDefault),configFile:z.string().default(''),nodeExecutable:z.string().default(''),allowScheduler:z.boolean().default(false)});
+// W2: `raccoonEnterpriseIds` is the only product entry point for enterprise
+// raccoon builds. The ids are sanitized in server/contracts.mjs before they are
+// handed to the worker, so a bad config value can never become a directory name.
+export const Config=z.object({taskRoot:z.string().default(rootDefault),configFile:z.string().default(''),nodeExecutable:z.string().default(''),allowScheduler:z.boolean().default(false),raccoonEnterpriseIds:z.array(z.string()).default([])});
 const unwrap=v=>v&&typeof v.get==='function'?v.get():v;
 const initializers=[];
 export class CreditHubRemote extends TypertRemoteService {
@@ -26,7 +29,7 @@ export function apply(ctx,config={}) {
   const configFile=unwrap(config.configFile)||join(taskRoot,'runtime/profile/config.json');
   const explicitNode=unwrap(config.nodeExecutable);
   let stopped=false,hub,compatibility,native;
-  const ready=createHubRuntime({taskRoot,stateRoot:dirname(configFile),configFile,resolveNodeImpl:({signal})=>resolveWorkerNode({explicit:explicitNode,taskRoot,signal}),engineRoot:fileURLToPath(new URL('../engine/',import.meta.url)),memoryRoot:join(taskRoot,'memory'),logRoot:join(taskRoot,'runtime/logs'),allowScheduler:unwrap(config.allowScheduler)===true,enableBackgroundOperations:true});
+  const ready=createHubRuntime({taskRoot,stateRoot:dirname(configFile),configFile,raccoonEnterpriseIds:unwrap(config.raccoonEnterpriseIds)??[],resolveNodeImpl:({signal})=>resolveWorkerNode({explicit:explicitNode,taskRoot,signal}),engineRoot:fileURLToPath(new URL('../engine/',import.meta.url)),memoryRoot:join(taskRoot,'memory'),logRoot:join(taskRoot,'runtime/logs'),allowScheduler:unwrap(config.allowScheduler)===true,enableBackgroundOperations:true});
   new CreditHubRemote(ctx,ready);
   registerGatewayRetryRecovery(ctx);
   ctx.effect(()=>()=>{stopped=true;native?.dispose?.();compatibility?.dispose();void hub?.close().catch(e=>ctx.logger.error('积分中枢后台退出异常：'+e.code));});

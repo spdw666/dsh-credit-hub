@@ -41,7 +41,7 @@ dsh plugin add github:spdw666/dsh-credit-hub
 
 默认每 60 秒检查受支持客户端的已知登录位置。可解析的已登录格式会复制到插件独立目录，识别身份，建立账号/上游，再获取实际模型目录；新路由默认启用，可在账户页关闭。原客户端只读，既有账号开关与路由保持。同一身份更新、不同身份新增。新账号自动登记已核实的签到/每日额度任务，只有用户启用全局排程后才执行；既有账号的任务与禁用选择不覆盖。
 
-候选包含 WorkBuddy、Trae、千问办公、ZCode、MiniMax、Qoder、CodeBuddy、CodeArts、Cline、LobsterAI、Loomy、小浣熊和 OpenCode 的已知版本路径。CodeArts 同时覆盖扩展形态（`codearts-agent` 的 VS Code globalStorage）与 0.2.x 桌面形态（`codearts/secretStorage/authSession:<region>` 的 Electron safeStorage 密文，按区域枚举文件名）；两者是不同的候选，同一台机器上互不影响。未安装、未登录、需要独立配置、已接入及目录失败分开呈现。加密 WorkBuddy、Qoder 原生身份、MiniMax lease、OpenCode 独立服务等条件未满足时不会伪装成已接通。SQLite/WAL、Electron safeStorage 信封与 Trae 身份元数据纳入内容校验。
+候选包含 WorkBuddy、Trae、千问办公、ZCode、MiniMax、Qoder、CodeBuddy、CodeArts、Cline、LobsterAI、Loomy 和 OpenCode 的已知版本路径；小浣熊桌面客户端（`~/.office-raccoon`、`~/.box-agent`）自 0.4.0 起默认不再扫描（见下节，推荐改用网页授权）。CodeArts 同时覆盖扩展形态（`codearts-agent` 的 VS Code globalStorage）与 0.2.x 桌面形态（`codearts/secretStorage/authSession:<region>` 的 Electron safeStorage 密文，按区域枚举文件名）；两者是不同的候选，同一台机器上互不影响。未安装、未登录、需要独立配置、已接入及目录失败分开呈现。加密 WorkBuddy、Qoder 原生身份、MiniMax lease、OpenCode 独立服务等条件未满足时不会伪装成已接通。SQLite/WAL、Electron safeStorage 信封与 Trae 身份元数据纳入内容校验。
 
 ### 账号与模型
 
@@ -50,6 +50,19 @@ dsh plugin add github:spdw666/dsh-credit-hub
 - 模型目录、账号快照接入和真实调用成功分别记录。
 - 接力保留完整 messages、tools、tool IDs/results 与输出预算，不为回退裁剪上下文。
 
+### 小浣熊网页授权（0.4.0 起为推荐通路）
+
+> **0.4.0**：桌面客户端登录态**默认不再被读取**（`discovery.raccoonDesktopReuse=false`）。新装机器扫描不会产生桌面小浣熊候选，`~/.office-raccoon` / `~/.box-agent` 也不再作为安装标记；**既有桌面账号不删、不改写、照常可读可签**。需要时可在「后装 Agent 自动接入」里打开「复用本机小浣熊桌面客户端登录态」，或用 `scripts/import-local.mjs` 手动导入。
+
+除只读复用桌面客户端登录态外，还可通过**官方登录页**为小浣熊单独授权一个账号：默认在本机 `127.0.0.1` 随机端口起一次性回调服务，浏览器完成登录后回调换码；也可粘贴 `office-raccoon://auth/callback?code=...`、裸 IAM 令牌或 JSON 令牌对。凭据只写入插件自有目录 `<stateRoot>/private/raccoon-oauth/raccoon-oauth-<sha12>.json`（原子写、`.tmp` + rename），不写回原客户端，不复制成第二个桌面登录。分派只看 `credentials.authKind === 'oauth_iam'`，不看会被改写的 `kind`。授权窗口 10 分钟、state 单次使用；回调页固定五个安全响应头、不回显令牌、不带 referrer。网页授权账号完全不参与后台自动发现的账号/快照/binding 体系，删号会连带删除该凭据文件。
+
+网页授权账号仍会获得**模型路由**：授权成功后立即、以及之后每个目录刷新周期，插件用该账号的凭据读取官方模型目录并为它建 `oauth-route-*` 路由（`小浣熊 · <模型名>`，`enabled` 跟随「自动启用新发现的模型路由」）。重复刷新不会重复建路由，你手工改名或停用过的路由不会被覆盖；凭据文件不会被改写，`data\discovered\` 也不会新增内容。
+
+一键续期：账号页显示剩余天数与「重新授权」。需要你在浏览器中确认，通常一次点击；浏览器会话过期时需要重新登录。到期前 7 天发一条事件通知，3 天/1 天/已过期只在界面内联提示，不重复打扰。
+
+**合规与风险**：本功能是第三方自行实现厂商登录页的授权流程，未获得厂商背书；服务条款是否许可、账号是否受影响由用户自行判断并承担风险。默认关闭开关（`operations.raccoonOauth.enabled`）时可整体停用浏览器与粘贴入口，已接入的桌面只读复用不受影响。
+
+**未验证事项（需用户配合）**：真实浏览器端到端授权、30 天后的一键续期、浏览器会话过期后是否需要重新登录，均未在本机验证。桌面端同时登录第二个账号是否互斥，社区有互相顶号的报告，本机未复现（只读查询显示多个活跃会话并存，`any_session_revoked=false`）；因此双账号请优先使用网页授权，不要假定桌面双开一定可用。
 ### 显式删除与防重新导入
 
 账号页提供确认删除。删除插件内账号、上游与路由引用，清理独占的插件自有凭据，不为这次删除新建含凭据的恢复备份。共享文件和原客户端目录保持不动；清理结果如有保留项会明确返回。

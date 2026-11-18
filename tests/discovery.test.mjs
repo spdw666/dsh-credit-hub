@@ -4,13 +4,17 @@ import {mkdir,writeFile,readFile,rm,readdir,symlink} from 'node:fs/promises';
 import {join,resolve,dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {randomUUID,createHash} from 'node:crypto';
-import {createDiscovery,nativeCandidates,captureHostEnvironment} from '../server/discovery.mjs';
+import {createDiscovery,nativeCandidates,captureHostEnvironment,raccoonEnterpriseCandidate} from '../server/discovery.mjs';
 
 const project=resolve(dirname(fileURLToPath(import.meta.url)),'../..');
 const digest=value=>createHash('sha256').update(value).digest('hex');
 const write=async(file,value)=>{await mkdir(dirname(file),{recursive:true});await writeFile(file,typeof value==='string'?value:JSON.stringify(value));};
 const parse=async file=>JSON.parse(await readFile(file,'utf8'));
 const auth=(principal='SAMPLE_ACCOUNT',token='SAMPLE_TOKEN_1')=>({auth:{accessToken:token,refreshToken:'SAMPLE_REFRESH',domain:'www.workbuddy.cn',expiresAt:4000000000000},account:{uid:principal}});
+// Client 1.2.x raccoon sessions are IAM tokens with no refresh_token at all.
+const raccoonToken=(name,exp=4102444800)=>'SAMPLEHEADER.'+Buffer.from(JSON.stringify({name,exp})).toString('base64url')+'.SAMPLESIGNATURE';
+const raccoonProfileAuth=home=>join(home,'.office-raccoon','agent','config','auth.json');
+const raccoonLegacyAuth=home=>join(home,'.box-agent','config','auth.json');
 const sampleModels=[{id:'SAMPLE_MODEL',name:'Sample model',callable:true,contextWindow:32000,maxTokens:8192}];
 async function fixture(overrides={}) {
   const dir=join(project,'work/discovery-tests',randomUUID()),root=join(dir,'TARGET'),native=join(dir,'SAMPLE_NATIVE');
@@ -144,12 +148,24 @@ test('Trae ambiguous historical identities without active-device log have explic
   const f=await fixture();try{const profile=join(f.hostEnvironment.APPDATA,'TRAE SOLO CN');await write(join(profile,'User/globalStorage/storage.json'),{'iCubeAuthInfo://icube.cloudide':JSON.stringify({token:'SAMPLE_TRAE_TOKEN',userId:'SAMPLE_TRAE_USER',expiredAt:4000000000000}),'iCubeAuthInfo://icube-dc:123450001':{},'iCubeAuthInfo://icube-dc:123450002':{}});await write(join(profile,'machineid'),'SAMPLE_STABLE_MACHINE');const result=row(await f.d.scan(),'trae-solo');assert.equal(result.status,'needs_setup');assert.equal(result.reason,'trae_active_device_metadata_required');assert.equal(f.config.value.accounts.length,0);}finally{await f.clean();}
 });
 
-test('expired, encrypted, incomplete and blocked native formats remain explicit setup/login states',async()=>{
-  const f=await fixture();try{
-    await write(f.file,{auth:{accessToken:{$wbEncrypted:1,envelope:'SAMPLE'}},account:{uid:'SAMPLE'}});assert.equal(row(await f.d.scan()).status,'needs_setup');assert.equal(f.config.value.accounts.length,0);
+test('expired, sealed, incomplete and blocked native formats remain explicit setup/login states',async()=>{
+  const f=await fixture({decryptWorkBuddy:async()=>{throw Object.assign(new Error('SAMPLE_RUNTIME_MISSING'),{code:'helper_start_failed'});}});try{
+    await write(f.file,{auth:{accessToken:{$wbEncrypted:1,envelope:'SAMPLE'}},account:{uid:'SAMPLE'}});const sealed=row(await f.d.scan());assert.equal(sealed.status,'needs_setup');assert.equal(sealed.reason,'native_decryption_setup_required');assert.equal(f.config.value.accounts.length,0);
     await write(f.file,{auth:{accessToken:'SAMPLE_EXPIRED',expiresAt:1},account:{uid:'SAMPLE'}});assert.match(row(await f.d.scan()).reason,/^credential_expired/);assert.equal(f.config.value.accounts.length,0);
     await write(f.file,{});assert.equal(row(await f.d.scan()).status,'not_logged_in');assert.equal(f.config.value.accounts.length,0);
     const path=nativeCandidates(f.hostEnvironment).find(c=>c.id==='qoder-cn').paths[0];await write(path,'SAMPLE_ENCRYPTED');assert.equal(row(await f.d.scan(),'qoder-cn').reason,'qoder_native_identity_required');assert.equal(f.config.value.accounts.length,0);
+  }finally{await f.clean();}
+});
+
+test('sealed WorkBuddy login state is opened once into an owned readable snapshot',async()=>{
+  let calls=0;const f=await fixture({decryptWorkBuddy:async sealed=>{calls++;return sealed.envelope==='SAMPLE_RT_SEAL'?'SAMPLE_OPEN_REFRESH':'SAMPLE_OPEN_TOKEN';}});try{
+    await write(f.file,{auth:{accessToken:{$wbEncrypted:1,envelope:'SAMPLE_ACCESS_SEAL'},refreshToken:{$wbEncrypted:1,envelope:'SAMPLE_RT_SEAL'},domain:'www.workbuddy.cn',expiresAt:4000000000000},account:{uid:'SAMPLE_ACCOUNT'}});
+    const nativeBefore=digest(await readFile(f.file));
+    const imported=row(await f.d.scan());assert.equal(imported.status,'imported');assert.equal(calls,2);
+    const account=f.config.value.accounts[0];assert.equal(account.platform,'workbuddy');assert.equal(account.credentials.kind,'file');
+    const owned=await parse(account.credentials.file);assert.equal(owned.accessToken,'SAMPLE_OPEN_TOKEN');assert.equal(owned.refreshToken,'SAMPLE_OPEN_REFRESH');assert.equal(owned.principal,'SAMPLE_ACCOUNT');assert.equal(owned.domain,'www.workbuddy.cn');assert.ok(!JSON.stringify(owned).includes('$wbEncrypted'));
+    assert.equal(digest(await readFile(f.file)),nativeBefore);
+    const reread=await f.d.scan();assert.equal(row(reread).status,'imported');assert.equal(calls,2);
   }finally{await f.clean();}
 });
 
@@ -195,6 +211,25 @@ test('CodeArts desktop safeStorage session is detected while the extension-era S
   }finally{await f.clean();}
 });
 
+test('a renewed WorkBuddy snapshot outranks the next read-only native capture',async()=>{
+  const decryptWorkBuddy=async sealed=>sealed.envelope==='SAMPLE_RT_SEAL'?'SAMPLE_OPEN_REFRESH':'SAMPLE_OPEN_TOKEN';
+  const f=await fixture({decryptWorkBuddy});try{
+    await write(f.file,{auth:{accessToken:{$wbEncrypted:1,envelope:'SAMPLE_ACCESS_SEAL'},refreshToken:{$wbEncrypted:1,envelope:'SAMPLE_RT_SEAL'},domain:'www.workbuddy.cn',expiresAt:4000000000000},account:{uid:'SAMPLE_ACCOUNT'}});
+    assert.equal(row(await f.d.scan()).status,'imported');
+    const account=f.config.value.accounts[0],owned=account.credentials.file;
+    // The runtime rotates the owned snapshot in place; the native file never changes
+    // when the desktop client is gone, so a lost binding must not overwrite it.
+    await writeFile(owned,JSON.stringify({...(await parse(owned)),accessToken:'SAMPLE_RENEWED_TOKEN',refreshToken:'SAMPLE_RENEWED_RT',managedBy:'ai-credit-gateway',expiresAtMs:4000000000001}));
+    await rm(join(f.stateRoot,'discovery-state.json'),{force:true});
+    const restarted=createDiscovery({service:f.service,options:f.options,hostEnvironment:f.hostEnvironment,extraCandidates:f.extraCandidates,decryptWorkBuddy,onEvent:()=>{}});
+    try{
+      const again=row(await restarted.scan());assert.equal(again.status,'changed');assert.equal(again.reason,undefined);
+      const kept=await parse(owned);assert.equal(kept.accessToken,'SAMPLE_RENEWED_TOKEN');assert.equal(kept.refreshToken,'SAMPLE_RENEWED_RT');assert.equal(kept.managedBy,'ai-credit-gateway');
+      assert.equal(f.config.value.accounts.length,1);
+    }finally{await restarted.stop();}
+  }finally{await f.clean();}
+});
+
 test('two signed-in CodeArts desktop accounts never share one rotating refresh cache',async()=>{
   const f=await fixture({extraCandidates:[],fetchModels:async()=>sampleModels,
     probeCredential:async account=>({principal:(await readFile(account.credentials.file,'utf8')).includes('SESSION_TWO')?'codearts:two':'codearts:one',expiresAtMs:Date.now()+3600000})});
@@ -214,4 +249,69 @@ test('two signed-in CodeArts desktop accounts never share one rotating refresh c
     assert.notEqual(a.credentials.file,b.credentials.file);
     assert.equal(await readFile(b.credentials.file,'utf8'),'SESSION_TWO');
   }finally{await f.clean();}
+});
+
+test('raccoon discovery imports the new-client auth into an owned snapshot',async()=>{
+  // 0.4.0: the desktop client is opt-in. This test keeps its original meaning by
+  // switching reuse on explicitly; `desktop reuse is off by default` covers the switch.
+  const f=await fixture({settings:()=>({raccoonDesktopReuse:true})});try{
+    assert.equal(row(await f.d.scan(),'raccoon').status,'missing');
+    const native=raccoonProfileAuth(f.home),token=raccoonToken('SAMPLE_RACCOON'),before=digest(await mkdir(dirname(native),{recursive:true}).then(()=>writeFile(native,JSON.stringify({access_token:token,office_identity:'SAMPLE_REFRESHED_IDENTITY'}))).then(()=>readFile(native)));
+    const imported=row(await f.d.scan(),'raccoon');
+    assert.equal(imported.status,'imported');assert.equal(imported.catalogStatus,'ready');assert.equal(imported.routeCount,1);
+    assert.equal(f.config.value.accounts.length,1);assert.equal(f.config.value.routes[0].enabled,true);
+    const account=f.config.value.accounts[0];
+    // The native login is never referenced directly: the owned snapshot lives inside the taskRoot.
+    assert.notEqual(account.credentials.file,native);assert.ok(account.credentials.file.startsWith(f.dataDir));
+    assert.ok(account.credentials.file.startsWith(join(f.dataDir,'discovered','raccoon')));
+    assert.deepEqual(account.tasks,[{id:'daily-quota',enabled:true}]);
+    // Only the read-only copy is read later, and the client's own file is bit-identical afterwards.
+    assert.equal((await parse(account.credentials.file)).access_token,token);
+    assert.equal(digest(await readFile(native)),before);
+    assert.deepEqual(await readdir(dirname(native)),['auth.json'],'no lock or staging file is ever created next to the native login');
+    const summary=JSON.stringify(f.d.status());for(const secret of [token,'SAMPLE_REFRESHED_IDENTITY',native])assert.ok(!summary.includes(secret));
+  }finally{await f.clean();}
+});
+
+test('raccoon discovery still reads the legacy box-agent login when the 1.2.x profile is absent',async()=>{
+  const f=await fixture({settings:()=>({raccoonDesktopReuse:true})});try{
+    const legacy=raccoonLegacyAuth(f.home);
+    await write(legacy,{access_token:raccoonToken('SAMPLE_LEGACY'),office_identity:'SAMPLE_LEGACY_IDENTITY'});
+    const imported=row(await f.d.scan(),'raccoon');
+    assert.equal(imported.status,'imported');
+    assert.ok(f.config.value.accounts[0].credentials.file.startsWith(join(f.dataDir,'discovered','raccoon')));
+    assert.equal(await readdir(dirname(legacy)).then(names=>names.join(',')),'auth.json');
+    // Once the 1.2.x profile appears it becomes the source discovery reads; the legacy file stays untouched.
+    await write(raccoonProfileAuth(f.home),{access_token:raccoonToken('SAMPLE_PROFILE'),office_identity:'SAMPLE_PROFILE_IDENTITY'});
+    const next=row(await f.d.scan(),'raccoon');
+    assert.equal(next.status,'imported','a different principal is a new binding, not a rebind');
+    assert.notEqual(next.accountId,imported.accountId);
+    assert.equal(f.config.value.accounts.length,2,'two distinct signed-in principals stay separate');
+    assert.equal(await readFile(legacy,'utf8'),JSON.stringify({access_token:raccoonToken('SAMPLE_LEGACY'),office_identity:'SAMPLE_LEGACY_IDENTITY'}));
+  }finally{await f.clean();}
+});
+
+test('two raccoon editions become two candidates and two identities',async()=>{
+  const f=await fixture();
+  const enterprise=raccoonEnterpriseCandidate(f.hostEnvironment,{enterpriseId:'acme'});
+  const d=createDiscovery({service:f.service,options:f.options,hostEnvironment:f.hostEnvironment,extraCandidates:[enterprise],onEvent:()=>{},settings:()=>({raccoonDesktopReuse:true})});
+  try{
+    assert.equal(enterprise.id,'raccoon-enterprise-acme');
+    assert.deepEqual(enterprise.paths,[join(f.home,'.box-agent-acme','config','auth.json')]);
+    const personalToken=raccoonToken('SAMPLE_PERSONAL'),corporateToken=raccoonToken('SAMPLE_CORPORATE');
+    await write(raccoonProfileAuth(f.home),{access_token:personalToken,office_identity:'SAMPLE_PERSONAL_IDENTITY'});
+    await write(join(f.home,'.box-agent-acme','config','auth.json'),{access_token:corporateToken,office_identity:'SAMPLE_CORPORATE_IDENTITY'});
+    const status=await d.scan();
+    assert.equal(row(status,'raccoon').status,'imported');assert.equal(row(status,'raccoon-enterprise-acme').status,'imported');
+    assert.equal(f.config.value.accounts.length,2);assert.equal(f.config.value.upstreams.length,2);assert.equal(f.config.value.routes.length,2);
+    const [personal,corporate]=['raccoon','raccoon-enterprise-acme'].map(id=>{
+      const found=f.config.value.accounts.find(account=>account.id===row(status,id).accountId);assert.ok(found);return found;});
+    assert.notEqual(personal.id,corporate.id);
+    assert.notEqual(personal.credentials.file,corporate.credentials.file);
+    assert.notEqual(personal.credentials.cacheFile,corporate.credentials.cacheFile,'each edition keeps its own refresh cache');
+    for(const account of [personal,corporate]){assert.ok(account.credentials.file.startsWith(join(f.dataDir,'discovered')));}
+    assert.equal((await parse(personal.credentials.file)).access_token,personalToken);
+    assert.equal((await parse(corporate.credentials.file)).access_token,corporateToken);
+    const summary=JSON.stringify(d.status());for(const secret of [personalToken,corporateToken])assert.ok(!summary.includes(secret));
+  }finally{await d.stop();await f.clean();}
 });

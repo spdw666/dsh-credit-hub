@@ -3,15 +3,35 @@ import {createHash} from 'node:crypto';
 import {stat,readFile} from 'node:fs/promises';
 import {ACCOUNT_EXPORT_PATH,validateAccountExportRequest} from './transfer.mjs';
 
-export const PLUGIN_VERSION='0.2.10';
+export const PLUGIN_VERSION='0.4.0';
 export const MAX_RPC_BYTES=2*1024*1024;
 export const MAX_INPUT_BYTES=4*1024*1024;
 export function hubError(code,message,status=400){return Object.assign(new Error(message),{code,status});}
 export function isWithin(root,path){const p=relative(resolve(root),resolve(path));return p===''||(!isAbsolute(p)&&p!=='..'&&!p.startsWith('..\\')&&!p.startsWith('../'));}
 export function requireWithin(root,path,field){if(!isWithin(root,path))throw hubError('state_path_outside_project',`${field} must remain in the independent plugin directory`);return resolve(path);}
+// W2: enterprise raccoon builds are addressed by id, and the id becomes part of a
+// directory name (`.box-agent-<id>`), so the hub sanitizes the list at the single
+// entry point every caller goes through instead of trusting the config file.
+// Rules mirror the desktop asar: one leading lower-case letter, then up to 47 of
+// `[a-z0-9-]`; no dots, spaces, separators or control characters survive, Windows
+// device names are refused, and the personal-edition directories can never be
+// addressed as an enterprise id.
+const ENTERPRISE_ID=/^[a-z][a-z0-9-]{0,47}$/;
+const ENTERPRISE_RESERVED=new Set(['con','prn','aux','nul','office-raccoon','box-agent',...Array.from({length:9},(_,i)=>`com${i+1}`),...Array.from({length:9},(_,i)=>`lpt${i+1}`)]);
+export function normalizeEnterpriseIds(value){
+  if(!Array.isArray(value))return [];
+  const kept=[];
+  for(const raw of value){
+    if(typeof raw!=='string')continue;
+    const id=raw.trim().toLowerCase();
+    if(!ENTERPRISE_ID.test(id)||ENTERPRISE_RESERVED.has(id)||kept.includes(id))continue;
+    kept.push(id);
+  }
+  return kept;
+}
 export function normalizeOptions(input,defaultTaskRoot){
   const taskRoot=resolve(input.taskRoot??defaultTaskRoot),stateRoot=requireWithin(taskRoot,input.stateRoot??join(taskRoot,'runtime','profile'),'stateRoot');
-  return {...input,taskRoot,stateRoot,configFile:requireWithin(stateRoot,input.configFile??join(stateRoot,'config.json'),'configFile'),engineRoot:resolve(input.engineRoot??join(taskRoot,'source','engine')),memoryRoot:requireWithin(taskRoot,input.memoryRoot??join(taskRoot,'memory'),'memoryRoot'),logRoot:requireWithin(taskRoot,input.logRoot??join(taskRoot,'runtime','logs'),'logRoot'),nodeExecutable:input.nodeExecutable??join(taskRoot,'runtime','node.exe'),startupTimeoutMs:input.startupTimeoutMs??30000,requestTimeoutMs:input.requestTimeoutMs??180000,allowScheduler:input.allowScheduler===true};
+  return {...input,raccoonEnterpriseIds:normalizeEnterpriseIds(input.raccoonEnterpriseIds),taskRoot,stateRoot,configFile:requireWithin(stateRoot,input.configFile??join(stateRoot,'config.json'),'configFile'),engineRoot:resolve(input.engineRoot??join(taskRoot,'source','engine')),memoryRoot:requireWithin(taskRoot,input.memoryRoot??join(taskRoot,'memory'),'memoryRoot'),logRoot:requireWithin(taskRoot,input.logRoot??join(taskRoot,'runtime','logs'),'logRoot'),nodeExecutable:input.nodeExecutable??join(taskRoot,'runtime','node.exe'),startupTimeoutMs:input.startupTimeoutMs??30000,requestTimeoutMs:input.requestTimeoutMs??180000,allowScheduler:input.allowScheduler===true};
 }
 export async function validateEngineRoot(engineRoot){
   try{
@@ -37,7 +57,10 @@ export function assertCredentialIsolation(account,config,taskRoot){
   if(typeof file!=='string'||file==='auto')throw hubError('credential_snapshot_required','This account needs an independent local credential snapshot',409);
   requireWithin(taskRoot,config.path(file),'account credential file');
 }
-const secretKeys=/^(?:credentials|authorization|accessToken|refreshToken|apiKey|adminKey|accessKey|secretKey|securityToken|machineToken|clientSecret|privateKey|secretAccessKey|sessionToken|bearerToken|idToken|token|secret|password|cookie|auth_raw|profile_raw|filePath|keysFile|configFile|dataDir|credentialFile|download|contentBase64)$/i;
+// `authorizeUrl` is published by exactly one response (POST /hub/raccoon/oauth/begin)
+// and stripped from every other event, log, snapshot and error surface. Token-shaped
+// keys are listed as well so no credential document can ever be echoed by accident.
+const secretKeys=/^(?:credentials|authorization|accessToken|refreshToken|access_token|refresh_token|authorization_code|authorizeUrl|authorize_url|apiKey|adminKey|accessKey|secretKey|securityToken|machineToken|clientSecret|privateKey|secretAccessKey|sessionToken|bearerToken|idToken|token|secret|password|cookie|auth_raw|profile_raw|filePath|keysFile|configFile|dataDir|credentialFile|download|contentBase64)$/i;
 const identityKeys=/^(?:uid|userId|principal|enterpriseId|machineId|deviceId|deviceCenterId|email|phone|mobile|accountNumber)$/i;
 export function maskText(value){let s=String(value);if(/^(?:(?:account|route|upstream)-[a-f0-9]{12}|event-[a-f0-9]{24}|delivery-[a-f0-9-]{36}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(s))return s;s=s.replace(/Bearer\s+[^\s,;]+/gi,'Bearer [hidden]');if(s.includes('@'))s=s.replace(/[A-Z0-9._%+-]{1,128}@(?:[A-Z0-9-]{1,63}\.){1,5}[A-Z]{2,16}/gi,'[邮箱已隐藏]');return s.replace(/(?<!\d)(\d{3})\d{4,}(\d{2,4})(?!\d)/g,'$1****$2');}
 function maskIdentity(value){const s=String(value??'');return s.length>4?s.slice(0,2)+'***'+s.slice(-2):'***';}
@@ -51,14 +74,14 @@ function publicZcodeDocumentation(value,key){
   if(!['metadataSources','reasoningSource'].includes(key)||typeof value!=='string'||value.length>2048)return false;
   return publicZcodeDocumentationUrls.has(value);
 }
-export function publicValue(value,depth=0,key=''){
+export function publicValue(value,depth=0,key='',allow=null){
   if(depth>15)return '[depth limited]';
-  if(typeof value==='string')return publicZcodeDocumentation(value,key)?value:maskText(value);
+  if(typeof value==='string')return allow&&allow.includes(key)?value:publicZcodeDocumentation(value,key)?value:maskText(value);
   if(value===null||typeof value!=='object')return value;
-  if(Array.isArray(value))return value.slice(0,2000).map(v=>publicValue(v,depth+1,key));
-  const out={};for(const [key,item] of Object.entries(value)){if(secretKeys.test(key))continue;out[key]=identityKeys.test(key)?maskIdentity(item):publicValue(item,depth+1,key);}return out;
+  if(Array.isArray(value))return value.slice(0,2000).map(v=>publicValue(v,depth+1,key,allow));
+  const out={};for(const [key,item] of Object.entries(value)){if(secretKeys.test(key)&&!(allow&&allow.includes(key)))continue;out[key]=identityKeys.test(key)?maskIdentity(item):publicValue(item,depth+1,key,allow);}return out;
 }
-export function boundedPublic(value){if(Buffer.byteLength(JSON.stringify(value))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);const body=publicValue(value);if(Buffer.byteLength(JSON.stringify(body))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);return body;}
+export function boundedPublic(value,allow=null){if(Buffer.byteLength(JSON.stringify(value))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);const body=publicValue(value,0,'',allow);if(Buffer.byteLength(JSON.stringify(body))>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);return body;}
 export function publicAccount(account,index,{blockedKinds=['antigravity','opencode']}={}){const snapshotReady=account.platform==='freeapi'&&account.credentials?.kind==='none'||typeof account.credentials?.file==='string'&&account.credentials.file!=='auto',blocked=blockedKinds.includes(account.platform),setupRequired=blocked||!snapshotReady;return {id:account.id,label:maskText(account.label??account.name??`账户${String(index+1).padStart(2,'0')}`),platform:account.platform,enabled:account.enabled!==false,inferenceEnabled:account.inferenceEnabled!==false,credentialMode:account.credentials?.kind??account.credentials?.mode??'unconfigured',snapshotReady,setupRequired,connectionState:blocked?'setup_required':!snapshotReady?'snapshot_required':'not_checked'};}
 export function createHandleMaps(config){
   const maps={accounts:new Map(),routes:new Map(),upstreams:new Map(),reverse:new Map()};
@@ -78,6 +101,16 @@ export function translateIds(value,maps,{toInternal=false,key='',owner=null}={})
 }
 const gets=new Set(['/admin/models','/admin/model-tests','/admin/model-directory','/admin/workbuddy/summary','/admin/workbuddy/tasks','/admin/workbuddy/task-jobs','/admin/workbuddy/pools','/admin/workbuddy/rotation','/admin/usage','/admin/records','/admin/activity-context','/admin/model-relay','/admin/balances','/admin/client-updates','/admin/free-providers']);
 const posts=new Set(['/admin/model-tests','/admin/model-import','/admin/model-export','/admin/claim','/admin/catalog','/admin/doctor','/admin/health','/admin/free-provider-add','/admin/model-relay','/admin/client-updates/check','/admin/workbuddy/task-jobs','/admin/workbuddy/tasks','/admin/workbuddy/capture','/admin/workbuddy/settings','/admin/workbuddy/pool','/admin/workbuddy/pool/normalize','/admin/workbuddy/rotation','/admin/workbuddy/rotation/evaluate','/admin/workbuddy/accounts/import/preview','/admin/workbuddy/accounts/import/commit','/admin/workbuddy/accounts/import','/admin/workbuddy/accounts/export']);
+// Local (IPC) surfaces. GET and POST are listed separately so a method mismatch
+// can never silently reach a handler; the same two lists are the single source of
+// truth for the worker's forwarding router.
+export const localGetPaths=Object.freeze(['/hub/snapshot','/hub/accounts','/hub/routes','/hub/audit','/hub/activity','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events','/hub/events/pending','/hub/forecast','/hub/scheduler-status','/hub/raccoon/oauth','/hub/raccoon/oauth/status']);
+export const localPostPaths=Object.freeze(['/hub/accounts','/hub/accounts/remove','/hub/routes','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events/ack','/hub/events/test','/hub/scheduler/manual','/hub/raccoon/oauth/begin','/hub/raccoon/oauth/paste','/hub/raccoon/oauth/cancel','/hub/raccoon/oauth/reauth']);
+// Paths the worker forwards to hub-operations instead of handling inline. A route
+// that is missing here falls through to the account-update branch, which answers
+// `account_not_found` for an unknown account id and `invalid_account_update` when
+// the body carries account settings — either way the operation never runs.
+export const operationPaths=Object.freeze(['/hub/operations','/hub/discovery','/hub/updates','/hub/events','/hub/events/pending','/hub/events/ack','/hub/events/test','/hub/forecast','/hub/scheduler-status','/hub/scheduler/manual','/hub/raccoon/oauth','/hub/raccoon/oauth/status','/hub/raccoon/oauth/begin','/hub/raccoon/oauth/paste','/hub/raccoon/oauth/cancel','/hub/raccoon/oauth/reauth']);
 export function parseManagementRequest(input){
   if(!input||typeof input!=='object'||Array.isArray(input))throw hubError('invalid_management_request','Management request must be an object');
   const method=String(input.method??'GET').toUpperCase(),path=input.path;
@@ -85,8 +118,7 @@ export function parseManagementRequest(input){
   const url=new URL(path,'http://hub.local');if(url.origin!=='http://hub.local'||url.pathname.includes('%')||url.pathname!==path.split('?')[0])throw hubError('invalid_management_path','Encoded or normalized management paths are not accepted');
   if(input.body!==undefined&&Buffer.byteLength(JSON.stringify(input.body))>MAX_INPUT_BYTES)throw hubError('rpc_request_too_large','Management request exceeds the 4 MiB limit',413);
   if(method==='POST'&&url.pathname===ACCOUNT_EXPORT_PATH){if(url.search)throw hubError('invalid_account_export_request','Account export does not accept query parameters');validateAccountExportRequest(input.body);}
-  const local=['/hub/snapshot','/hub/accounts','/hub/routes','/hub/audit','/hub/activity','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events','/hub/events/pending','/hub/forecast','/hub/scheduler-status'];
-  if(local.includes(url.pathname)&&method==='GET'||['/hub/accounts','/hub/accounts/remove','/hub/routes','/hub/scheduler','/hub/operations','/hub/discovery','/hub/updates','/hub/events/ack','/hub/events/test','/hub/scheduler/manual'].includes(url.pathname)&&method==='POST')return {method,path,pathname:url.pathname,query:Object.fromEntries(url.searchParams),body:input.body,local:true};
+  if(localGetPaths.includes(url.pathname)&&method==='GET'||localPostPaths.includes(url.pathname)&&method==='POST')return {method,path,pathname:url.pathname,query:Object.fromEntries(url.searchParams),body:input.body,local:true};
   const dynamicGet=/^\/admin\/workbuddy\/(?:accounts\/[a-zA-Z0-9_.-]+\/details|task-jobs\/[a-f0-9-]{36})$/.test(url.pathname);
   const dynamicPost=/^\/admin\/workbuddy\/(?:accounts\/[a-zA-Z0-9_.-]+\/(?:profile|inference|mark-status)|task-jobs\/[a-f0-9-]{36}\/cancel)$/.test(url.pathname);
   if(!(method==='GET'&&(gets.has(url.pathname)||dynamicGet)||method==='POST'&&(posts.has(url.pathname)||dynamicPost)))throw hubError('management_operation_not_allowed','This management operation is not exposed by the plugin',403);

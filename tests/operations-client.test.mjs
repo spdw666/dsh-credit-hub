@@ -216,3 +216,20 @@ test('operations UI uses scoped existing components, local horizontal scroll and
   assert.match(source, /credit-hub__button--primary/); assert.match(source, /aria-label=/);
   assert.doesNotMatch(source, /style=\{|#[\da-fA-F]{6}\b/);
 });
+
+test('discovery panel exposes the desktop switch unchecked and shows web-authorized route counts', async () => {
+  const fixture = await client(), calls = [], perform = (...args) => { calls.push(args); return Promise.resolve(true); };
+  const base = { running: false, scanning: false, candidates: [], oauthRoutes: [{ accountId: 'raccoon-oauth-aaaaaaaaaaaa', routeCount: 2, catalogStatus: 'ready' }, { accountId: 'raccoon-oauth-bbbbbbbbbbbb', routeCount: 0, catalogStatus: 'error', catalogReason: 'raccoon_catalog_unreachable' }] };
+  const props = { snapshot: { operations: { discovery: { ...base }, settings: { discovery: { enabled: true, autoEnableRoutes: true, fetchModels: true, intervalSeconds: 60 } } } }, busy: false, perform };
+  let tree = fixture.render(fixture.api.DiscoveryPanel, props);
+  const boxes = nodes(tree, node => node.type === 'input' && node.props.type === 'checkbox'), desktop = boxes[boxes.length - 1];
+  assert.equal(desktop.props.checked, false, 'an absent key is off, never on');
+  assert.match(text(tree), /桌面客户端/); assert.match(text(tree), /推荐改用网页授权/);
+  assert.match(text(tree), /网页授权账号：2 条模型路由 · 目录已更新/);
+  assert.match(text(tree), /0 条模型路由 · 目录更新失败/);
+  desktop.props.onChange({ target: { checked: true } });
+  tree = fixture.render(fixture.api.DiscoveryPanel, { ...props, snapshot: { operations: { discovery: { ...base, raccoonDesktopReuse: true }, settings: props.snapshot.operations.settings } } });
+  await button(tree, '保存发现设置').props.onClick();
+  assert.equal(calls[0][1].body.discovery.raccoonDesktopReuse, true, 'the checkbox only edits the discovery section');
+  assert.equal(calls[0][1].body.discovery.intervalSeconds, 60);
+});

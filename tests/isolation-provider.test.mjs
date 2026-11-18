@@ -7,8 +7,13 @@ import {createHash,randomUUID} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import {DatabaseSync} from 'node:sqlite';
 
-const root=resolve(dirname(fileURLToPath(import.meta.url)),'../..');
-const baseline=process.env.ISOLATION_PROVIDER_BASELINE==='1';
+// N11: the static source assertions in this file are change detectors, not the
+// isolation proof. They exist so that a reviewer notices when a provider starts
+// reading a shared profile/cache path instead of a private file. The real
+// isolation guarantees for the raccoon web-authorization path are covered by
+// tests/raccoon-oauth-isolation.test.mjs (N2/N3 cases) and by D2's on-device
+// review. Do not treat a green run here as evidence that an account cannot leak.
+const root=resolve(dirname(fileURLToPath(import.meta.url)),'../..'),baseline=process.env.ISOLATION_PROVIDER_BASELINE==='1';
 const source=process.env.ISOLATION_PROVIDER_SOURCE??(baseline?join(root,'work/isolation-provider-baseline'):fileURLToPath(new URL('../engine/src/',import.meta.url)));
 const hash=x=>createHash('sha256').update(x).digest('hex');
 const read=n=>readFile(join(source,n),'utf8');

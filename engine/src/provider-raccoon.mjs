@@ -1,11 +1,14 @@
 import {desktopSseResponse, desktopCompletionLimit} from './provider-sse.mjs';
 import {homedir} from 'node:os';
-import {join, dirname, resolve} from 'node:path';
-// SenseTime Raccoon native adapter. Official live endpoints verified 2026-10-11:
-// current-user ~/.box-agent/config/auth.json supplies Bearer access_token independently
-// of Electron Cookies. GET model_catalog / points balance and chat/tool roundtrip passed.
-// Gateway refresh uses a private cache; each resolve re-reads the untouched native source.
-// Protocol references: github.com/xxhhlk/raccoon2api and rockswang/wild-work (MIT).
+import {join, dirname, resolve, isAbsolute} from 'node:path';
+import {existsSync} from 'node:fs';
+// SenseTime Raccoon native adapter. Official live endpoints verified 2026-10-11.
+// Native auth is %USERPROFILE%\.office-raccoon\agent\config\auth.json (client 1.2.x), with
+// BOX_AGENT_CONFIG_DIR and the legacy ~/.box-agent/config/auth.json as fallbacks. It supplies
+// a Bearer access_token independently of Electron Cookies. GET model_catalog / points balance
+// and chat/tool roundtrip passed. Gateway refresh uses a private cache; each resolve re-reads
+// the untouched native source. Protocol references: github.com/xxhhlk/raccoon2api and
+// rockswang/wild-work (MIT).
 import {AppError, redact, hash, rememberSecret, dayIn} from './util.mjs';
 import {stat, readFile, mkdir, open, writeFile, rename, unlink} from 'node:fs/promises';
 import {createDecipheriv, randomBytes} from 'node:crypto';
@@ -31,13 +34,52 @@ export const descriptor = Object.freeze({
   sourceUrls: ['https://www.xiaohuanxiong.com/', 'https://doc.xiaohuanxiong.com/', 'https://raccoon.sensetime.com/'],
 });
 
-export function defaultRaccoonPaths() {
-  const base = (process.env.APPDATA ?? '').replace(/\\/g, '/');
+/**
+ * Expand a leading `~` and reject empty/NUL/relative values, so an out-of-contract
+ * environment value can never be turned into a candidate path.
+ */
+function expandHomePath(value, home) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.includes('\0')) return null;
+  const expanded = text === '~' ? home : /^~[\\/]/.test(text) ? join(home, text.slice(2)) : text;
+  return isAbsolute(expanded) ? expanded : null;
+}
+
+/**
+ * Native auth candidates, highest priority first. `server/discovery.mjs` and
+ * `scripts/import-local.mjs` implement the same order (cross-checked by
+ * tests/raccoon-paths.test.mjs). Only homedir() is a base here: the plugin worker redirects
+ * APPDATA/LOCALAPPDATA into the taskRoot, so paths derived from them read an empty sandbox.
+ */
+export function raccoonAuthCandidates({env = process.env, home = homedir()} = {}) {
+  const out = [];
+  const add = value => { if (value && !out.includes(value)) out.push(value); };
+  const configured = expandHomePath(env?.BOX_AGENT_CONFIG_DIR, home);
+  // Official contract: BOX_AGENT_CONFIG_DIR names the config DIRECTORY, but users often set the file.
+  if (configured) add(/\.json$/i.test(configured) ? configured : join(configured, 'auth.json'));
+  add(join(home, '.office-raccoon', 'agent', 'config', 'auth.json'));
+  add(join(home, '.box-agent', 'config', 'auth.json'));
+  return out;
+}
+
+export function defaultRaccoonAuthPath({env = process.env, home = homedir(), existsImpl = existsSync} = {}) {
+  const candidates = raccoonAuthCandidates({env, home});
+  return candidates.find(candidate => { try { return existsImpl(candidate); } catch { return false; } }) ?? candidates[0];
+}
+
+export function defaultRaccoonPaths({home = homedir(), existsImpl = existsSync, programFiles = process.env.ProgramFiles || 'C:\\Program Files'} = {}) {
+  // 1.2.x client userData root, derived from homedir() only (never %APPDATA% inside the worker).
+  const root = join(home, '.office-raccoon', 'user-data');
+  const shipped = join(programFiles, '@raccoonoffice-desktop', 'resources', 'default-llm-config.json');
+  let llmConfigPresent = false;
+  try { llmConfigPresent = existsImpl(shipped) === true; } catch { llmConfigPresent = false; }
   return {
-    llmConfig: 'D:/raccoon-ai/resources/default-llm-config.json',
-    sessionBinding: base ? `${base}/office-raccoon/default-session-model-binding.json` : '',
-    cookieDb: base ? `${base}/office-raccoon/Network/Cookies` : '',
-    localState: base ? `${base}/office-raccoon/Local State` : '',
+    // Read-only probe: the shipped client no longer ships default-llm-config.json.
+    llmConfig: llmConfigPresent ? shipped : '',
+    sessionBinding: join(root, 'default-session-model-binding.json'),
+    cookieDb: join(root, 'Network', 'Cookies'),
+    localState: join(root, 'Local State'),
   };
 }
 
@@ -61,6 +103,9 @@ export function parseRaccoonLlmConfig(raw) {
 
 export async function raccoonLlmConfig({configFilePath = defaultRaccoonPaths().llmConfig, readFileImpl} = {}) {
   const read = readFileImpl ?? (async p => JSON.parse(await readFile(p, 'utf8')));
+  // The shipped 1.2.x client no longer ships default-llm-config.json: an empty probe is a
+  // normal "not installed" state, not a read error.
+  if (!configFilePath) throw new AppError('本机未发现小浣熊 LLM 配置文件（仅按路径引用）', 404, 'raccoon_config_missing');
   let raw;
   try { raw = await read(configFilePath); } catch { throw new AppError('无法读取小浣熊 LLM 配置（仅按路径引用）', 404, 'raccoon_config_missing'); }
   return parseRaccoonLlmConfig(raw);
@@ -175,8 +220,25 @@ export async function raccoonCredentialPresence({cookieDbPath = defaultRaccoonPa
 const AUTH_COOKIE_DENY = /^(csrf|xsrf|_ga|_gid|_gat|hm_|hm\.|Hm_|sensorsdata|_clck|_clsk|abtest|lang|locale|theme)/i;
 const SESSION_COOKIE_HINT = /(session|sid|token|auth|login|ticket|jwt|passport|sso)/i;
 
+const DAY_MS=86400000;
+export function raccoonRemainingDays(expiresAtMs,now=Date.now()){
+ if(!Number.isFinite(expiresAtMs))return 0;
+ return Math.max(0,Math.ceil((expiresAtMs-now)/DAY_MS));
+}
+/** N10: only the 7-day tier is announced on the event channel; closer tiers stay inline. */
+export function raccoonRenewalLevel(expiresAtMs,now=Date.now()){
+ if(!Number.isFinite(expiresAtMs)||expiresAtMs<=now)return 'expired';
+ const days=raccoonRemainingDays(expiresAtMs,now);
+ return days<=3?'urgent':days<=7?'warn':'info';
+}
+
 /** Resolve current-user native auth first; cookie presence alone never proves authentication. */
 export async function raccoonResolve(account, config = {}, options = {}) {
+  // Dispatch on credentials.authKind, never on credentials.kind: `kind` is also a
+  // display/discovery hint and is rewritten by discovery snapshots, so it is not
+  // an authentication boundary. A web-authorized account must never fall through
+  // to the desktop reader.
+  if(account?.credentials?.authKind==='oauth_iam')return await resolveRaccoonOAuth(account,config,options);
   const cache=account?.credentials?.cacheFile;options={...options,...(cache?{cacheFile:typeof config.path==='function'?config.path(cache):cache}:{})};
   const ref = account?.credentials?.file ?? account?.credentials?.path ?? null;
   const nativeFile=ref&&ref!=='auto'?(typeof config.path==='function'?config.path(ref):ref):(config.authFilePath??((config.cookieDbPath)?null:defaultRaccoonAuthPath()));
@@ -220,13 +282,21 @@ export async function raccoonCookieHeader({cookieDbPath = defaultRaccoonPaths().
 /** Public view: presence + cookie NAMES only. No cookie values, no tokens. */
 export function raccoonCredentialView(secret) {
   if (!secret) return {present: false, status: 'credential_missing', cookieNames: []};
+  const oauth=secret.authKind==='oauth_iam',at=Date.now();
+  const expiresAtMs=Number.isFinite(secret.expiresAtMs)?secret.expiresAtMs:(secret.expiresAt?Date.parse(secret.expiresAt):NaN);
   return {
     present: true,
-    authKind: secret.authKind==='bearer'?'native_bearer_token':'electron_session_cookie',
+    authKind: oauth?'raccoon_oauth_iam':(secret.authKind==='bearer'?'native_bearer_token':'electron_session_cookie'),
     principal: secret.principal,
     cookieNames: secret.cookieNames ?? [],
     sessionCookieCount: secret.cookieNames?.length ?? 0,
     source: secret.source,
+    // IAM (client 1.2.x) sessions carry no refresh token; the token is reusable read-only until exp.
+    refreshTokenPresent: secret.refreshTokenPresent ?? null,
+    // N9: a web-authorized account reports its own renewal state instead of making
+    // the operator infer it from a status line.
+    ...(oauth?{sourceLabel:'网页授权',needsReauth:secret.needsReauth===true||!(expiresAtMs>at),expiresAt:Number.isFinite(expiresAtMs)?new Date(expiresAtMs).toISOString():(secret.expiresAt??null),expiresAtMs:Number.isFinite(expiresAtMs)?expiresAtMs:null,remainingDays:raccoonRemainingDays(expiresAtMs,at),renewalLevel:raccoonRenewalLevel(expiresAtMs,at),...(secret.obtainedAt?{obtainedAt:secret.obtainedAt}:{})}:{}),
+    ...(secret.authKind!=='oauth_iam'&&secret.refreshTokenPresent === false ? {renewal: {mode: 'read_only_until_expiry', reason: 'raccoon_iam_no_refresh', expiresAt: secret.expiresAt ?? null}} : {}),
   };
 }
 
@@ -285,7 +355,7 @@ export async function raccoonModels(options = {}) {
  * and no model is published as callable.
  */
 export async function raccoonHealth({credential, cookieDbPath, localStatePath, fetchImpl, llmConfigPath, sessionBindingPath, timeoutMs = 8000} = {}) {
-  if(credential?.authKind==='bearer')return raccoonBearerHealth(credential,{fetchImpl:fetchImpl??globalThis.fetch,timeoutMs});
+  if(['bearer','oauth_iam'].includes(credential?.authKind))return raccoonBearerHealth(credential,{fetchImpl:fetchImpl??globalThis.fetch,timeoutMs});
   let presence;
   try {
     presence = await raccoonCookiePresence({cookieDbPath, localStatePath});
@@ -347,7 +417,7 @@ export async function raccoonClaim(secret,task='daily-checkin',options={}) {
     supported: false,
     code: 'no_checkin_confirmed',
     reason: '官方客户端与线上文档均未发现签到/领取接口；积分来自商汤账号侧，不由本地客户端管理',
-    evidence: ['D:/raccoon-ai/resources/default-llm-config.json', 'D:/raccoon-ai/resources/.env.electron (origin listing)'],
+    evidence: ['https://doc.xiaohuanxiong.com/ (no check-in surface in the desktop client)', '本地客户端 profile: %USERPROFILE%\\.office-raccoon\\agent\\config\\auth.json'],
   };
 }
 
@@ -370,7 +440,7 @@ export async function raccoonChat(upstream,secret,input,signal,options={}) {
 export const raccoonProvider = {
   descriptor,
   resolve: raccoonResolve,
-  models: (credential, options={}) => credential?.authKind==='bearer'?raccoonServerModels(credential,options):raccoonModels(options),
+  models: (credential, options={}) => ['bearer','oauth_iam'].includes(credential?.authKind)?raccoonServerModels(credential,options):raccoonModels(options),
   health: (credential, options={}) => raccoonHealth({...options,credential}),
   status: raccoonStatus,
   claim: raccoonClaim,
@@ -380,9 +450,10 @@ export const raccoonProvider = {
   cookiePresence: raccoonCookiePresence,
 };
 
-// Official native client auth is ~/.box-agent/config/auth.json, independent of Electron cookies.
+// Native client auth is %USERPROFILE%\.office-raccoon\agent\config\auth.json
+// (BOX_AGENT_CONFIG_DIR override, legacy ~/.box-agent/config fallback — see
+// raccoonAuthCandidates). It is independent of Electron cookies.
 // Native files stay unchanged; rotated credentials are saved only in gateway private-cache.
-export function defaultRaccoonAuthPath(){return join(process.env.BOX_AGENT_CONFIG_DIR||join(homedir(),'.box-agent','config'),'auth.json');}
 export async function readRaccoonNativeAuth(file=defaultRaccoonAuthPath(),{readFileImpl=readFile}={}){
  let raw;try{raw=JSON.parse(String(await readFileImpl(file,'utf8')).replace(/^\uFEFF/,''));}catch{throw new AppError('小浣熊原生登录文件未就绪',401,'raccoon_credential_missing');}
  const token=raw.access_token??raw.accessToken;if(typeof token!=='string'||!token.trim()||/[\r\n]/.test(token))throw new AppError('小浣熊原生登录令牌为空',401,'raccoon_credential_missing');
@@ -392,8 +463,36 @@ export async function readRaccoonNativeAuth(file=defaultRaccoonAuthPath(),{readF
  rememberSecret(token);if(raw.refresh_token)rememberSecret(raw.refresh_token);
  return {accessToken:token,authKind:'bearer',principal:'raccoon:'+hash(identity).slice(0,24),source:'native_auth_file',filePath:file,cookieNames:[],expiresAt:Number.isFinite(claims.exp)?new Date(claims.exp*1000).toISOString():null};
 }
-function raccoonBearerHeaders(secret){rememberSecret(secret.accessToken);return {'authorization':'Bearer '+secret.accessToken,'content-type':'application/json','accept':'application/json'};}
-async function raccoonJson(secret,path,options={}){
+// Web authorization (loopback browser flow or a pasted token pair) writes its own
+// credential file below the plugin state root. The descriptor is deliberately
+// separate from the desktop reader: no client file is opened, no refresh token is
+// ever replayed, and `principal` is derived exactly like the desktop path.
+export async function readRaccoonOAuthAuth(file,{readFileImpl=readFile}={}){
+ let raw;try{raw=JSON.parse(String(await readFileImpl(file,'utf8')).replace(/^\uFEFF/,''));}catch{throw new AppError('网页授权凭据文件不存在或已损坏，请点击『重新授权』',401,'raccoon_oauth_reauth_required');}
+ if(raw?.authKind!=='oauth_iam')throw new AppError('该凭据文件不是网页授权凭据，请点击『重新授权』',401,'raccoon_oauth_reauth_required');
+ const token=raw.access_token??raw.accessToken;
+ if(typeof token!=='string'||!token.trim()||/[\r\n]/.test(token))throw new AppError('网页授权访问令牌为空，请点击『重新授权』',401,'raccoon_oauth_reauth_required');
+ const claims=tokenClaims(token);
+ // Same formula as readRaccoonNativeAuth: claims.name, then claims.sub, then a stored principal.
+ const identity=claims.name??claims.sub??raw.principal;
+ if(typeof identity!=='string'||!identity)throw new AppError('网页授权缺少稳定账号身份，请点击『重新授权』',401,'raccoon_identity_missing');
+ rememberSecret(token);if(raw.refresh_token)rememberSecret(raw.refresh_token);
+ const storedExpiry=Date.parse(raw.accessExpiresAt??raw.expiresAt??'');
+ const expiresAtMs=Number.isFinite(claims.exp)?claims.exp*1000:(Number.isFinite(storedExpiry)?storedExpiry:NaN);
+ return {accessToken:token,authKind:'oauth_iam',principal:'raccoon:'+hash(identity).slice(0,24),source:'raccoon_oauth_loopback',filePath:file,cookieNames:[],expiresAt:Number.isFinite(expiresAtMs)?new Date(expiresAtMs).toISOString():null,expiresAtMs:Number.isFinite(expiresAtMs)?expiresAtMs:null,refreshTokenPresent:!!(raw.refresh_token??raw.refreshToken),acquiredVia:raw.acquiredVia??null,obtainedAt:typeof raw.obtainedAt==='string'?raw.obtainedAt:null,needsReauth:false};
+}
+// Re-authorization is the only renewal path for a web-authorized account: the
+// vendor refresh endpoint is never called with its token pair.
+async function resolveRaccoonOAuth(account,config={},options={}){
+ const ref=account?.credentials?.file??account?.credentials?.path;
+ if(typeof ref!=='string'||!ref||ref==='auto')throw new AppError('网页授权账号缺少独立凭据文件，请点击『重新授权』',401,'raccoon_oauth_reauth_required');
+ const file=typeof config.path==='function'?config.path(ref):ref;
+ const secret=await readRaccoonOAuthAuth(file,options);
+ const at=options.now??Date.now();
+ if(!(Number.isFinite(secret.expiresAtMs)&&secret.expiresAtMs>at))throw new AppError('网页授权已到期，请点击『重新授权』',401,'raccoon_oauth_reauth_required');
+ return secret;
+}
+function raccoonBearerHeaders(secret){rememberSecret(secret.accessToken);return {'authorization':'Bearer '+secret.accessToken,'content-type':'application/json','accept':'application/json'};}async function raccoonJson(secret,path,options={}){
  const response=await raccoonFetch(options.fetchImpl??globalThis.fetch,RACCOON_ORIGIN+path,{method:options.method??'GET',headers:{...raccoonBearerHeaders(secret),...options.headers},signal:options.signal,timeoutMs:options.timeoutMs??30000});
  if(!response.ok){await response.body?.cancel().catch(()=>{});throw new AppError('小浣熊官方接口 HTTP '+response.status,response.status,response.status===401?'raccoon_session_expired':'raccoon_upstream_error');}
  const reader=response.body?.getReader();if(!reader)throw new AppError('小浣熊空响应',502,'raccoon_empty_response');let bytes=0;const chunks=[];
@@ -452,6 +551,9 @@ async function publishRaccoonCache(file,data){const temp=file+'.'+randomBytes(6)
 function raccoonBlockedRefresh(cached){const pending=cached?.loginRequired===false||/(?:unconfirmed|invalid|pending)$/.test(cached?.refreshFailure??'');return Object.assign(new AppError(pending?'小浣熊续期结果待核验；检测到新本机登录态后自动恢复':'小浣熊上次续期未确认；等待本机登录态更新',pending?503:401,'raccoon_refresh_needs_login'),{loginRequired:!pending,refreshPending:pending});}
 async function loadRaccoonRefreshed(file,options){
  let source,original;try{source=await readFile(file,'utf8');original=JSON.parse(source.replace(/^\uFEFF/,''));}catch{throw new AppError('小浣熊原生登录文件未就绪',401,'raccoon_credential_missing');}
+ // N6: a web-authorized credential never enters the desktop refresh flow. Replaying
+ // its token pair at the vendor refresh endpoint would only waste a live session.
+ if(original?.authKind==='oauth_iam')throw new AppError('网页授权账号不支持后台静默续期，请点击『重新授权』',401,'raccoon_oauth_reauth_required');
  // Parse identity before any credential-bearing network operation.
  await readRaccoonNativeAuth(file,{readFileImpl:async()=>source});
  const sourceHash=hash(source),sourceCredentialHash=hash(JSON.stringify([tokenIdentity(original),original.refresh_token??original.refreshToken??null])),cacheFile=options.cacheFile??join(process.env.LOCALAPPDATA??homedir(),'AI Credit Gateway','private-cache','raccoon-'+hash(resolve(file)).slice(0,16)+'.json');
@@ -461,9 +563,22 @@ async function loadRaccoonRefreshed(file,options){
  let auth=matches&&cached?.auth?cached.auth:original;
  const token=auth.refresh_token??auth.refreshToken;
  const attemptedHash=typeof token==='string'?hash(token):null;
- if(tokenExpiry(original)>now+60000&&(original.access_token??original.accessToken)!==(cached?.auth?.access_token??cached?.auth?.accessToken))return {...await readRaccoonNativeAuth(file,{readFileImpl:async()=>source}),refreshTokenPresent:!!(original.refresh_token??original.refreshToken)};
- const credential=async(raw,fromCache)=>{const value=await readRaccoonNativeAuth(file,{readFileImpl:async()=>JSON.stringify(raw)});return {...value,source:fromCache?'gateway_private_refresh_cache':'native_auth_file',refreshTokenPresent:!!(raw.refresh_token??raw.refreshToken)};};
+ if(tokenExpiry(original)>now+60000&&(original.access_token??original.accessToken)!==(cached?.auth?.access_token??cached?.auth?.accessToken))return {...await readRaccoonNativeAuth(file,{readFileImpl:async()=>source}),refreshTokenPresent:!!(original.refresh_token??original.refreshToken),...(original.refresh_token||original.refreshToken?{}:{reason:'raccoon_iam_no_refresh'})};
+ const credential=async(raw,fromCache)=>{const value=await readRaccoonNativeAuth(file,{readFileImpl:async()=>JSON.stringify(raw)});return {...value,source:fromCache?'gateway_private_refresh_cache':'native_auth_file',refreshTokenPresent:!!(raw.refresh_token??raw.refreshToken),...(raw.refresh_token||raw.refreshToken?{}:{reason:'raccoon_iam_no_refresh'})};};
  if(options.refresh===false)return credential(auth,matches&&!!cached?.auth);
+ // Client 1.2.x IAM sessions store only access_token (the client itself filters refreshToken for
+ // IAM tokens), so there is nothing to rotate. Report the real expiry once instead of
+ // raccoon_refresh_missing, and never replay the access token as a refresh token: the official
+ // /api/web/auth/v1/refresh endpoint echoes IAM tokens unchanged without extending exp, which
+ // would only end as raccoon_refresh_invalid. No network call, no cache write, no lock file.
+ if(!token){
+  if(!(tokenExpiry(auth)>now+60000)){
+   const expiresAt=Number.isFinite(tokenExpiry(auth))?new Date(tokenExpiry(auth)).toISOString():null;
+   throw Object.assign(new AppError('小浣熊登录态由客户端维护，可只读复用至 '+(expiresAt?expiresAt.slice(0,10):'未知日期')+'；到期需重新打开小浣熊客户端完成网页登录',401,'raccoon_refresh_needs_login'),{loginRequired:true,refreshTokenPresent:false,reason:'raccoon_iam_no_refresh',expiresAt});
+  }
+  // Still valid: read-only reuse, ignoring any stale rotation state left by an older build.
+  return credential(auth,matches&&!!cached?.auth);
+ }
  if(matches&&cached?.refreshFailure&&tokenExpiry(auth)>now+5000)return {...await credential(auth,true),refreshPending:true};
  if(matches&&cached?.retryAt&&now<cached.retryAt)throw Object.assign(new AppError('小浣熊续期暂缓，稍后自动重试',429,'raccoon_refresh_deferred'),{retryAt:cached.retryAt});
  if(cached?.refreshFailure&&(matches||attemptedHash&&cached.attemptedTokenHash===attemptedHash)&&(!cached.retryAt||now<cached.retryAt))throw raccoonBlockedRefresh(cached);

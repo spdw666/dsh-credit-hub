@@ -25,9 +25,29 @@ function sharedWithOthers(config,account,path,{directory=false}={}){
 }
 /** Delete only known files or an exact private discovery snapshot. Never follow
  * links or remove a shared/native directory. Historical token-free ledgers stay. */
-export async function removeOwnedCredentialAssets(service,account,{taskRoot}={}){
+// N2: web-authorized credentials live in a second private root owned by this
+// plugin. It is an allow-list, not a relaxation of the data-directory rule: the
+// only reachable name is the deterministic one for this very account, it must be
+// a regular non-link file, and the shared check still runs first.
+const RACCOON_OAUTH_FILE=/^raccoon-oauth-[a-f0-9]{12}\.json$/;
+const RACCOON_OAUTH_ACCOUNT_ID=/^raccoon-oauth-[a-f0-9]{12}$/;
+async function deleteOwnedOAuthCredential(service,account,{taskRoot,stateRoot,removed,retained}){
+  const id=String(account?.id??'');
+  if(!RACCOON_OAUTH_ACCOUNT_ID.test(id)){retained.push({kind:'oauth',reason:'not_private_data'});return;}
+  const root=resolve(taskRoot),directory=resolve(stateRoot??join(resolve(service.config.dataDir),'..'),'private','raccoon-oauth'),target=join(directory,id+'.json');
+  if(!inside(directory,target)||!RACCOON_OAUTH_FILE.test(id+'.json')){retained.push({kind:'oauth',reason:'not_private_data'});return;}
+  if(sharedWithOthers(service.config,account,target)){retained.push({kind:'oauth',reason:'shared'});return;}
+  try{
+    await assertInsideRoot(root,target);const stat=await lstat(target);
+    if(stat.isSymbolicLink()||!stat.isFile()){retained.push({kind:'oauth',reason:'unexpected_type'});return;}
+    await rm(target,{force:true});removed.push('oauth');
+  }catch(e){if(e.code==='ENOENT')return;retained.push({kind:'oauth',reason:/symlink/.test(e.code??'')?'link_rejected':'cleanup_failed'});}
+}
+export async function removeOwnedCredentialAssets(service,account,{taskRoot,stateRoot}={}){
   const root=resolve(taskRoot),dataDir=resolve(service.config.dataDir),removed=[],retained=[];
+  const webAuthorized=account?.credentials?.authKind==='oauth_iam';
   for(const {key,file} of credentialPaths(service.config,account)){
+    if(webAuthorized)continue;
     const r=relative(dataDir,file).split(sep).join('/');
     const directory=/^(?:profileDir|runtimeDataDir)$/i.test(key);
     const discoveryDirectory=directory&&/^discovered\/[a-z0-9-]+\/[a-f0-9]{64}$/.test(r);
@@ -44,6 +64,7 @@ export async function removeOwnedCredentialAssets(service,account,{taskRoot}={})
       }catch(e){if(e.code==='ENOENT')continue;retained.push({kind:key,reason:/symlink/.test(e.code??'')?'link_rejected':'cleanup_failed'});}
     }
   }
+  if(webAuthorized)await deleteOwnedOAuthCredential(service,account,{taskRoot,stateRoot,removed,retained});
   return {removedCredentialAssets:removed.length,retainedAssets:retained};
 }
 export function pruneAccount(value,accountId){
@@ -64,7 +85,7 @@ export function pruneAccount(value,accountId){
 }
 /** Called under the management mutation queue. A deliberate delete persists a
  * credential-free identity tombstone in the SAME config commit before cleanup. */
-export async function removeHubAccount(service,accountId,{confirm,taskRoot,resolvePrincipal}={}){
+export async function removeHubAccount(service,accountId,{confirm,taskRoot,stateRoot,resolvePrincipal}={}){
   if(confirm!==true)throw error('account_delete_confirmation_required');
   await service.config.load?.();
   let account=service.config.value.accounts.find(a=>a.id===accountId);if(!account)throw error('account_not_found',404);
@@ -91,7 +112,7 @@ export async function removeHubAccount(service,accountId,{confirm,taskRoot,resol
   service.credentials?.cache?.delete(accountId);service.balanceCache?.delete(accountId);service.balanceCacheKeys?.delete(accountId);
   service.platforms?.catalogs?.clear?.();service.platforms?.catalogFlights?.clear?.();
   if(service.ledger?.get?.('wb-management-current')?.accountId===accountId)service.ledger.set('wb-management-current',null);
-  const assets=await removeOwnedCredentialAssets(service,account,{taskRoot});
+  const assets=await removeOwnedCredentialAssets(service,account,{taskRoot,stateRoot});
   service.ledger?.unbind?.(accountId);
   return {deleted:true,removed,suppressed:true,...assets,credentialBackupCreated:false,historyPreserved:true};
 }

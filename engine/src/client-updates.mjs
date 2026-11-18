@@ -76,7 +76,7 @@ export const DEFAULT_TARGETS = [
   },
   {
     id: 'raccoon', name: '商汤小浣熊', platform: 'raccoon',
-    install: 'D:\\raccoon-ai',
+    install: join(process.env.ProgramFiles || 'C:\\Program Files', '@raccoonoffice-desktop'),
     version: {type: 'asar'},
     latest: {type: 'feed', url: 'https://sta-volc.xiaohuanxiong.com/office-agent/win'},
     note: ''

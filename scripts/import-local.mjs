@@ -44,6 +44,35 @@ function sourcePath(value, base) {
   return out;
 }
 
+/**
+ * BOX_AGENT_CONFIG_DIR → auth.json. Expands a leading `~` and requires an absolute result;
+ * empty/NUL/relative values return null so a malformed environment value can never become a
+ * candidate path. The official contract names a directory, but users also point at the file.
+ */
+export function raccoonConfigAuthFile(value, home = homedir()) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.includes('\0')) return null;
+  const expanded = text === '~' ? home : /^~[\\/]/.test(text) ? join(home, text.slice(2)) : text;
+  if (!isAbsolute(expanded)) return null;
+  return /\.json$/i.test(expanded) ? expanded : join(expanded, 'auth.json');
+}
+
+/**
+ * Native raccoon auth candidates, highest priority first. This order must stay identical to
+ * `raccoonAuthCandidates()` in engine/src/provider-raccoon.mjs; server/discovery.mjs imports
+ * this one. tests/raccoon-paths.test.mjs cross-checks both copies.
+ * Only homedir() is a base: the plugin worker redirects APPDATA/LOCALAPPDATA into the taskRoot.
+ */
+export function raccoonAuthCandidates({env = process.env, home = homedir()} = {}) {
+  const out = [];
+  const add = file => { if (file && !out.includes(file)) out.push(file); };
+  add(raccoonConfigAuthFile(env?.BOX_AGENT_CONFIG_DIR, home));
+  add(join(home, '.office-raccoon', 'agent', 'config', 'auth.json'));
+  add(join(home, '.box-agent', 'config', 'auth.json'));
+  return out;
+}
+
 export function credentialCandidates(account, {sourceDir, env = process.env, home = homedir(), username = userInfo().username} = {}) {
   const c = account.credentials ?? {}, explicit = sourcePath(c.file ?? c.path, sourceDir);
   if (explicit) return [explicit];
@@ -64,7 +93,7 @@ export function credentialCandidates(account, {sourceDir, env = process.env, hom
     case 'qoder': return [join(app, account.edition === 'cn' ? 'com.qodercn.app.stable' : 'com.qoder.app.stable', 'auth.v1.dat')];
     case 'lobster': return [join(app, 'LobsterAI/lobsterai.sqlite')];
     case 'loomy': return [env.LOOMY_AUTH_SESSION_FILE, join(env.PUBLIC ?? 'C:/Users/Public', 'Loomy', digest(username).slice(0,12), 'userData/auth-session.json'), join(app,'Loomy/auth-session.json')].filter(Boolean);
-    case 'raccoon': return [join(env.BOX_AGENT_CONFIG_DIR ?? join(home,'.box-agent/config'), 'auth.json')];
+    case 'raccoon': return raccoonAuthCandidates({env, home});
     case 'opencode': return [join(home, '.local/share/opencode/opencode.db')];
     default: return [];
   }

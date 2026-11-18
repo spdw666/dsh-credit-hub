@@ -75,3 +75,50 @@ test('SQLite close/reopen retains random plan and pre-submission attempt alongsi
   const work=fileURLToPath(new URL('../../work/',import.meta.url));await mkdir(work,{recursive:true});const dir=await mkdtemp(join(work,'scheduler-ledger-')),f=fixture({accounts:2,scheduler:{enabled:false}});let ledger=new Ledger(dir),scheduler=new Scheduler(f.config,{run:async(accountId,task)=>({accountId,task,status:'error',reason:'SAMPLE_offline'})},ledger,{clock:()=>f.time,random:()=>0.4});
   try{ledger.record({day:'2026-10-18',platform:'sample',accountId:'SAMPLE-0',task:'daily-checkin',status:'already'});const before=scheduler.status().plan.map(r=>r.at);await scheduler.manual({accountIds:['SAMPLE-1'],missingOnly:true});await scheduler.stop();ledger.close();ledger=new Ledger(dir);let calls=0;scheduler=new Scheduler(f.config,{run:async()=>{calls++;return {status:'success'};}},ledger,{clock:()=>f.time,random:()=>0.9});assert.deepEqual(scheduler.status().plan.map(r=>r.at),before);assert.equal(scheduler.status().todayAttempted.length,2);f.config.value.scheduler.enabled=true;f.config.value.scheduler.startupSpreadSeconds=0;scheduler.start();await settle();assert.equal(calls,0);assert.equal(scheduler.status().queue.length,0);}finally{await scheduler.stop();ledger.close();await rm(dir,{recursive:true,force:true});}
 });
+
+test('a manual request promotes today\'s queued window appointment instead of waiting for the window',async()=>{
+  const f=fixture({accounts:4,now:'2026-11-18T09:33:00+08:00',scheduler:{enabled:true,startup:false,timezone:'Asia/Shanghai',hour:10,minute:0,jitterSeconds:600,windows:{}}});
+  const ids=Array.from({length:4},(_,i)=>'SAMPLE-'+i);
+  f.scheduler.start();await settle();
+  const queue=f.scheduler.status().queue;
+  assert.equal(queue.length,4);
+  assert.ok(queue[0].dueAt>f.time);
+  assert.equal(f.calls.length,0);
+  const result=await f.scheduler.manual({accountIds:ids,missingOnly:false});
+  assert.equal(f.calls.length,4);
+  assert.equal(result.queued,4);
+  assert.ok(result.results.every(r=>r.status==='success'));
+  await f.scheduler.stop();
+});
+
+test('an accepted manual request returns before the claims finish',async()=>{
+  const f=fixture({accounts:4,now:'2026-11-18T09:33:00+08:00',scheduler:{enabled:true,startup:false,timezone:'Asia/Shanghai',hour:10,minute:0,jitterSeconds:600,windows:{}}});
+  const ids=Array.from({length:4},(_,i)=>'SAMPLE-'+i);
+  f.scheduler.start();await settle();
+  const accepted=await f.scheduler.manual({accountIds:ids,missingOnly:false,wait:false});
+  assert.equal(accepted.accepted,true);
+  assert.equal(accepted.queued,4);
+  assert.ok(!('results' in accepted));
+  assert.equal(f.calls.length,2);
+  await f.advance(1000);
+  assert.equal(f.calls.length,4);
+  const attempted=f.scheduler.status().todayAttempted;
+  assert.equal(attempted.length,4);
+  assert.ok(attempted.every(a=>a.status==='success'));
+  await f.scheduler.stop();
+});
+
+test('a promoted manual claim is not claimed again by the next window tick',async()=>{
+  const f=fixture({accounts:4,now:'2026-11-18T09:33:00+08:00',scheduler:{enabled:true,startup:false,timezone:'Asia/Shanghai',hour:10,minute:0,jitterSeconds:600,windows:{}}});
+  const ids=Array.from({length:4},(_,i)=>'SAMPLE-'+i);
+  f.scheduler.start();await settle();
+  await f.scheduler.manual({accountIds:ids,missingOnly:false});
+  assert.equal(f.calls.length,4);
+  f.time='2026-11-18T10:05:00+08:00';
+  await f.scheduler.tick();
+  assert.equal(f.calls.length,4);
+  const last=f.ledger.get('schedule-last');
+  assert.equal(last.complete,true);
+  assert.equal(last.attempted,4);
+  await f.scheduler.stop();
+});

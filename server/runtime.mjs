@@ -9,6 +9,16 @@ import {homedir,userInfo} from 'node:os';
 
 const taskRoot=dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 export {PLUGIN_VERSION,parseManagementRequest,normalizeOptions} from './contracts.mjs';
+// N1(b): `authorizeUrl` is redacted from every published surface except the reply to
+// `POST /hub/raccoon/oauth/begin`, and only while the authorization state it carries
+// is still inside its ten-minute window. The worker applies the same allow-list
+// before the response crosses the IPC boundary, so a miss here cannot leak it.
+function authorizeUrlSurface(request,result){
+  if(request?.pathname!=='/hub/raccoon/oauth/begin')return null;
+  const answer=result?.body??result;
+  if(answer?.phase!=='pending'||!(Number(answer?.remainingMs)>0))return null;
+  return ['authorizeUrl'];
+}
 export const watchdogDefaults=Object.freeze({heartbeatIntervalMs:5000,heartbeatTimeoutMs:3000,heartbeatFailures:3,restartBaseMs:500,restartMaxMs:30000,jitterRatio:.2,stableResetMs:60000,restartWindowMs:300000,maxRestarts:5,cooldownMs:60000,shutdownGraceMs:3000,resumeGraceMs:15000});
 function watchdogPolicy(value={}){
   const next={...watchdogDefaults,...value};
@@ -128,7 +138,7 @@ export async function createHubRuntime(input={}){
         const item=pending.get(message.id);if(!item||item.rec!==rec)return;
         pending.delete(message.id);clearTimeout(item.timer);
         if(message.error)item.reject(Object.assign(new Error(message.error.message),message.error));
-        else try{item.resolve(item.operation==='managementRequest'&&isAccountExportRequest(item.request)&&message.result?.status===200?validateAccountExportResponse(message.result,item.request):boundedPublic(message.result));}catch(error){item.reject(error);}
+        else try{item.resolve(item.operation==='managementRequest'&&isAccountExportRequest(item.request)&&message.result?.status===200?validateAccountExportResponse(message.result,item.request):boundedPublic(message.result,authorizeUrlSurface(item.request,message.result)));}catch(error){item.reject(error);}
       });
       const timer=setTimeout(()=>fail(rec,hubError('worker_startup_timeout','Plugin worker startup timed out',504)),options.startupTimeoutMs);timer.unref?.();
       let hello;try{hello=await ready;}finally{clearTimeout(timer);rec.rejectReady=null;}
@@ -169,6 +179,10 @@ export async function createHubRuntime(input={}){
     const error=hubError('worker_stopped','Plugin worker is stopped',503);rejectPending(error);for(const waiter of [...waiters])waiter.finish(error);listeners.clear();record?.rejectReady?.(error);
     closeFlight=(async()=>{await stopRecord(record,{graceful:true});await attemptFlight;await log('STOPPED');})();return closeFlight;
   }
-  const controller={runtime,options,status,request,waitUntilReady,onReady(listener){if(typeof listener!=='function')throw new TypeError('Ready listener must be a function');listeners.add(listener);return()=>listeners.delete(listener);},async snapshot(){const value=await ipc('snapshot');return {...value,worker:{...value.worker,...status()}};},models:()=>ipc('models'),get workerPid(){return record?.proc.pid;},close};
+  const controller={runtime,options,status,request,waitUntilReady,
+    // Q6: callers that need the worker before issuing a request use this; it
+    // reuses the same ready barrier (and its timeout/abort semantics).
+    whenReady:{waitFor:input=>waitUntilReady(input)},
+    onReady(listener){if(typeof listener!=='function')throw new TypeError('Ready listener must be a function');listeners.add(listener);return()=>listeners.delete(listener);},async snapshot(){const value=await ipc('snapshot');return {...value,worker:{...value.worker,...status()}};},models:()=>ipc('models'),get workerPid(){return record?.proc.pid;},close};
   launch();return controller;
 }

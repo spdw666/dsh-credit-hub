@@ -7,18 +7,22 @@ import {createDiscovery} from './discovery.mjs';
 import {createEventRouter,validateEventSettings} from './events.mjs';
 import {buildForecast,captureBalanceHistory} from './forecast.mjs';
 import {createUpdateMonitor,releaseSource} from './updates.mjs';
+import {createRaccoonOAuth} from './raccoon-oauth.mjs';
 import {PLUGIN_VERSION,hubError,requireWithin,publicValue,createHandleMaps} from './contracts.mjs';
-export const operationDefaults={discovery:{enabled:true,intervalSeconds:60,autoEnableRoutes:true,fetchModels:true},updates:{enabled:true,intervalHours:1,includePrerelease:false},events:{enabled:true,credentialWarnDays:7,balanceThreshold:{percent:10,credits:100},cooldownSeconds:3600,mappings:{'checkin.failed':['native'],'credential.expiring':['native'],'balance.low':['native'],'relay.triggered':['native'],'request.failure_streak':['native'],'update.available':['native']},sinks:{native:{kind:'native',enabled:true}}},forecast:{safetyMultiplier:1.25,maxBalanceAgeHours:24}};
+export const operationDefaults={discovery:{enabled:true,intervalSeconds:60,autoEnableRoutes:true,fetchModels:true,raccoonDesktopReuse:false},updates:{enabled:true,intervalHours:1,includePrerelease:false},events:{enabled:true,credentialWarnDays:7,balanceThreshold:{percent:10,credits:100},cooldownSeconds:3600,mappings:{'checkin.failed':['native'],'credential.expiring':['native'],'balance.low':['native'],'relay.triggered':['native'],'request.failure_streak':['native'],'update.available':['native']},sinks:{native:{kind:'native',enabled:true}}},forecast:{safetyMultiplier:1.25,maxBalanceAgeHours:24},raccoonOauth:{enabled:true}};
 const object=v=>!!v&&typeof v==='object'&&!Array.isArray(v);
 export function validateOperationSettings(input,descriptor={}){
  if(!object(input)||Object.keys(input).some(k=>!Object.hasOwn(operationDefaults,k)))throw hubError('invalid_operations_settings','Unknown operations setting');
  const next=structuredClone(operationDefaults);for(const [key,value]of Object.entries(input)){if(!object(value))throw hubError('invalid_operations_settings',key+' must be an object');next[key]={...next[key],...value};}
- const d=next.discovery;if(typeof d.enabled!=='boolean'||typeof d.autoEnableRoutes!=='boolean'||typeof d.fetchModels!=='boolean'||!Number.isInteger(d.intervalSeconds)||d.intervalSeconds<10||d.intervalSeconds>86400)throw hubError('invalid_discovery_settings','Discovery interval must be 10–86400 seconds with boolean toggles');
+ const d=next.discovery;if(typeof d.enabled!=='boolean'||typeof d.autoEnableRoutes!=='boolean'||typeof d.fetchModels!=='boolean'||typeof d.raccoonDesktopReuse!=='boolean'||!Number.isInteger(d.intervalSeconds)||d.intervalSeconds<10||d.intervalSeconds>86400)throw hubError('invalid_discovery_settings','Discovery interval must be 10–86400 seconds with boolean toggles');
  const u=next.updates;if(typeof u.enabled!=='boolean'||!Number.isFinite(u.intervalHours)||u.intervalHours<.25||u.intervalHours>168||typeof u.includePrerelease!=='boolean'||u.allowLocalTest!==undefined)throw hubError('invalid_update_settings','Update check interval must be 0.25–168 hours');releaseSource(u,descriptor);
  const e=next.events;if(typeof e.enabled!=='boolean'||!Number.isFinite(e.credentialWarnDays)||e.credentialWarnDays<0||e.credentialWarnDays>90||!Number.isFinite(e.cooldownSeconds)||e.cooldownSeconds<0||e.cooldownSeconds>604800)throw hubError('invalid_event_settings','Invalid event threshold or cooldown');
  if(!Number.isFinite(next.forecast.safetyMultiplier)||next.forecast.safetyMultiplier<1||next.forecast.safetyMultiplier>5||!Number.isFinite(next.forecast.maxBalanceAgeHours)||next.forecast.maxBalanceAgeHours<.1||next.forecast.maxBalanceAgeHours>168)throw hubError('invalid_forecast_settings','Invalid forecast margin or balance age');
  if(next.forecast.renewAtByAccount!==undefined&&(!object(next.forecast.renewAtByAccount)||Object.entries(next.forecast.renewAtByAccount).some(([key,value])=>!/^account-[a-f0-9]{12}$/.test(key)||(value!==null&&(typeof value!=='string'||!Number.isFinite(Date.parse(value)))))))throw hubError('invalid_forecast_settings','Invalid account replenishment date');
- return next;
+ // N5: the web-authorization switch is part of the same document. If it were not
+ // accepted here, saving any other section would fail as a whole.
+ const o=next.raccoonOauth;if(typeof o.enabled!=='boolean'||Object.keys(o).some(key=>key!=='enabled'))throw hubError('invalid_operations_settings','raccoonOauth accepts only an enabled boolean');
+  return next;
 }
 export async function createHubOperations({service,options,descriptor={},hostEnvironment={}}){
  const file=requireWithin(options.taskRoot,join(options.stateRoot,'hub-settings.json'),'hub settings');
@@ -32,7 +36,19 @@ export async function createHubOperations({service,options,descriptor={},hostEnv
  const onNativeEvent=async(event,{deliveryId})=>{let item=nativeInbox.find(e=>e.deliveryId===deliveryId);if(!item){item={deliveryId,event,queuedAt:new Date().toISOString(),displayedAt:null};nativeInbox.push(item);if(nativeInbox.length>200)nativeInbox.splice(0,nativeInbox.length-200);persistInbox();}if(item.displayedAt)return {ack:true};return new Promise(resolve=>{const timer=setTimeout(()=>{ackWaiters.delete(deliveryId);resolve({ack:false});},4500);timer.unref?.();ackWaiters.set(deliveryId,{resolve,timer});});};
  const events=createEventRouter({ledger,settings:settings.events,onNativeEvent});
  const updates=createUpdateMonitor({ledger,version:PLUGIN_VERSION,descriptor,settings:settings.updates,onEvent:event=>events.emit({...event,id:event.key,data:{latestVersion:event.version,currentVersion:PLUGIN_VERSION}})});
- const discovery=createDiscovery({service,options,hostEnvironment,settings:()=>settings.discovery,updateConfig,onEvent:event=>{if(event?.type)events.emit(event);},...(options.discoveryCandidates?{extraCandidates:options.discoveryCandidates}:{})});
+ const discovery=createDiscovery({service,options,hostEnvironment,settings:()=>settings.discovery,updateConfig,onEvent:event=>{if(event?.type)events.emit(event);},...(options.discoveryCandidates?{extraCandidates:options.discoveryCandidates}:{}),...(Array.isArray(options.raccoonEnterpriseIds)?{enterpriseIds:options.raccoonEnterpriseIds}:{})});
+ // Web authorization owns its own loopback listener and credential files; it only
+ // needs config writes (through withMutation) and the settings getter. The commit
+ // hook is requirement A's first trigger: the freshly authorized account gets its
+ // model routes immediately instead of waiting for the next discovery interval.
+ const raccoonOauth=createRaccoonOAuth({
+  service,options,withMutation,
+  settings:()=>settings.raccoonOauth,
+  onAccountCommitted:info=>discovery.refreshOauthAccount(info.accountId),
+  ...(options.raccoonOauthFetch?{fetchImpl:options.raccoonOauthFetch}:{}),
+  ...(options.raccoonOauthProbe===false?{probeEnabled:false}:{}),
+  ...(options.now?{now:options.now}:{}),
+ });
  let forecast={accounts:[],window:{hours:168},assumptions:[]},timer,refreshFlight,settingsFlight=Promise.resolve(),closed=false,lastError=null;
  const balances=()=>service.balanceCache instanceof Map?[...service.balanceCache].map(([accountId,value])=>({accountId,...value})):[];
  function usage7d(){const from=new Date(Date.now()-7*86400000).toISOString(),rows=[];let cursor=0,total=0,more=null;for(let n=0;n<40;n++){const part=service.ledger.usage?.({from,limit:500,beforeId:cursor})??{records:[]};rows.push(...(part.records??[]));total=part.total??rows.length;more=part.nextBeforeId;if(!more)break;cursor=more;}
@@ -61,11 +77,19 @@ export async function createHubOperations({service,options,descriptor={},hostEnv
   case '/hub/forecast':await refresh();return forecast;
   case '/hub/scheduler-status':return service.scheduler.status?.()??{todayMissing:[],todayAttempted:[],plan:[]};
   case '/hub/scheduler/manual':if(!service.scheduler.manual)throw hubError('scheduler_queue_unavailable','The isolated engine needs its queued scheduler',424);return service.scheduler.manual({...body,missingOnly:body.missingOnly!==false});
+  // R1–R6: Raccoon web authorization. Kept beside the other operation routes so a
+  // single switch owns the whole browser/paste surface.
+  case '/hub/raccoon/oauth':return raccoonOauth.overview();
+  case '/hub/raccoon/oauth/status':return raccoonOauth.sessionStatus(request.query?.sessionId);
+  case '/hub/raccoon/oauth/begin':return raccoonOauth.begin(body);
+  case '/hub/raccoon/oauth/paste':return raccoonOauth.paste(body);
+  case '/hub/raccoon/oauth/cancel':return raccoonOauth.cancel(body.sessionId);
+  case '/hub/raccoon/oauth/reauth':return raccoonOauth.begin({...body,reauth:true});
   default:throw hubError('unknown_operation','Unknown operations endpoint',404);
  }}
  // Capture edges soon after local ledger writes, without awaiting sink delivery.
  const originals=[];if(typeof service.credentials?.read==='function'){const original=service.credentials.read;service.credentials.read=async function(account,...args){const value=await original.call(this,account,...args);try{const expiresAtMs=credentialExpiry(value);if(expiresAtMs){const prior=ledger.get('credit-hub:credential-expiry:v1')??{};prior[account.id]={accountId:account.id,expiresAtMs,observedAtMs:Date.now()};ledger.set('credit-hub:credential-expiry:v1',prior);}}catch{}return value;};originals.push(()=>{service.credentials.read=original;});}for(const method of ['record','finishUsage'])if(typeof service.ledger[method]==='function'){const original=service.ledger[method];service.ledger[method]=function(...args){const result=original.apply(this,args);queueMicrotask(()=>{if(!closed)void refresh();});return result;};originals.push(()=>{service.ledger[method]=original;});}
  await refresh();
- return {snapshot,request,refresh,withMutation,updateConfig,start(){if(timer)return;if(options.enableBackgroundOperations){discovery.start();updates.start();}timer=setInterval(()=>void refresh(),30000);timer.unref?.();},async close(){closed=true;clearInterval(timer);await discovery.stop();await updates.close();await refreshFlight;for(const {resolve,timer}of ackWaiters.values()){clearTimeout(timer);resolve({ack:false});}ackWaiters.clear();await events.close();for(const reset of originals)reset();}};
+ return {snapshot,request,refresh,withMutation,updateConfig,raccoonOauth,start(){if(timer)return;if(options.enableBackgroundOperations){discovery.start();updates.start();}timer=setInterval(()=>void refresh(),30000);timer.unref?.();},async close(){closed=true;clearInterval(timer);raccoonOauth.dispose();await discovery.stop();await updates.close();await refreshFlight;for(const {resolve,timer}of ackWaiters.values()){clearTimeout(timer);resolve({ack:false});}ackWaiters.clear();await events.close();for(const reset of originals)reset();}};
 }
 

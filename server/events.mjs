@@ -3,7 +3,7 @@ import {normalizeBalanceUnit} from './units.mjs';
 
 export const EVENT_TYPES=Object.freeze(['checkin.failed','credential.expiring','balance.low','relay.triggered','request.failure_streak','update.available']);
 const TITLES={'checkin.failed':'签到失败','credential.expiring':'登录凭据即将过期','balance.low':'余额低于预留线','relay.triggered':'已触发模型接力','request.failure_streak':'连续 3 次请求失败','update.available':'积分中枢有新版本'};
-const STATE_KEY='credit-hub:events:v1',DAY=86400000,MAX_OUTBOX=256,MAX_SEEN=2048,MAX_RECENT=40;
+const STATE_KEY='credit-hub:events:v1',DAY=86400000,OAUTH_WARN_DAYS=7,MAX_OUTBOX=256,MAX_SEEN=2048,MAX_RECENT=40;
 const finite=v=>typeof v==='number'&&Number.isFinite(v),number=(v,fallback,min,max)=>finite(v)?Math.max(min,Math.min(max,v)):fallback;
 const hash=v=>createHash('sha256').update(String(v)).digest('hex');
 const instant=v=>v instanceof Date?v.getTime():typeof v==='number'?v:Date.parse(v);
@@ -102,12 +102,23 @@ export function createEventRouter({ledger,settings={},now=Date.now,fetch:fetcher
       // reset the edge, otherwise an expired cache would create repeated alerts.
       if(fresh&&supported)edge('balance:'+opaque('account',id),low,()=>({...context(id),type:'balance.low',id:'balance:'+id+':'+row.checkedAt,data:{value:row.value,total,unit:row.unit,threshold:config.balanceThreshold.credits,thresholdPercent:config.balanceThreshold.percent}}));
     }
+    // N10: a web-authorized credential gets exactly ONE durable channel event —
+    // the seven-day heads-up. The 3/1/expired stages stay inline in
+    // `status.renewalLevel`, so a renewing account cannot flood the inbox. The
+    // dedupe key keeps its existing shape, so no new event type is introduced.
+    for(const row of list(credentials)){
+      if(row.authKind!=='oauth_iam')continue;
+      const id=accountKey(row),expiry=instant(row.expiresAtMs??row.expiresAt??row.credentialExpiresAt);
+      if(!Number.isFinite(expiry))continue;
+      edge('credential:'+opaque('account',id),expiry-at<=OAUTH_WARN_DAYS*DAY&&expiry>at,()=>({...context(id),type:'credential.expiring',id:'credential:'+id+':'+expiry,data:{expiresAt:new Date(expiry).toISOString(),remainingDays:Math.max(0,Math.ceil((expiry-at)/DAY)),reasonCode:'raccoon_oauth_expiring'}}));
+    }
     // Only platforms with no renewal path (Loomy) are announced. A credential
     // that renews itself is never escalated: its expiry hint would just be noise.
     for(const row of list(credentials)){
+      if(row.authKind==='oauth_iam')continue;
       if(row.renewable!==false)continue;
       const id=accountKey(row),expiry=instant(row.expiresAtMs??row.expiresAt??row.credentialExpiresAt),known=Number.isFinite(expiry);
-      if(known)edge('credential:'+opaque('account',id),expiry-at<=config.credentialWarnDays*DAY,()=>({...context(id),type:'credential.expiring',id:'credential:'+id+':'+expiry,data:{expiresAt:new Date(expiry).toISOString(),remainingDays:Math.max(0,(expiry-at)/DAY)}}));
+      if(known)edge('credential:'+opaque('account',id),expiry-at<=config.credentialWarnDays*DAY,()=>({...context(id),type:'credential.expiring',id:'credential:'+id+':'+expiry,data:{expiresAt:new Date(expiry).toISOString(),remainingDays:Math.max(0,Math.ceil((expiry-at)/DAY))}}));
     }
     // A provider that has no renewal path at all (Loomy) can only be repaired by
     // logging in again. Announce it as soon as its session is known to be gone,

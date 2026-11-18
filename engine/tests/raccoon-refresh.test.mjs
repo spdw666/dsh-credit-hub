@@ -21,3 +21,27 @@ test('a new native login is not blocked by another source cooldown',async t=>{co
 test('same-identity newer native access token recovers a daemon after an unknown refresh result without replay',async t=>{const f=await fixture(t);let posts=0;const opts={...f,now,fetchImpl:async()=>{posts++;throw Error('network unknown')}};await assert.rejects(resolveRaccoonNativeAuth(f.file,opts),{code:'raccoon_refresh_unconfirmed'});const newNative={...old,access_token:jwt()};await writeFile(f.file,JSON.stringify(newNative));const c=await resolveRaccoonNativeAuth(f.file,opts);assert.equal(c.accessToken,newNative.access_token);assert.equal(posts,1);});
 
 test('source changed by native client during lock acquisition cancels refresh and next resolve recovers',async t=>{const fs=await import('node:fs/promises');const {syncBuiltinESMExports}=await import('node:module');const f=await fixture(t);const originalOpen=fs.default.open;let posts=0;fs.default.open=async(path,...args)=>{const lock=await originalOpen(path,...args);if(path===f.cacheFile+'.lock')await writeFile(f.file,JSON.stringify(fresh));return lock};syncBuiltinESMExports();try{await assert.rejects(resolveRaccoonNativeAuth(f.file,{...f,now,fetchImpl:async()=>{posts++;return response()}}),{code:'raccoon_refresh_source_changed'});}finally{fs.default.open=originalOpen;syncBuiltinESMExports()}assert.equal(posts,0);assert.equal((await resolveRaccoonNativeAuth(f.file,{...f,now})).accessToken,fresh.access_token);});
+
+// Client 1.2.x IAM sessions store an access_token only (the client itself filters refreshToken for
+// IAM tokens), so there is nothing to rotate: resolve must stay read-only, never POST, never write
+// a cache/lock, and never reuse the access token as a refresh token.
+test('auth.json without refresh_token resolves read-only and reports refreshTokenPresent:false',async t=>{
+ const at=jwt('user',(now/1000)+3600),f=await fixture(t,{access_token:at,office_identity:'fixture-office'});let posts=0;
+ const s=await resolveRaccoonNativeAuth(f.file,{...f,now,fetchImpl:async()=>{posts++;throw Error('must not POST');}});
+ assert.equal(s.accessToken,at);assert.equal(s.refreshTokenPresent,false);assert.equal(s.reason,'raccoon_iam_no_refresh');assert.equal(s.source,'native_auth_file');assert.equal(posts,0);
+ const view=raccoonCredentialView(s);assert.equal(view.refreshTokenPresent,false);assert.equal(view.renewal.reason,'raccoon_iam_no_refresh');assert.equal(view.renewal.mode,'read_only_until_expiry');
+ assert.ok(!JSON.stringify(view).includes(at));assert.ok(!JSON.stringify(view).includes(at.slice(0,24)));
+ await assert.rejects(readFile(f.cacheFile),{code:'ENOENT'});await assert.rejects(readFile(f.cacheFile+'.lock'),{code:'ENOENT'});
+});
+
+test('expired native auth without any refresh token fails fast with one readable code',async t=>{
+ const at=jwt('user',(now/1000)-60),f=await fixture(t,{access_token:at,office_identity:'fixture-office'});let posts=0;
+ await assert.rejects(resolveRaccoonNativeAuth(f.file,{...f,now,fetchImpl:async()=>{posts++;throw Error('must not POST');}}),error=>{
+  assert.equal(error.code,'raccoon_refresh_needs_login');assert.equal(error.status,401);assert.equal(error.loginRequired,true);
+  assert.equal(error.refreshTokenPresent,false);assert.equal(error.reason,'raccoon_iam_no_refresh');
+  assert.match(error.message,/只读复用至 \d{4}-\d{2}-\d{2}/);assert.ok(!error.message.includes(at.slice(0,24)));return true;});
+ assert.equal(posts,0);
+ await assert.rejects(readFile(f.cacheFile),{code:'ENOENT'});await assert.rejects(readFile(f.cacheFile+'.lock'),{code:'ENOENT'});
+ // explicit read-only resolution keeps returning the expired native credential unchanged
+ assert.equal((await resolveRaccoonNativeAuth(f.file,{...f,now,refresh:false})).accessToken,at);
+});

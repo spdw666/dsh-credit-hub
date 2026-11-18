@@ -50,8 +50,8 @@ const discoveryState = row => ({ connected: '已接入', added: '已接入', imp
 
 export function DiscoveryPanel({ snapshot, busy, perform }) {
   const state = object(operations(snapshot).discovery), current = settingsFor(snapshot, 'discovery');
-  const form = useDraft({ enabled: current.enabled ?? false, autoEnableRoutes: current.autoEnableRoutes ?? true, fetchModels: current.fetchModels ?? true, intervalSeconds: current.intervalSeconds ?? 60 });
-  const rows = list(state.candidates), id = useId();
+  const form = useDraft({ enabled: current.enabled ?? false, autoEnableRoutes: current.autoEnableRoutes ?? true, fetchModels: current.fetchModels ?? true, raccoonDesktopReuse: current.raccoonDesktopReuse === true, intervalSeconds: current.intervalSeconds ?? 60 });
+  const rows = list(state.candidates), webAuthorized = list(state.oauthRoutes), id = useId();
   const save = () => { const fresh = form.guard.capture(); return perform('保存 Agent 自动发现', post('/hub/operations', { discovery: { ...form.draft, intervalSeconds: Number(form.draft.intervalSeconds) } }), () => { if (fresh()) form.saved(); }); };
   return <section aria-label="Agent 自动发现与接入">
     <h2>后装 Agent 自动接入</h2>
@@ -60,10 +60,12 @@ export function DiscoveryPanel({ snapshot, busy, perform }) {
       <span>发现方式</span><Check checked={form.draft.enabled} disabled={busy} onChange={enabled => form.update({ enabled })}>启用后台自动发现</Check>
       <span>模型目录</span><Check checked={form.draft.fetchModels} disabled={busy} onChange={fetchModels => form.update({ fetchModels })}>接入后获取上游模型目录</Check>
       <span>模型路由</span><Check checked={form.draft.autoEnableRoutes} disabled={busy} onChange={autoEnableRoutes => form.update({ autoEnableRoutes })}>自动启用新发现的模型路由</Check>
+      <span>桌面客户端</span><Check checked={form.draft.raccoonDesktopReuse} disabled={busy} onChange={raccoonDesktopReuse => form.update({ raccoonDesktopReuse })}>复用本机小浣熊桌面客户端登录态（默认关闭，推荐改用网页授权）</Check>
       <Field label="检查间隔（秒）" id={`${id}-interval`}><input id={`${id}-interval`} type="number" min="10" max="86400" value={form.draft.intervalSeconds} disabled={busy} onChange={event => form.update({ intervalSeconds: event.target.value })}/></Field>
       <div className="credit-hub__wide credit-hub__toolbar"><Action primary disabled={busy || !form.dirty || !Number.isInteger(Number(form.draft.intervalSeconds)) || Number(form.draft.intervalSeconds) < 10 || Number(form.draft.intervalSeconds) > 86400} onClick={save}>保存发现设置</Action><Action disabled={busy || state.scanning} onClick={() => perform('扫描并接入新 Agent', post('/hub/discovery', { connect: true }))}>{state.scanning ? '正在扫描接入…' : '立即扫描并接入'}</Action></div>
     </div>
     <p className="credit-hub__muted">{state.running ? '后台发现运行中' : '后台发现尚未运行'} · 最近检查：{when(state.scannedAt || state.checkedAt)}。接入状态与模型目录核验分开显示；没有有效登录态时，不显示为已接入。</p>
+    {webAuthorized.map(row => <p className="credit-hub__muted" key={row.accountId}>网页授权账号：{number(row.routeCount)} 条模型路由 · {({ ready: '目录已更新', error: '目录更新失败', disabled: '目录获取已关闭', needs_setup: '目录需要配置', not_requested: '尚未更新目录', upstream_missing: '缺少上游配置' })[row.catalogStatus] || show(row.catalogStatus, '目录未核验')}</p>)}
     <Rows columns={['客户端 / 平台', '接入状态', '模型路由', '说明']} rows={rows} label="Agent 发现结果" empty="尚无发现记录。开启后台发现或点击“立即扫描并接入”，后装客户端会在下一轮检查。">{rows.map((row, index) => <tr key={row.id || `${row.platform}-${index}`}><td><span className="credit-hub__cell-main">{show(row.label, row.platform || '客户端')}</span><span className="credit-hub__cell-detail">{show(row.platform)}</span></td><td>{discoveryState(row)}{row.accountId && <span className="credit-hub__cell-detail">已建立独立账号</span>}</td><td>{Number.isFinite(row.routeCount) ? `${number(row.routeCount)} 条` : '尚无目录'}<span className="credit-hub__cell-detail">{({ ready: '目录已更新', cached: '使用缓存目录', error: '目录更新失败', failed: '目录更新失败', disabled: '目录获取已关闭', needs_setup: '目录需要配置', pending: '等待目录更新', not_requested: '尚未更新目录' })[row.catalogStatus] || show(row.catalogStatus, '目录未核验')}</span></td><td><span className="credit-hub__cell-detail">{show(row.reason || row.catalogReason, '—')}</span></td></tr>)}</Rows>
   </section>;
 }
@@ -261,4 +263,18 @@ export function SchedulerControls({ snapshot, busy, perform }) {
   </section>;
 }
 
-export function OperationsSettings(props) { return <><DiscoveryPanel {...props}/><NotificationSettings {...props}/><UpdatePanel {...props}/></>; }
+export function RaccoonOAuthSettings({ snapshot, busy, perform }) {
+  const current = settingsFor(snapshot, 'raccoonOauth'), form = useDraft({ enabled: current.enabled ?? true });
+  const enabled = form.draft.enabled;
+  return <section aria-label="小浣熊网页授权">
+    <h2>小浣熊网页授权</h2>
+    <p className="credit-hub__muted">开启后，账户面板提供浏览器授权与粘贴授权码两种入口，用于网页授权账号的首登与一键续期。关闭后两个入口全部隐藏，桌面客户端的只读复用不受影响。该流程是第三方自行实现厂商登录页，未获厂商背书；服务条款是否许可、账号风险由你自行判断并承担。</p>
+    <div className="credit-hub__form">
+      <span>授权入口</span><Check checked={enabled} disabled={busy} onChange={value => form.update({ enabled: value })}>启用网页授权登录与续期</Check>
+      <div className="credit-hub__wide credit-hub__toolbar"><Action primary disabled={busy || !form.dirty} onClick={() => perform('保存小浣熊网页授权设置', post('/hub/operations', { raccoonOauth: { enabled: form.draft.enabled } }), () => form.saved())}>保存网页授权设置</Action></div>
+    </div>
+    <p className="credit-hub__muted">{enabled ? '续期需要你在浏览器中确认，通常一次点击；浏览器会话过期时需要重新登录。' : '网页授权入口已关闭；已存在的网页授权账号凭据不会被删除。'}</p>
+  </section>;
+}
+
+export function OperationsSettings(props) { return <><DiscoveryPanel {...props}/><RaccoonOAuthSettings {...props}/><NotificationSettings {...props}/><UpdatePanel {...props}/></>; }

@@ -4,7 +4,7 @@ import {join,dirname} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {randomBytes} from 'node:crypto';
 import {attachRuntimeMemory} from './memory.mjs';
-import {PLUGIN_VERSION,MAX_RPC_BYTES,assertIsolatedConfig,assertCredentialIsolation,boundedPublic,publicAccount,hubError,normalizeOptions,requireWithin,createHandleMaps,translateIds,validateEngineRoot} from './contracts.mjs';
+import {PLUGIN_VERSION,MAX_RPC_BYTES,assertIsolatedConfig,assertCredentialIsolation,boundedPublic,publicAccount,hubError,normalizeOptions,requireWithin,createHandleMaps,translateIds,validateEngineRoot,operationPaths} from './contracts.mjs';
 import {isAccountExportRequest,validateAccountExportRequest,engineAccountExportResponse} from './transfer.mjs';
 import {createHubOperations} from './operations.mjs';
 import {schedulerActivation,shouldStartScheduler} from './scheduler-activation.mjs';
@@ -18,7 +18,7 @@ process.env.AI_CREDIT_MEMORY=options.memoryRoot;
 delete process.env.ELECTRON_RUN_AS_NODE;delete process.env.NODE_OPTIONS;delete process.env.DSH_DESKTOP_NODE_EXECUTABLE;
 let service,listener,closing=false,workerReady=false,coreVersion,buildActivityContext,privateAdminKey,stopMemory,operations,cleanupFlight=Promise.resolve();
 const maps=()=>createHandleMaps(service.config.value);
-const publish=value=>boundedPublic(translateIds(value,maps()));
+const publish=(value,allow=null)=>boundedPublic(translateIds(value,maps()),allow);
 const send=message=>{if(process.connected)process.send?.(message);};
 const problem=error=>({code:error.code??'hub_worker_error',message:error.message??'Worker operation failed',status:error.status??500});
 function defaultConfig(){return {schemaVersion:1,dataDir:'./data',server:{host:'127.0.0.1',port:0,allowRemote:false,requestTimeoutMs:180000,bodyLimitBytes:67108864},scheduler:{enabled:false,startup:false,timezone:'Asia/Shanghai',hour:10,minute:0,jitterSeconds:600,retryMinutes:60},workbuddy:{autoMigrateSessions:false,autoTasks:false},clientUpdates:{enabled:false},accounts:[],upstreams:[],routes:[]};}
@@ -33,7 +33,7 @@ async function mutate(operation,body){
   if(!body||typeof body!=='object'||Array.isArray(body))throw hubError('invalid_management_body','An object is required');
   if(operation==='/hub/accounts/remove'){
     if(Object.keys(body).some(k=>!['accountId','confirm'].includes(k))||typeof body.accountId!=='string')throw hubError('invalid_account_delete','accountId and confirm are required');
-    return removeHubAccount(service,body.accountId,{confirm:body.confirm,taskRoot:options.taskRoot,resolvePrincipal:account=>probeIsolatedCredential(account,{engineRoot:options.engineRoot,dataDir:service.config.dataDir,allowExpired:true})});
+    return removeHubAccount(service,body.accountId,{confirm:body.confirm,taskRoot:options.taskRoot,stateRoot:options.stateRoot,resolvePrincipal:account=>probeIsolatedCredential(account,{engineRoot:options.engineRoot,dataDir:service.config.dataDir,allowExpired:true})});
   }
   const value=structuredClone(service.config.value);
   if(operation==='/hub/scheduler'){
@@ -54,7 +54,20 @@ async function mutate(operation,body){
   await service.config.save(value);service.credentials.cache.clear();service.platforms.catalogs.clear();return {saved:true,account:accountView(account,value.accounts.indexOf(account))};
 }
 async function localRequest(request){
-  if(['/hub/operations','/hub/discovery','/hub/updates','/hub/events','/hub/events/pending','/hub/events/ack','/hub/events/test','/hub/forecast','/hub/scheduler-status','/hub/scheduler/manual'].includes(request.pathname))return {status:200,body:publish(await operations.request({...request,body:translateIds(request.body,maps(),{toInternal:true})}))};
+  // R1–R6 of the Raccoon web-authorization surface. Every path here must also be
+  // present in contracts.mjs (GET/POST allow-lists) and operations.mjs (switch);
+  // a miss in any one of the three turns into a different visible error. The list
+  // itself is shared with the allow-lists in contracts.mjs so it cannot drift.
+  if(operationPaths.includes(request.pathname)){
+    const answer=await operations.request({...request,body:translateIds(request.body,maps(),{toInternal:true})});
+    // N1(b): the single, explicitly whitelisted exception to the `authorizeUrl`
+    // redaction. The URL carries the one-time state, so it is handed back only to
+    // the caller that asked to begin an authorization, and only while that state is
+    // still inside its validity window. Every other surface (status, overview,
+    // snapshot, logs, events, errors) keeps it stripped by publish().
+    const allow=request.pathname==='/hub/raccoon/oauth/begin'&&answer?.phase==='pending'&&Number(answer?.remainingMs)>0?['authorizeUrl']:null;
+    return {status:200,body:publish(answer,allow)};
+  }
   if(request.method==='POST')return {status:200,body:publish(await operations.withMutation(()=>mutate(request.pathname,translateIds(request.body,maps(),{toInternal:true}))))};
   const current=snapshot();let body;
   switch(request.pathname){case '/hub/accounts':body={accounts:current.accounts};break;case '/hub/routes':body={routes:current.routes};break;case '/hub/audit':body=current.audit;break;case '/hub/activity':body=buildActivityContext(service,request.query);break;case '/hub/scheduler':body={...current.schedule,running:current.schedulerRunning};break;default:body=current;}
@@ -67,7 +80,7 @@ async function managementRequest(request){
   url.pathname=url.pathname.split('/').map(part=>handles.reverse.get(part)??part).map(encodeURIComponent).join('/');
   for(const [key,value] of url.searchParams)url.searchParams.set(key,translateIds(value,handles,{toInternal:true,key}));
   const body=translateIds(request.body,handles,{toInternal:true});
-  if(request.method==='POST'&&request.pathname==='/admin/claim'&&typeof service.scheduler.manual==='function')return {status:200,body:publish(await service.scheduler.manual({accountIds:body?.accountId?[body.accountId]:body?.accountIds,taskId:body?.taskId,missingOnly:false}))};
+  if(request.method==='POST'&&request.pathname==='/admin/claim'&&typeof service.scheduler.manual==='function')return {status:200,body:publish(await service.scheduler.manual({accountIds:body?.accountId?[body.accountId]:body?.accountIds,taskId:body?.taskId,missingOnly:false,wait:false}))};
   const response=await fetch(listener.baseUrl+url.pathname+url.search,{method:request.method,headers:{Authorization:'Bearer '+privateAdminKey,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(options.requestTimeoutMs),redirect:'error'});
   let bytes=0;const chunks=[];for await(const chunk of response.body){bytes+=chunk.length;if(bytes>MAX_RPC_BYTES)throw hubError('rpc_response_too_large','Management response exceeds the 2 MiB limit',413);chunks.push(chunk);}
   let result;try{result=JSON.parse(Buffer.concat(chunks,bytes).toString('utf8'));}catch{throw hubError('invalid_worker_response','Plugin worker returned invalid JSON',502);}

@@ -72,7 +72,7 @@ export class Scheduler {
     }return result;
   }
   enqueue(row,{source='manual',dueAt=this.now(),missingOnly=false}={}){
-    const day=wallDay(this.now(),this.config.value.scheduler.timezone),id=JSON.stringify([day,row.accountId,row.task]),existing=this.pending.find(p=>p.id===id)??this.active.get(id);if(existing){if(source!=='manual'&&existing.source!=='manual'&&!this.active.has(id)){Object.assign(existing,{...row,source,dueAt});this.pending.sort((a,b)=>a.dueAt-b.dueAt||a.sequence-b.sequence);this.arm();}return existing.promise;}
+    const day=wallDay(this.now(),this.config.value.scheduler.timezone),id=JSON.stringify([day,row.accountId,row.task]),existing=this.pending.find(p=>p.id===id)??this.active.get(id);if(existing){if(source==='manual'&&!this.active.has(id)){Object.assign(existing,{...row,source:'manual',missingOnly,dueAt:this.now()});this.pending.sort((a,b)=>a.dueAt-b.dueAt||a.sequence-b.sequence);this.arm();}else if(source!=='manual'&&existing.source!=='manual'&&!this.active.has(id)){Object.assign(existing,{...row,source,dueAt});this.pending.sort((a,b)=>a.dueAt-b.dueAt||a.sequence-b.sequence);this.arm();}return existing.promise;}
     if(this.closing)return Promise.resolve({...row,status:'cancelled',reason:'scheduler_stopped'});
     let resolve;const promise=new Promise(r=>{resolve=r;}),job={...row,id,day,source,dueAt,missingOnly,sequence:++this.sequence,resolve,promise};this.pending.push(job);this.pending.sort((a,b)=>a.dueAt-b.dueAt||a.sequence-b.sequence);this.arm();return promise;
   }
@@ -105,7 +105,7 @@ export class Scheduler {
     this.arm();
     if(started.length){await Promise.all(started);if(!this.closing&&this.pending.some(p=>p.dueAt<=this.now()&&![...this.active.values()].some(a=>a.accountId===p.accountId)))await this.pump();}
   }
-  async manual({accountIds,taskId,missingOnly=true}={}){
+  async manual({accountIds,taskId,missingOnly=true,wait=true}={}){
     if(accountIds!==undefined&&(!Array.isArray(accountIds)||accountIds.length>10000||accountIds.some(id=>typeof id!=='string')))throw new TypeError('accountIds must be an array of account IDs');
     // Disabling automatic scheduling cancels its pending work, but a later
     // explicit manual request may still use the bounded queue. Service.close()
@@ -113,7 +113,7 @@ export class Scheduler {
     if(this.stopped&&this.closing&&!this.service?.workbuddyTaskJobsClosing)this.closing=false;
     const selected=accountIds?new Set(accountIds):null,candidates=this.candidates().filter(r=>(!selected||selected.has(r.accountId))&&(!taskId||r.task===taskId)),day=wallDay(this.now(),this.config.value.scheduler.timezone),attempts=this.attempts(day),skipped=[],eligible=[];
     for(const row of candidates){const a=attempts.get(JSON.stringify([row.accountId,row.task])),retryAt=automaticRetryAt(a,this.config.value.scheduler);if(missingOnly&&a&&['success','already','observed'].includes(a.status)&&(retryAt===null||this.now()<retryAt))skipped.push({...row,status:'skipped',reason:'already_completed_today'});else eligible.push(row);}
-    const requests=eligible.map(row=>this.enqueue(row,{source:'manual',missingOnly}));await this.pump();return {results:await Promise.all(requests),queued:eligible.length,skipped};
+    const requests=eligible.map(row=>this.enqueue(row,{source:'manual',missingOnly}));if(!wait){for(const request of requests)void request.catch(()=>{});void this.pump().catch(()=>{});return {accepted:true,queued:eligible.length,skipped};}await this.pump();return {results:await Promise.all(requests),queued:eligible.length,skipped};
   }
   async tick() {
     if(this.stopped||this.tickFlight)return;
@@ -149,7 +149,7 @@ export class Scheduler {
     const results=[];
     for(const account of (this.config.value.accounts??[])) {
       if(account.enabled===false)continue;
-      if(!['lobster','codebuddy','workbuddyai','qoder'].includes(account.platform))continue;
+      if(!['workbuddy','lobster','codebuddy','workbuddyai','qoder'].includes(account.platform))continue;
       const task=(account.tasks??[]).find(t=>t.id==='daily-checkin');if(!task||task.enabled===false)continue;
       const prior=credentials.renewalState?.(account.id);
       // A terminal "re-login required" verdict must not be retried every tick; only a new desktop login
@@ -161,7 +161,18 @@ export class Scheduler {
       const due=account.platform==='qoder'?(credentials.shouldRenewQoder?.(credential)??false):account.platform==='lobster'?await (await import('./provider-lobster.mjs')).shouldRenewLobster({expiresAtMs:credential.expiresAtMs})
         :(await import('./provider-buddy.mjs')).shouldRenewBuddy({expiresAtMs:credential.expiresAtMs});
       if(!due){results.push({accountId:account.id,status:'fresh',expiresAt:Number.isFinite(credential.expiresAtMs)?new Date(credential.expiresAtMs).toISOString():null});continue;}
-      try { const renewed=account.platform==='qoder'?await credentials.renewQoder(account,{trigger:'schedule'}):await credentials.renewDesktopSession(account,{trigger:'schedule'});results.push({accountId:account.id,status:'renewed',expiresAt:Number.isFinite(renewed.expiresAtMs)?new Date(renewed.expiresAtMs).toISOString():null}); }
+      try {
+        let renewed;
+        if(account.platform==='workbuddy'){
+          // The gateway rotates its own snapshot; renewDesktopSession has no WB
+          // branch. A read-only snapshot (native file) leaves the tokens untouched,
+          // which is reported as not_renewable instead of a false success.
+          renewed=await credentials.read(account,{renew:true});
+          const rotated=renewed&&(renewed.accessToken!==credential.accessToken||renewed.refreshToken!==credential.refreshToken);
+          if(!rotated){results.push({accountId:account.id,status:'not_renewable',code:'wb_refresh_unavailable'});continue;}
+        } else renewed=account.platform==='qoder'?await credentials.renewQoder(account,{trigger:'schedule'}):await credentials.renewDesktopSession(account,{trigger:'schedule'});
+        results.push({accountId:account.id,status:'renewed',expiresAt:Number.isFinite(renewed.expiresAtMs)?new Date(renewed.expiresAtMs).toISOString():null});
+      }
       catch (error) { results.push({accountId:account.id,status:error.loginRequired===true?'login_required':'error',code:error.code??'renew_failed'}); }
     }
     if(results.length)this.ledger.set('credential-renewal-last',{at:new Date(now).toISOString(),results});
