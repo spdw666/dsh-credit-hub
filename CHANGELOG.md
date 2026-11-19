@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.3
+
+Stop a client-update regression from depending on the machine it runs on. The
+Trae manifest case called `fetchLatestVersion({latest:{type:'trae'}})` without
+ids, so it read the desktop client's `storage.json` — present on a developer
+box, absent on every CI runner, where it failed with `ENOENT` and turned the
+whole engine suite red.
+
+- The case now passes explicit `mid`/`did`, which the product path already
+  supports, so it still pins the manifest parse and the request parameters.
+- A new case covers the host-dependent branch honestly: with a roaming
+  directory that has no `storage.json`, `traeUpdateIdentity` must name the exact
+  path it could not read instead of inventing identifiers.
+- Verified with an empty `APPDATA`/`LOCALAPPDATA`, i.e. the CI shape: 14 pass.
+- No runtime change; 0.3.2's probe removal stands.
+
 ## 0.3.2
 
 Remove a local debug probe that shipped with 0.3.1. `engine/src/server.mjs`

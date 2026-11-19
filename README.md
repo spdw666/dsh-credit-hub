@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.2**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.3**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 

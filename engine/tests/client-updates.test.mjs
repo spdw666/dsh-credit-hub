@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {
   compareVersions, parseLatestYml, fieldValue, normalizeClientUpdates,
   readInstalledVersion, fetchLatestVersion, checkTarget, runClientUpdateCheck,
-  clientUpdateDue, mergeTargets
+  clientUpdateDue, mergeTargets, traeUpdateIdentity
 } from '../src/client-updates.mjs';
 
 test('compareVersions treats build suffixes as the same release', () => {
@@ -146,7 +146,9 @@ test('fetchLatestVersion reads official page patterns and the Trae manifest', as
   assert.equal(page.source, 'official_page');
 
   const trae = await fetchLatestVersion(
-    {latest: {type: 'trae', url: 'https://api.trae.test/check_update'}},
+    // The manifest branch is what this case pins; the desktop identity read is a
+    // host fact (it needs the client installed), so the request gets explicit ids.
+    {latest: {type: 'trae', url: 'https://api.trae.test/check_update', mid: 'SAMPLE_TRAE_MID', did: 'SAMPLE_TRAE_DID'}},
     {installed: '3.4.3', fetchImpl: okJson({data: {manifest: {win32: {version: '2.3.92182'}}}})}
   );
   assert.equal(trae.latest, '2.3.92182');
@@ -156,6 +158,19 @@ test('fetchLatestVersion reads official page patterns and the Trae manifest', as
     {latest: {type: 'text', url: 'https://z.test', regex: 'v([0-9]+)'}},
     {installed: '1', fetchImpl: textResp('nothing here')}
   ), /pattern not found/);
+});
+
+test('trae identity names the exact storage path it could not read instead of inventing ids', async () => {
+  const roaming = await mkdtemp(join(tmpdir(), 'trae-identity-'));
+  try {
+    await assert.rejects(traeUpdateIdentity({edition: 'cn', roaming}), (error) => {
+      assert.match(error.message, /Trae 本机设备标识读取失败/);
+      assert.match(error.message, /Trae CN[\\/]User[\\/]globalStorage[\\/]storage\.json/);
+      return true;
+    });
+  } finally {
+    await rm(roaming, {recursive: true, force: true});
+  }
 });
 
 test('checkTarget reports update/current/ahead/no_source/not_detected', async () => {
