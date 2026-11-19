@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+Remove a local debug probe that shipped with 0.3.1. `engine/src/server.mjs`
+appended every `/v1/chat/completions` failure to a machine-local path while
+handling the request; on any host without that directory the append threw
+`ENOENT`, which replaced the real upstream error and failed 32 engine
+regressions in CI. The probe wrote a private path into the published package,
+so no runtime behaviour is kept from it.
+
+- The gateway now rethrows the original error untouched, as the release before 0.3.0 did.
+- Local single-process engine run matches the per-file run again: 1962 pass / 0 fail.
+- No other change; the 0.3.1 host adaptation (DSH 0.2.2-rc.5) and version alignment stand.
+
 ## 0.3.1
 
 Follow the host to DSH 0.2.2-rc.5. rc.4 and rc.5 change none of the official

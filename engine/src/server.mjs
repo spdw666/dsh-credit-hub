@@ -1,5 +1,4 @@
 import {balances} from './balances.mjs';
-import {appendFileSync} from 'node:fs';
 import {startModelAudit} from './model-audit.mjs';
 import {restartDsh} from './dsh-control.mjs';
 import {captureWorkBuddyAccount,configureWorkBuddyPool} from './workbuddy-pool.mjs';
@@ -201,7 +200,7 @@ export async function startServer(service,{host,port,key,adminKey,admin=true,onS
             if(!res.write(`data: ${JSON.stringify(chunk)}\n\n`))await waitForResponseDrain(res,controller.signal);
           }
           res.end('data: [DONE]\n\n');served=true;return;
-        }catch(e){if(controller.signal.aborted&&controller.signal.reason?.name==='TimeoutError')throw new AppError('Gateway request deadline exceeded',504,'request_timeout');appendFileSync('D:/CodexHome/Temp/dbprobe/chatfail.log', JSON.stringify({model:body?.model,tools:body?.tools?.length??0,msgs:body?.messages?.length??0,stream:body?.stream===true,code:e?.code,status:e?.status,msg:String(e?.message||'').slice(0,300)})+'\n');throw e;}finally{clearTimeout(timeout);controllers.delete(controller);res.off('close',disconnect);lease?.finish({success:served});}
+        }catch(e){if(controller.signal.aborted&&controller.signal.reason?.name==='TimeoutError')throw new AppError('Gateway request deadline exceeded',504,'request_timeout');throw e;}finally{clearTimeout(timeout);controllers.delete(controller);res.off('close',disconnect);lease?.finish({success:served});}
       }
       throw new AppError('Endpoint not found',404,'not_found');
     }catch(e){const error=errorView(e),retry=[429,503,504].includes(error.status)&&Number.isFinite(e.retryAfterSeconds)&&e.retryAfterSeconds>=0&&e.retryAfterSeconds<=86400?{retryAfterSeconds:e.retryAfterSeconds}:{};const metadata=rateLimitMetadata(e);if(![429,503,504].includes(error.status)){delete metadata.retryAfterSeconds;delete metadata.retryAfterSource;}const payload={message:error.message,type:error.code,code:error.code,...retry,...metadata,...zcodeFailureMetadata(e),...gatewayFailureContract(e,requestContext),...(Number.isInteger(e.upstreamStatus)&&e.upstreamStatus>=400&&e.upstreamStatus<=599?{upstreamStatus:e.upstreamStatus}:{})};if(res.destroyed)return;if(requestContext&&!res.headersSent){res.setHeader('X-AI-Credit-Retry-Owner','gateway');res.setHeader('X-Should-Retry','false');}if(res.headersSent){res.end(`event: error\ndata: ${JSON.stringify({error:payload})}\n\n`);}else {if(retry.retryAfterSeconds!==undefined)res.setHeader('Retry-After',String(Math.ceil(retry.retryAfterSeconds)));json(res,error.status,{error:payload});}}
