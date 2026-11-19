@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.3.1
+
+Follow the host to DSH 0.2.2-rc.5. rc.4 and rc.5 change none of the official
+surfaces this plugin binds to: all 25 audited source paths are byte-identical to
+rc.3 (llm, typert and the pi-ai adapter included), the same 18 seams and sidebar
+slot contract hold, and both releases vendor the same cordis 4.1.0 /
+schemastery 3.19.0 / loader 1.1.0 / pi-ai 1.3.0 mix. So this release moves the
+audited host range, the matrix, the pinned SDK, CI and the version only.
+
+- Add audited DSH 0.2.2-rc.4 and 0.2.2-rc.5 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.
+- Extend the official source/module contract matrix to 40 tags and run the real Typert, LLM and PiAiAdapter contracts at both fixed tags (context 1000000, retry 1, tools and the 64000-token budget intact).
+- Pin rc.4/rc.5 to the same vendored mix as rc.1–rc.3, keep all seven modern peer packages, and make rc.5 the default development SDK. CI adds two Node 24.21.0 jobs while the Node 22.23.3 jobs stay on the 0.2.1 line.
+- **Fix the 0.3.0 version split**: 0.3.0 moved `package.json`/`release.json` but left `PLUGIN_VERSION`, `package-lock.json`, the README banner and two test assertions at 0.2.10, so `release.test.mjs` failed and the shipped package reported itself as 0.2.10 while advertising 0.3.0 (the update monitor therefore kept offering 0.3.0 to 0.3.0). All five places now move together.
+- No plugin runtime change: no adapter, worker, server or client logic moved in this release.
+
+## 0.3.0
+
+Bring the engine up to the upstream gateway's 2026-11-18 fixes. The engine had
+forked from the shared baseline on 2026-10-18 and had taken no upstream fix
+since; this release closes that gap. Everything below was re-verified against
+the plugin's own suites (engine 1962/0, plugin 226/0).
+
+- Full-capability OpenCode bridge. The adapter was a text-only bridge; it now
+  carries a tool contract, a bounded prompt budget (400000 chars), a 300 s
+  session deadline, image parts and `parseToolCalls`, and absorbs
+  `stream_options`/`store` transport controls instead of forwarding them.
+- Reasoning-effort projection for Qoder, CodeArts, Lobster and Raccoon:
+  `thinking_config` and the native effort tables are surfaced as
+  `reasoningEfforts`, so a caller can select a native thinking level.
+- Five-stage model audit. The audit gained an `output` stage (single-line
+  1..200 sequence plus a closing sentence, ≥600 body chars) between `stream`
+  and `tools`; the OpenCode audit deadline moved 120 s → 300 s to match.
+- Error attribution rebuilt. `transport-failure.mjs` classifies phase, code and
+  timeout origin; `workbuddy-channel.mjs` attributes WorkBuddy channel skips;
+  `usage` records `upstreamResponseReceived` so a retry decision can tell "no
+  response" from "partial response".
+- Daily reconciliation declarations. `platforms` now asks each provider
+  whether it declares a repeatable initialization for the exact task, and
+  `claims` fences a retry on that single answer instead of optimistically
+  re-posting. Raccoon's native GET chain and Loomy's idempotent first login
+  declare it; reward POSTs do not.
+- Claim outcomes carry `retryable` and `beforeSubmission` explicitly: only a
+  failure that provably happened before any write may be retried, an
+  unconfirmed write is never a retry cue, and a rejected credential is
+  `action_required` rather than retryable.
+- MiniMax desktop discovery uses a per-instance lease, so two instances no
+  longer contend for one runtime directory.
+- Credential isolation preserved. Qoder keeps explicit `profileDir`/`localState`
+  overrides, CodeArts keeps explicit `localState`/`cacheFile` and a per-source
+  refresh flight, Raccoon keeps an explicit `cacheFile`; the upstream versions
+  had dropped these and would have read a machine-wide path instead.
+- ZCode's blocked-upstream contract is preserved on the new HTTP layer, and the
+  `/v1/models` catalog keeps its field whitelist and https-only source URLs.
+- Video check-in providers are not part of this package. Three small shims
+  answer the "is this a video receipt" question for every shipped platform so
+  the balance and claim paths stay unchanged; replace them with the upstream
+  implementations if those providers are ever added here.
+
 ## 0.2.10
 
 - Add audited DSH 0.2.2-rc.3 to the exact optional host SDK peer ranges; preserve every previously audited prerelease.

@@ -37,15 +37,17 @@ test('Lobster status exposes active and credits to the generic scheduled claim c
   const status = await lobsterStatus(secret, 'daily-checkin', fixture);
   assert.equal(status.known, true);
   assert.equal(status.claimable, true);
-  assert.equal(status.active, true);
-  assert.equal(status.credits, 100);
+  assert.equal(status.lifecycleState, 'active');
+  assert.equal(status.authenticated, true);
+  assert.equal(status.rewardCredits, 100);
   assert.equal(fixture.posts(), 0);
 });
 for (const [name, state] of [['inactive', {lifecycleState: 'ended'}], ['login required', {authenticated: false}], ['no official action', {offered: false}]]) {
   test(`Lobster ${name} is not an automatic claim invitation`, async () => {
     const fixture = lobsterFixture(state);
     const status = await lobsterStatus(secret, 'daily-checkin', fixture);
-    assert.equal(status.active, false);
+    // The invitation gate is claimable, not lifecycleState: an ended activity, a
+    // rejected login and an absent official action all fail it independently.
     assert.equal(status.claimable, false);
     await lobsterClaimCheckin(secret, 'daily-checkin', fixture);
     assert.equal(fixture.posts(), 0);

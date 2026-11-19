@@ -16,6 +16,7 @@ import {desktopSseResponse,desktopCompletionLimit} from './provider-sse.mjs';
 //    `event:error` with HTTP 200 (converted to AppError here); delta.reasoning_content is INCREMENTAL.
 import {AppError, redact, hash, rememberSecret, dayIn} from './util.mjs';
 import {readFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 
 const thinkingProfiles = new Map();
 const REASONING_LEVEL_ORDER = ['minimal','low','medium','high','xhigh','max'];
@@ -233,7 +234,13 @@ export async function lobsterFetch(fetchImpl, url, {method = 'GET', headers = {}
     return await fetchImpl(url, {method, headers, body, redirect: 'error', signal: activeSignal});
   } catch (e) {
     if (activeSignal.aborted || e?.name === 'AbortError') throw new AppError('LobsterAI 请求已取消或超时', 499, 'request_cancelled');
-    throw new AppError('LobsterAI 官方接口连接失败或超时', 503, 'lobster_network_error');
+    const error = new AppError('LobsterAI 官方接口连接失败或超时', 503, 'lobster_network_error');
+    // A failed read provably happened before any write, so the scheduler may retry
+    // it. A failed POST may have landed upstream and must stay non-retryable until
+    // the next status read reconciles it - the scheduler keys its retry decision on
+    // this flag, so it cannot be inferred from the error code alone.
+    if (method === 'GET') error.beforeSubmission = true;
+    throw error;
   }
 }
 
@@ -298,6 +305,51 @@ async function lobsterRequest(secret, {method = 'GET', path, query, body, fetchI
  * a conservative `maxTokens` marked `maxTokensSource:'configured_default'` (never claimed as official).
  * `supportsToolCalling` is null upstream on every observed entry → tools:false rather than a guess.
  */
+// Version-pinned metadata declaration from the installed official native client.
+// This is the native registry's exact-ID fallback for LobsteraiServer, not a
+// service-advertised capacity. No runtime options or local config can extend it.
+const NATIVE_CONTEXT_EVIDENCE = Object.freeze({
+  source: 'native_client_registry',
+  nativeVersion: '2026.10.23',
+  artifactSha256: '9e64675081a5e9c689b35672ee864ab878df4c88c3bb177ea08dab11b028a7f6',
+  member: 'dist-electron/shared/providers/constants.js',
+  memberSha256: '9050623fcc7ac0a3eba6ac246fa502e56a8fd69a621e873d28d76d25a2534643',
+  sourceUrl: 'https://github.com/netease-youdao/LobsterAI/blob/main/src/shared/providers/constants.ts',
+});
+const NATIVE_CONTEXT_WINDOWS = Object.freeze({
+  'MiniMax-M2.7': 204800,
+  'qwen3.6-plus': 1000000,
+  'kimi-k2.6': 262144,
+  'kimi-k2.5': 262144,
+  'glm-5.1': 202800,
+  'glm-5': 202800,
+});
+// Exact snapshot declaration by the model manufacturer; this is not a Lobster
+// service-advertised capacity or a generic family/default limit.
+const MANUFACTURER_CONTEXT_EVIDENCE = Object.freeze({
+  source: 'manufacturer_documentation',
+  modelId: 'qwen3.5-plus-2026-04-20',
+  manufacturer: 'Alibaba Cloud Model Studio',
+  sourceUrl: 'https://www.alibabacloud.com/help/en/model-studio/qwen3-5-plus',
+  contentSha256: '11655aaaec6367d0c109629280f21de0bf9d0b2f5aa75a079281690039abe063',
+  textSha256: 'd84a5b3c1cc5a895c02ba0c513bea91542fae079810cf5e2165bed28ffd7ace2',
+  section: 'Snapshot Versions / qwen3.5-plus-2026-04-20 / Context Limits',
+  capturedAt: '2026-10-25T12:59:42.876Z',
+  declaredContextWindow: 1000000,
+});
+// Exact third-party client registry declaration. This is neither a Lobster
+// service capacity nor a model-manufacturer declaration; retain its own source.
+const CLIENT_MODEL_CONTEXT_EVIDENCE = Object.freeze({
+  source: 'client_model_registry',
+  client: 'Hermes',
+  modelId: 'glm-5v-turbo',
+  sourceUrl: 'https://github.com/NousResearch/hermes-agent/blob/4bc2efbeb37ac459ee502a76c4e73e1829a033ea/agent/model_metadata.py#L335',
+  sourceCommit: '4bc2efbeb37ac459ee502a76c4e73e1829a033ea',
+  sourceFile: 'agent/model_metadata.py',
+  sourceSha256: '497f2342915b0c7f23e56c2ec7e191a122d6255a6d12e660e570a4013895ab3d',
+  registryConstant: 'DEFAULT_CONTEXT_LENGTHS',
+  declaredContextWindow: 202752,
+});
 export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signal, timeoutMs = 30000} = {}) {
   if (typeof fetchImpl !== 'function') throw new AppError('LobsterAI 网络请求需要显式注入 fetchImpl', 400, 'lobster_fetch_not_injected');
   if (!secret?.accessToken) throw new AppError('LobsterAI 凭据不可用', 401, 'lobster_credential_missing');
@@ -308,7 +360,14 @@ export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signa
   return list.map(entry => {
     const id = typeof entry?.modelId === 'string' && entry.modelId ? entry.modelId : null;
     if (!id) return null;
-    const contextWindow = Number.isSafeInteger(entry.contextWindow) && entry.contextWindow > 0 ? entry.contextWindow : null; // official fact when present
+    const officialContextWindow = Number.isSafeInteger(entry.contextWindow) && entry.contextWindow > 0 ? entry.contextWindow : null;
+    // Only absent/null metadata uses the pinned native exact-ID declaration.
+    // An explicit malformed/zero/negative value stays unknown, not a fallback.
+    const nativeContextWindow = entry.contextWindow == null && Object.hasOwn(NATIVE_CONTEXT_WINDOWS, id) ? NATIVE_CONTEXT_WINDOWS[id] : null;
+    const manufacturerContextWindow = entry.contextWindow == null && id === MANUFACTURER_CONTEXT_EVIDENCE.modelId ? MANUFACTURER_CONTEXT_EVIDENCE.declaredContextWindow : null;
+    const clientModelContextWindow = entry.contextWindow == null && id === CLIENT_MODEL_CONTEXT_EVIDENCE.modelId ? CLIENT_MODEL_CONTEXT_EVIDENCE.declaredContextWindow : null;
+    const contextWindow = officialContextWindow ?? nativeContextWindow ?? manufacturerContextWindow ?? clientModelContextWindow;
+    const contextWindowSource = officialContextWindow !== null ? 'official_catalog' : nativeContextWindow !== null ? 'native_client_registry' : manufacturerContextWindow !== null ? 'manufacturer_documentation' : clientModelContextWindow !== null ? 'client_model_registry' : null;
     const thinkingOptions = Array.isArray(entry?.thinkingConfig?.options) ? entry.thinkingConfig.options.map(o => o?.level).filter(v => typeof v === 'string') : [];
     thinkingProfiles.set(id,thinkingOptions);
     const accessible = entry?.accessible !== false;
@@ -316,6 +375,9 @@ export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signa
       id,
       name: typeof entry?.modelName === 'string' && entry.modelName ? entry.modelName : id,
       contextWindow,
+      officialContextWindow,
+      contextWindowSource,
+      ...(nativeContextWindow !== null ? {contextWindowEvidence: NATIVE_CONTEXT_EVIDENCE} : manufacturerContextWindow !== null ? {contextWindowEvidence: MANUFACTURER_CONTEXT_EVIDENCE} : clientModelContextWindow !== null ? {contextWindowEvidence: CLIENT_MODEL_CONTEXT_EVIDENCE} : {}),
       maxTokens: CONFIGURED_OUTPUT_TOKENS,
       maxTokensSource: 'configured_default',
       officialMaxTokens: null,
@@ -325,6 +387,10 @@ export async function lobsterModels(secret, {fetchImpl = globalThis.fetch, signa
       multimodal: entry?.supportsImage === true,
       reasoning: null, isReasoning:entry?.supportsThinking===true,
       reasoningOptions: thinkingOptions,
+      // router.mjs 只认 reasoningEfforts / reasoning.supportedEfforts 两种形态，
+      // 上游真实 level 不投影过去，对外就永远显示"无思考档"（2026-11-17 实测：
+      // deepseek-flash 的 thinkingConfig.options 确实声明了 off/high/max）。
+      ...(thinkingOptions.length ? {reasoningEfforts: Object.fromEntries(thinkingOptions.map(level => [level, level]))} : {}),
       reasoningEffortMapping: lobsterReasoningMapping(thinkingOptions),
       reasoningMappingSource: "gateway_aliases_of_official_options",
       reasoningDefault: typeof entry?.thinkingConfig?.defaultLevel === 'string' ? entry.thinkingConfig.defaultLevel : null,
@@ -453,25 +519,29 @@ export async function lobsterStatus(secret, task = 'daily-checkin', options = {}
     configRevision: slot.present ? slot.activity.configRevision : null,
     lifecycleState: context?.lifecycleState ?? null,
     authenticated: context?.authenticated ?? null,
-    // ClaimService gates the scheduler on `active`, not the UI's `claimable`.
-    // Keep both bound to the current official action, never just slot presence.
-    active: known && isClaimable(context),
     claimable: known && isClaimable(context),
     claimed: context?.state?.claimedToday === true || context?.state?.completed === true,
     claimedToday: context?.state?.claimedToday ?? null,
     claimedDays: context?.state?.claimedDays ?? null,
     rewardCredits: context?.state?.rewardCredits ?? null,
-    credits: context?.state?.rewardCredits ?? null,
     claimedCredits: context?.state?.claimedCredits ?? null,
     actionsOffered: context?.actions ?? [],
     day: dayIn(new Date(), 'Asia/Shanghai'),
     source: '/api/client-activities/slot+context',
+    // Compatibility projections for the generic scheduled-claim contract, which
+    // gates on `active` and reads `credits` for its receipt. `claimable` is the
+    // authoritative predicate; these two restate it in the older vocabulary so a
+    // provider that stopped emitting them is not silently judged inactive.
+    active: known && isClaimable(context),
+    credits: context?.state?.rewardCredits ?? null,
   };
 }
 
 function idempotencyKey(activityCode) {
-  const suffix = Math.random().toString(16).slice(2).padEnd(16, '0');
-  return `ai-credit-${activityCode}-${Date.now().toString(36)}-${suffix}`.slice(0, 80);
+  // The shipped host validator permits only 1..64 ASCII characters. Embedding
+  // the evergreen activity code made the old key 74 characters and the server
+  // rejected the action with 51103 before any reward was granted.
+  return `ai-credit-${hash(activityCode).slice(0, 12)}-${randomUUID()}`;
 }
 
 /**
@@ -482,16 +552,16 @@ function idempotencyKey(activityCode) {
 export async function lobsterClaimCheckin(secret, task = 'daily-checkin', options = {}) {
   if (task !== 'daily-checkin') throw new AppError('LobsterAI 任务未登记', 400, 'lobster_task_unknown');
   const {fetchImpl} = options;
-  const before = await lobsterStatus(secret, task, options).catch(error => { error.beforeSubmission = true; throw error; });
+  const before = await lobsterStatus(secret, task, options);
   if (!before.known) return {...before, submitted: false, reason: 'activity_absent'};
   if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
   if (!before.claimable) return {...before, submitted: false, reason: before.authenticated === false ? 'login_required' : 'not_claimable'};
   const actionId = 'check_in';
   if (!CHECKIN_ACTION_WHITELIST.has(actionId)) throw new AppError('LobsterAI 动作不在官方白名单内', 400, 'lobster_action_rejected');
   // Fresh slot read for configRevision — never trust a stale caller-supplied revision.
-  const fresh = before.configRevision === null ? await lobsterActivitySlot(secret, options).catch(error => { error.beforeSubmission = true; throw error; }) : null;
+  const fresh = before.configRevision === null ? await lobsterActivitySlot(secret, options) : null;
   const configRevision = before.configRevision ?? fresh?.activity?.configRevision ?? null;
-  if (!Number.isSafeInteger(configRevision)) throw Object.assign(new AppError('LobsterAI 活动版本号未知，拒绝提交', 502, 'lobster_revision_unknown'), {beforeSubmission: true});
+  if (!Number.isSafeInteger(configRevision)) throw new AppError('LobsterAI 活动版本号未知，拒绝提交', 502, 'lobster_revision_unknown');
   const body = {configRevision, idempotencyKey: idempotencyKey(before.activityCode), payload: {}};
   let failure = null;
   try {
@@ -505,6 +575,10 @@ export async function lobsterClaimCheckin(secret, task = 'daily-checkin', option
   if (failure) {
     const error = new AppError(`LobsterAI 签到未获服务端确认: ${failure.message}`, failure.status, failure.code);
     error.failure = failure; error.after = after;
+    if ([51103, 51105, 51106].includes(failure.upstreamCode)) {
+      error.definitiveRejection = true;
+      error.upstreamCode = failure.upstreamCode;
+    }
     throw error;
   }
   throw new AppError('LobsterAI 签到提交后服务端状态未变化', 502, 'lobster_claim_unconfirmed');

@@ -2,6 +2,7 @@
 // is retained here: catalogue snapshots live only for the current invocation.
 import {AppError} from './util.mjs';
 import {rateLimitMetadata} from './rate-limit-metadata.mjs';
+import {transportFailureMetadata} from './transport-failure.mjs';
 
 const positive=v=>Number.isSafeInteger(v)&&v>0?v:null;
 const capability=v=>typeof v==='boolean'?v:null;
@@ -26,14 +27,12 @@ export function requestContract(request){
 }
 
 export function supplierTerminal(cause){
-  const terminal=new AppError('同型号供应未完成本次请求（'+code(cause?.code)+'，HTTP '+status(cause?.status)+'）；其余候选不支持本次完整请求，历史、工具和输出预算均已保留',status(cause?.status),code(cause?.code));
+  const terminal=new AppError('同型号供应未完成本次请求（'+code(cause?.code)+'，'+(transportFailureMetadata(cause)||typeof cause?.upstreamResponseReceived==='boolean'?'网关状态 ':'HTTP ')+status(cause?.status)+'）；其余候选不支持本次完整请求，历史、工具和输出预算均已保留',status(cause?.status),code(cause?.code));
   Object.assign(terminal,rateLimitMetadata(cause));
+  if(cause?.code==='workbuddy_channel_rejected')terminal.upstreamCode=11128;
   if(Number.isInteger(cause?.upstreamStatus)&&cause.upstreamStatus>=400&&cause.upstreamStatus<=599)terminal.upstreamStatus=cause.upstreamStatus;
-  for(const [key,allowed]of [
-    ['networkPhase',['connect','tls_handshake','response_header','response_body']],
-    ['transportCode',['ENOTFOUND','EAI_AGAIN','ECONNREFUSED','ECONNRESET','ETIMEDOUT','CERT_HAS_EXPIRED','ERR_TLS_CERT_ALTNAME_INVALID','UNABLE_TO_VERIFY_LEAF_SIGNATURE','DEPTH_ZERO_SELF_SIGNED_CERT','ABORT_ERR']],
-    ['timeoutOrigin',['connect_deadline','header_deadline','body_idle','request_deadline']]
-  ])if(allowed.includes(cause?.[key]))terminal[key]=cause[key];
+  const transport=transportFailureMetadata(cause);if(transport)Object.assign(terminal,{networkPhase:transport.phase,transportCode:transport.code,timeoutOrigin:transport.timeoutOrigin});
+  if(typeof cause?.upstreamResponseReceived==='boolean')terminal.upstreamResponseReceived=cause.upstreamResponseReceived;
   return terminal;
 }
 
@@ -41,13 +40,11 @@ export class RequestPlan{
   constructor(request,config,catalogs=new Map()){
     this.contract=requestContract(request);this.config=config;this.catalogs=new Map(catalogs);
     this.candidateCount=0;this.skippedCount=0;this.attemptCount=0;this.dispatchCount=0;
-    this.root=null;this.fallbackRoot=null;this.last=null;
+    this.root=null;this.fallbackRoot=null;this.last=null;this.capacityGap=null;
   }
   platform(target){return platform(this.config.upstreams?.find(u=>u.id===target?.upstreamId)?.kind);}
   candidate(){this.candidateCount++;}
   dispatched(first){this.dispatchCount++;if(first)this.attemptCount++;}
-  // Called only after this candidate's UsageAttempt proves one local, unsent
-  // dispatch. Its caller owns the once-only guard; prior candidates remain.
   retractUnsentDispatch(){if(this.dispatchCount<1||this.attemptCount<1)return false;this.dispatchCount--;this.attemptCount--;return true;}
   seedBlocked(rows=[]){
     const row=rows.find(r=>Number.isInteger(r.status)&&(r.errorCode||r.reasonCode));if(row)this.fallbackRoot={code:code(row.errorCode??row.reasonCode),status:status(row.status),platform:this.platform(row.target)};
@@ -65,6 +62,9 @@ export class RequestPlan{
     }else if(c.requiresTools&&(model.tools===false||!relay&&model.tools!==true)){reasonCode='tools_not_supported';message='Target does not declare tools support';}
     else if(c.hasImages&&(model.multimodal===false||!relay&&model.multimodal!==true)){reasonCode='images_not_supported';message='Target does not declare image-input support';}
     else if(relay&&capabilities.outputCapacity!==null&&c.outputBudget>capabilities.outputCapacity){
+      // Record the widest ceiling any candidate offered: it is the one number that
+      // tells the caller what to lower max_tokens to. Never shrink the request.
+      if(this.capacityGap===null||capabilities.outputCapacity>this.capacityGap.capacity)this.capacityGap={requested:c.outputBudget,capacity:capabilities.outputCapacity};
       reasonCode='relay_capacity_incompatible';message='Same-model provider output capacity is below this request; history and output budget were not trimmed';
     }
     if(reasonCode)return {metadata:{...result,state:'skipped',reasonCode},error:new AppError(message,errorStatus,reasonCode)};
@@ -78,7 +78,7 @@ export class RequestPlan{
   summary(state='ongoing'){return {schema:1,state,candidateCount:this.candidateCount,skippedCount:this.skippedCount,attemptCount:this.attemptCount,dispatchCount:this.dispatchCount};}
   attach(error){
     const last=this.last??{code:code(error?.code),status:status(error?.status),platform:'unknown'},root=this.root??this.fallbackRoot??last;
-    error.relayFailure={root:{...root},last:{code:last.code,status:last.status},skippedCount:this.skippedCount,attemptCount:this.attemptCount};
+    error.relayFailure={root:{...root},last:{code:last.code,status:last.status},skippedCount:this.skippedCount,attemptCount:this.attemptCount,...(this.capacityGap?{capacityGap:{...this.capacityGap}}:{})};
     return error;
   }
 }

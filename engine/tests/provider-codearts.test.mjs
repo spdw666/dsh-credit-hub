@@ -190,13 +190,14 @@ test('CodeArts models expose the official catalog with honest capacity and calla
     ]});
   }});
   assert.deepEqual(rows.map(r=>r.id),['GLM-5.2','Qwen3-VL-235B','glm-5.2-sft-harmony']);
-  assert.equal(rows[0].toolRoundtripVerified,true);assert.ok(rows.slice(1).every(r=>r.toolRoundtripVerified===false));
+  assert.ok(rows.every(r=>r.toolRoundtripVerified===true));
   const glm=rows[0];
   assert.equal(glm.contextWindow,524288);assert.equal(glm.maxTokens,65536);assert.equal(glm.tools,true);assert.deepEqual(glm.toolChoiceModes,["auto","none"]);assert.equal(glm.auditToolChoice,"auto");
   assert.equal(glm.callable,true);assert.equal(glm.callableReason,null);
   assert.equal(glm.enabled,true);assert.equal(glm.verification,'official_catalog');assert.equal(glm.creditRate,0.7);
   assert.equal(rows[1].multimodal,true);assert.equal(rows[1].creditRate,null);assert.equal(rows[2].enabled,false);
-  assert.ok(rows.slice(1).every(r=>r.callable===false),'unknown capacity must never be published as callable');
+  assert.equal(rows[1].callable,true,'known VL model has an explicit configured capacity and live chat/tool proof');
+  assert.equal(rows[2].callable,false,'disabled upstream remains unavailable');
   await assert.rejects(codeartsModels(CREDENTIAL,{fetchImpl:async()=>Response.json({builtinModels:{}})}),{code:'codearts_catalog_schema'});
   await assert.rejects(codeartsModels(CREDENTIAL,{limit:1,fetchImpl:async()=>Response.json({builtinModels:[{model_id:'a'},{model_id:'b'}]})}),{code:'codearts_catalog_too_large'});
 });
@@ -358,6 +359,29 @@ test('CodeArts tool choice never silently weakens forced modes and none sends no
   for(const choice of ['required',{type:'function',function:{name:'read_fixture'}},'unknown'])
     assert.throws(()=>buildCodeArtsChatBody({...input,tool_choice:choice},'GLM-5.2','fixture'),{code:'codearts_tool_choice_unsupported'});
   assert.deepEqual(buildCodeArtsChatBody({...input,tool_choice:null},'GLM-5.2','fixture').tools,tools);
+});
+
+
+
+test('CodeArts history tool arguments are normalized so the engine never rejects the whole request',async()=>{
+  // A no-argument tool call arrives from clients as '' / '   ' / 'null' / malformed JSON, and the
+  // ModelArts engine answers those with HTTP 200 + `InferHub.ModelArts.81001.400 Invalid Argument`
+  // for the WHOLE request — every later turn in that conversation then fails too.
+  const {buildCodeArtsChatBody,normalizeCodeArtsToolArguments}=await import('../src/provider-codearts.mjs');
+  const call=(args)=>({role:'assistant',content:null,tool_calls:[{id:'call_1',type:'function',function:{name:'no_args',arguments:args}}]});
+  for(const broken of ['','   ','null','{bad','[1,2]'])
+    assert.equal(normalizeCodeArtsToolArguments([call(broken)])[0].tool_calls[0].function.arguments,'{}',`${JSON.stringify(broken)} must become {}`);
+  // Real payloads stay byte-identical; a no-op history keeps referential identity (no copy churn).
+  for(const valid of ['{}','{"a":1}','{"nested":{"x":[1,2]}}'])
+    assert.equal(normalizeCodeArtsToolArguments([call(valid)])[0].tool_calls[0].function.arguments,valid);
+  const untouched=[{role:'user',content:'hi'}];
+  assert.equal(normalizeCodeArtsToolArguments(untouched),untouched);
+  const body=buildCodeArtsChatBody({messages:[call('')],tools:[]},'deepseek-v4.1-flash-1017','fixture');
+  assert.equal(body.messages[0].tool_calls[0].function.arguments,'{}');
+  // Caller-owned input must not be mutated in place.
+  const original=call('');
+  buildCodeArtsChatBody({messages:[original]},'deepseek-v4.1-flash-1017','fixture');
+  assert.equal(original.tool_calls[0].function.arguments,'');
 });
 
 test('CodeArts refresh uses exact official STS, PKCE and ES256 DPoP without secret diagnostics or retries',async()=>{

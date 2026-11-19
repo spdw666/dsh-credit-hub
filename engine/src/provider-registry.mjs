@@ -1,4 +1,8 @@
 import {AppError} from './util.mjs';
+// The plugin ships the desktop providers only. The upstream gateway also carries
+// the video check-in providers (vidu/pixverse/jimeng/kling/...); those modules are
+// deliberately not part of this package, so this set must not name them - a kind
+// listed here without its module makes desktopProvider() throw provider_module_missing.
 export const desktopProviderKinds=new Set(['qoder','codebuddy','workbuddyai','cline','codearts','lobster','raccoon','loomy','opencode']);
 const definitions={qoder:['provider-qoder.mjs','qoderProvider'],codebuddy:['provider-buddy.mjs','codeBuddyProvider'],workbuddyai:['provider-buddy.mjs','workBuddyAIProvider'],cline:['provider-cline.mjs','clineProvider'],codearts:['provider-codearts.mjs','codeartsProvider'],lobster:['provider-lobster.mjs','lobsterProvider'],raccoon:['provider-raccoon.mjs','raccoonProvider'],loomy:['provider-loomy.mjs','loomyProvider'],opencode:['provider-opencode.mjs','openCodeProvider']};
 const loaded=new Map();

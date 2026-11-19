@@ -95,6 +95,26 @@ export class Platforms {
     if(a.platform==='minimax')return {status:'authenticated',checkin:await miniMaxStatus(credential),membership:await miniMaxMembership(credential)};
     throw new AppError('Credential read succeeded; platform health protocol awaits verification',501,'platform_protocol_pending');
   }
+  // Repeatable initialization must be declared by the provider for exactly this
+  // task. The caller fences a retry on this single answer, so a provider that
+  // says nothing is treated as non-repeatable rather than optimistically retried.
+  async dailyReconciliationDeclared(id,task) {
+    const a=this.account(id);
+    if(!desktopProviderKinds.has(a.platform))return false;
+    const p=await desktopProvider(a.platform);
+    return (p.dailyReconciliationTasks??p.descriptor?.dailyReconciliationTasks)?.includes(task)===true;
+  }
+  async dailyReconciliationMode(id,task) {
+    // A protocol migration, not a caller-provided escape from POST fencing:
+    // Raccoon's native GET initialization and Loomy's server-idempotent
+    // first-login are repeatable; reward POSTs are not.
+    const a=this.account(id);
+    if(!desktopProviderKinds.has(a.platform))return null;
+    const p=await desktopProvider(a.platform);
+    if(!(p.dailyReconciliationTasks??p.descriptor?.dailyReconciliationTasks)?.includes(task))return null;
+    if(a.platform==='raccoon')return 'native-session-get';
+    return (p.dailyReconciliationMode??p.descriptor?.dailyReconciliationMode)==='idempotent-first-login'?'idempotent-first-login':null;
+  }
   async status(accountId,taskId) {
     const a=this.account(accountId);const credential=await this.credentials.resolve(accountId);
     try{return await this.taskStatus(a,accountId,taskId,credential);}

@@ -1,59 +1,167 @@
+import {setTimeout as sleep} from 'node:timers/promises';
 import {dayIn,errorView} from './util.mjs';
+import {officialVideoDailySettlement,videoDailyClaimDay} from './provider-video-daily.mjs';
+import {INDEPENDENT_VIDEO_KINDS,independentVideoSettlement,retainIndependentVideoReceipt} from './provider-video-independent.mjs';
+
+// Acknowledgement is not settlement. These are READ-only rechecks, never POST
+// retries. The scheduler owns durable, per-task backoff across later attempts.
+const confirmationDelays=[0,300,1200];
 export class ClaimService {
   constructor(config,credentials,platforms,ledger){Object.assign(this,{config,credentials,platforms,ledger});}
-  async run(accountId,taskId='daily-checkin') {
-    const day=dayIn(new Date(),this.config.value.scheduler.timezone);let account=this.config.value.accounts.find(a=>a.id===accountId);
-    const base={day,platform:account?.platform??'unknown',accountId,task:taskId};let key, reserved=false, wrote=false,priorUncertain=false;
-    const finish=(status,result={})=>{const full={...base,status,...result};if(reserved)this.ledger.finish(key,status,result);this.ledger.record(full);return full;};
+  async run(accountId,taskId='daily-checkin',context={}) {
+    const account=this.config.value.accounts.find(a=>a.id===accountId),day=videoDailyClaimDay(account?.platform,new Date(),this.config.value.scheduler.timezone);
+    const automatic=context.trigger==='automatic';
+    const base={day,platform:account?.platform??'unknown',accountId,task:taskId,trigger:automatic?'automatic':'manual',triggerSource:automatic?context.source??'scheduler':'direct',operationAttempted:false,automaticOperationConfirmed:false,automaticRewardConfirmed:false};
+    let key,reserved=false,reservationId,wrote=false,previousUncertain=false,readOnlyDaily=false,reconcilableDaily=false,declaredDaily=false;
+    const finish=(status,result={})=>{
+      const provenance={trigger:base.trigger,triggerSource:base.triggerSource,operationAttempted:base.operationAttempted,automaticOperationConfirmed:base.automaticOperationConfirmed,automaticRewardConfirmed:base.automaticRewardConfirmed};
+      result={...provenance,...(base.campaignId?{campaignId:base.campaignId}:{}),...result};
+      // Retryability is derived here, once, from the outcome: only a failure that
+      // provably happened before any write may be retried, and a terminal status
+      // is never retryable regardless of the error it carries.
+      if(result.retryable===undefined){
+        if(status==='error')result.retryable=result.beforeSubmission===true;
+        // An actionable failure is retried only as a scheduled pre-submission
+        // recheck: the credential may be renewed without any claim being written.
+        else if(status==='action_required')result.retryable=result.beforeSubmission===true;
+        // An unconfirmed write is never a retry cue, and it is never pre-submission.
+        else if(status==='uncertain'){result.retryable=false;if(result.beforeSubmission===undefined)result.beforeSubmission=false;}
+        else if(['success','already','observed','not_available','skipped','busy','device_occupied'].includes(status))result.retryable=false;
+      }
+      if(reserved&&this.ledger.finish(key,status,result,reservationId)===false){status='busy';result={...provenance,automaticOperationConfirmed:false,automaticRewardConfirmed:false,reason:'claim_reservation_lost',retryable:false};}
+      const full={...base,status,...result};this.ledger.record(full);return full;
+    };
+    const confirmed=s=>s?.known===true&&s.claimed===true;
+    const observed=s=>s?.known===true&&s.observed===true&&s.claimed!==true;
+    const rememberWindow=s=>{if(Number.isFinite(Date.parse(s?.nextClaimAt)))base.nextClaimAt=s.nextClaimAt;};
+    const rememberConfirmationDay=s=>{
+      const officialDay=s?.day??s?.details?.dailyCycleDate;
+      // A batch may span midnight. Use an explicit official day only when it
+      // matches the wall clock at confirmation; never credit a future receipt.
+      if(officialDay===dayIn(new Date(),this.config.value.scheduler.timezone))base.day=officialDay;
+    };
+    const errorResult=e=>({reason:e.code??'upstream_error',error:errorView(e),...(typeof e.beforeSubmission==='boolean'?{beforeSubmission:e.beforeSubmission}:{}),...(typeof e.retryable==='boolean'?{retryable:e.retryable}:{}),...(Number.isFinite(Number(e.retryAt))?{retryAt:Number(e.retryAt)}:Number.isFinite(Date.parse(e.retryAt))?{retryAt:e.retryAt}:{}),...(Number.isFinite(e.retryAfterMs)&&e.retryAfterMs>=0?{retryAfterMs:e.retryAfterMs}:{}),...(e.loginRequired===true||e.status===401?{loginRequired:true}:{})});
     try {
       if(!account||account.enabled===false)return finish('skipped',{reason:'account_disabled'});
       const task=account.tasks?.find(t=>t.id===taskId);if(!task?.enabled)return finish('skipped',{reason:'task_disabled'});
       const c=await this.credentials.resolve(accountId);
-      // Qoder's verified daily campaign changes at 10:00 CST, not midnight.
-      // Read its current window before reserving; retries in that window stay idempotent.
+      const mode=await this.platforms.dailyReconciliationMode?.(accountId,taskId);
+      // mode 只是候选：还要 provider 真的为这个 platform+task 声明过可重复初始化。
+      // 声明缺失一律按不可重试处理，:89 的 POST fencing 原样生效。
+      declaredDaily=!mode?false:await this.platforms.dailyReconciliationDeclared?.(accountId,taskId)===true;
+      readOnlyDaily=declaredDaily&&mode==='native-session-get';
+      reconcilableDaily=declaredDaily&&(mode==='native-session-get'||mode==='idempotent-first-login');
+      // Qoder campaigns roll over at 10:00 CST, not at the ledger's midnight.
       let before;
-      if(account.platform==='qoder'){
+      if(account.platform==='qoder'||account.platform==='codearts'){
         before=await this.platforms.status(accountId,taskId);
-        if(!before.known)return finish('error',{reason:'unknown_server_state',beforeSubmission:true,retryable:true});
-        if(before.campaignWindowId)base.campaignWindowId=String(before.day??day)+':'+String(before.campaignWindowId);
-        if(Number.isFinite(Date.parse(before.nextClaimAt)))base.nextClaimAt=before.nextClaimAt;
+        if(before.known!==true)return finish('error',{reason:'unknown_server_state',beforeSubmission:true,retryable:true});
+        if(account.platform==='qoder'&&before.campaignWindowId)base.campaignWindowId=String(before.day??day)+':'+String(before.campaignWindowId);
+        if(account.platform==='codearts'&&Number.isSafeInteger(before.campaignId)&&before.campaignId>0){
+          base.campaignId=before.campaignId;
+          // Pre-rotation adapters signed only daily campaign 1. Retain its
+          // legacy day-key fence, including unknown submissions, while a new
+          // official campaign gets an independent per-day reservation.
+          if(before.campaignId!==1)base.campaignWindowId=day+':codearts:'+before.campaignId;
+        }
+        rememberWindow(before);
       }
       key=this.ledger.claimKey(account.platform,c.principalHash,base.campaignWindowId?'campaign:'+base.campaignWindowId:day,taskId,c.identity?.deviceId??'');
       const datedObservation=['loomy','raccoon'].includes(account.platform)&&['daily-quota','daily-checkin'].includes(taskId);
-      const reservation=this.ledger.reserve(key,Date.now(),datedObservation?{observationDay:day}:{});reserved=reservation.acquired;priorUncertain=reservation.uncertain===true;
-      const observed=result=>finish('observed',{...result,...(datedObservation?{observationSchema:1,observationVerifiedDay:day}:{})});
-      if(!reserved)return finish(reservation.status==='observed'?'observed':reservation.status==='rejected'?'rejected':reservation.done?'already':'busy',{...(reservation.result??{}),originalReason:reservation.result?.reason,reason:reservation.done?'local_idempotency':'another_worker'});
-      before??=await this.platforms.status(accountId,taskId);
-      if(!before.known)return finish(priorUncertain?'uncertain':'error',{reason:'unknown_server_state',beforeSubmission:!priorUncertain,retryable:!priorUncertain});
-      if(before.observed)return observed({reason:before.reason,details:before.details});
-      if(before.claimed)return finish('already',{reason:before.reason??'server_already_claimed',credits:before.credits,...(before.details?{details:before.details}:{})});
-      if(!before.active)return finish(priorUncertain?'uncertain':'not_available',{reason:before.reason??'activity_inactive',beforeSubmission:!priorUncertain,...(before.nextClaimAt?{nextClaimAt:before.nextClaimAt}:{} )});
-      if(before.deviceOccupied)return finish(priorUncertain?'uncertain':'device_occupied',{reason:'device_daily_limit'});
-      // A crash/timeout after submission must not resubmit merely because the local row is stale.
-      const confirmOnly=reservation.uncertain&&account.platform==='codearts'&&taskId==='daily-checkin'&&before.known===true&&before.pendingConfirmation===true;
-      if(reservation.uncertain&&!confirmOnly)return finish('uncertain',{reason:'previous_submission_unconfirmed',serverState:'not_claimed'});
-      wrote=true;const claim=await this.platforms.claim(accountId,taskId,confirmOnly?{confirmOnly:true}:{});
-      if(claim.submitted===false&&!priorUncertain)wrote=false;
-      const after=await this.platforms.status(accountId,taskId);
-      // Official automatic-entitlement refresh is not a paid/active claim. Both
-      // the submission adapter and a fresh known server recheck must agree.
-      if(claim.observed===true&&claim.claimed!==true&&after.known===true&&after.observed===true&&after.claimed!==true)return observed({reason:after.reason??claim.reason??'server_auto_daily_quota',claimed:false,officialRefreshConfirmed:true,...(after.details??claim.details?{details:after.details??claim.details}:{})});
-      if(!after.claimed){const notSubmitted=claim.submitted===false&&!priorUncertain;return finish(notSubmitted?'not_available':'uncertain',{reason:notSubmitted?(claim.reason??'not_claimable'):'claim_response_not_confirmed',beforeSubmission:notSubmitted,retryable:false});}
-      if(account.platform==='workbuddy')this.ledger.set('wb-pool-cooldown:'+accountId,{until:0,reason:'checkin_confirmed'});
-      return finish('success',{credits:claim.credit??after.credits,serverConfirmed:true,...(claim.unit?{unit:claim.unit}:{}),...(claim.planId?{planId:claim.planId,details:claim.details}: {})});
+      const reservation=this.ledger.reserve(key,Date.now(),{preparing:true,...(datedObservation?{observationDay:day}:{})});
+      reserved=reservation.acquired;reservationId=reservation.reservationId;previousUncertain=reservation.uncertain===true;
+      const finishObserved=result=>finish('observed',{...result,...(datedObservation?{observationSchema:1,observationVerifiedDay:base.day}:{})});
+      if(!reserved&&!reservation.done)return finish('busy',{reason:'another_worker'});
+      before??=await this.platforms.status(accountId,taskId);rememberWindow(before);
+      if(before.known!==true)return finish(previousUncertain&&!reconcilableDaily?'uncertain':'error',{reason:'unknown_server_state',...(previousUncertain&&!reconcilableDaily?{}:{beforeSubmission:true,retryable:true})});
+      if(observed(before))return finishObserved({reason:before.reason,details:before.details,serverConfirmed:true,benefitOutcome:'available_before_run'});
+      if(confirmed(before))return finish('already',{reason:before.reason??'server_already_claimed',credits:before.credits,serverConfirmed:true,benefitOutcome:'available_before_run',...(before.details?{details:before.details}:{})});
+      // Vidu's fresh balance read cannot answer whether its grant happened.
+      // Preserve only a terminal, same-key official positive receipt; this does
+      // not authorize a write or turn serialized JSON into a new settlement.
+      if(!reserved&&account.platform==='vidu'&&taskId==='daily-checkin'&&before.known===true&&before.claimed===null&&['success','already'].includes(reservation.status)){
+        const prior=reservation.result,receipt=prior?.officialDailyReceipt,checkedAt=typeof receipt?.checkedAt==='string'?Date.parse(receipt.checkedAt):NaN;
+        if(prior?.serverConfirmed===true&&prior.claimed===true&&receipt?.source==='/iam/v1/users/every-day-credit'&&receipt.day===day&&Number.isSafeInteger(receipt.amount)&&receipt.amount>0&&prior.credits===receipt.amount&&Number.isFinite(checkedAt)&&checkedAt<=Date.now()&&dayIn(new Date(checkedAt),this.config.value.scheduler.timezone)===day)
+          return finish('already',{reason:'official_daily_receipt_retained',credits:receipt.amount,claimed:true,serverConfirmed:true,benefitOutcome:'available_before_run',retainedOfficialReceipt:true,submitted:false,mutation:false,automaticPerformed:false,officialDailyReceipt:{source:receipt.source,day:receipt.day,amount:receipt.amount,checkedAt:receipt.checkedAt}});
+      }
+      // A same-key official zero grant is terminal too. A later balance-only
+      // read is not contradictory evidence and must not replay the grant or
+      // turn an existing balance into a new award. Opaque new-settlement
+      // validation above remains separate from this persisted observation.
+      if(!reserved&&account.platform==='vidu'&&taskId==='daily-checkin'&&before.known===true&&before.claimed===null&&reservation.status==='observed'){
+        const prior=reservation.result,receipt=prior?.officialDailyReceipt,checkedAt=typeof receipt?.checkedAt==='string'?Date.parse(receipt.checkedAt):NaN;
+        if(prior?.serverConfirmed===true&&prior.claimed===false&&prior.credits===0&&prior.benefitOutcome==='no_new_daily_credit'&&receipt?.source==='/iam/v1/users/every-day-credit'&&receipt.day===day&&receipt.amount===0&&Number.isFinite(checkedAt)&&checkedAt<=Date.now()&&dayIn(new Date(checkedAt),this.config.value.scheduler.timezone)===day)
+          return finish('observed',{reason:'official_daily_zero_receipt_retained',credits:0,claimed:false,observed:true,serverConfirmed:true,benefitOutcome:'no_new_daily_credit',retainedOfficialReceipt:true,submitted:false,mutation:false,automaticPerformed:false,officialDailyReceipt:{source:receipt.source,day:receipt.day,amount:0,checkedAt:receipt.checkedAt}});
+      }
+      if(!reserved&&INDEPENDENT_VIDEO_KINDS.includes(account.platform)&&before.known===true&&before.claimed===null&&['success','already','observed'].includes(reservation.status)){
+        const retained=retainIndependentVideoReceipt(account.platform,c.principalHash,reservation.result,day);
+        if(retained)return finish(retained.observed?'observed':'already',retained);
+      }
+      // A terminal local receipt does not authorize another submission, even if
+      // today's fresh server read disagrees. Expose disagreement, not success.
+      if(!reserved)return finish(reservation.status==='rejected'?'rejected':'uncertain',{...(reservation.result??{}),trigger:base.trigger,triggerSource:base.triggerSource,operationAttempted:false,automaticOperationConfirmed:false,automaticRewardConfirmed:false,reason:reservation.status==='rejected'?'previous_definitive_rejection':'local_receipt_conflicts_server_state',serverConfirmed:false});
+      const confirmOnly=account.platform==='codearts'&&taskId==='daily-checkin'&&before.pendingConfirmation===true;
+      if(previousUncertain&&!confirmOnly&&!reconcilableDaily)return finish('uncertain',{reason:'previous_submission_unconfirmed',serverState:'not_claimed'});
+      if(!before.active)return finish('not_available',{reason:before.reason??'activity_inactive'});
+      if(before.deviceOccupied)return finish('device_occupied',{reason:'device_daily_limit'});
+      if(reservationId&&!this.ledger.markSubmitted(key,reservationId))return finish('busy',{reason:'claim_reservation_lost'});
+      wrote=!readOnlyDaily;base.operationAttempted=true;let claim,submissionError,lastError,after;
+      try{claim=await this.platforms.claim(accountId,taskId,{...(confirmOnly?{confirmOnly:true}:{}),...(base.campaignId?{expectedCampaignId:base.campaignId}:{})});}
+      catch(e){if(e.beforeSubmission||e.definitiveRejection||e.actionRequired)throw e;submissionError=e;}
+      const execution=()=>{
+        const details=claim?.details;
+        // first-login's alreadyProcessed describes initialization, not a
+        // standalone daily credit transaction. Do not infer a new grant from it.
+        const newlyGranted=account.platform!=='loomy'&&!confirmOnly&&!submissionError&&claim?.submitted===true&&claim?.alreadyClaimed!==true&&claim?.claimed===true&&(account.platform!=='codearts'||claim?.newClaimSubmitted===true);
+        // CodeArts may advance ELIGIBLE -> CLAIMED between the outer preflight
+        // and the adapter's own read. A confirmed receipt can then be only a
+        // confirmation operation, not proof that this run posted a new claim.
+        const performed=account.platform==='codearts'?!submissionError&&claim?.submitted===true&&(claim?.newClaimSubmitted===true||claim?.confirmed===true):claim?.automaticPerformed===true||!submissionError&&(confirmOnly?claim?.submitted===true&&claim?.confirmed===true:claim?.submitted!==false&&claim!==undefined);
+        return {...(account.platform==='codearts'&&typeof claim?.submitted==='boolean'?{operationAttempted:claim.submitted}:{}),automaticOperationConfirmed:automatic&&performed,automaticRewardConfirmed:automatic&&newlyGranted,benefitOutcome:readOnlyDaily&&claim?.automaticPerformed===true?'daily_validity_extended':newlyGranted?'newly_granted':account.platform==='loomy'&&details?.dailyQuotaAlreadyProcessed===false?'first_login_newly_processed':details?.dailyQuotaAlreadyProcessed===true||claim?.alreadyClaimed===true?'already_processed':'confirmed_without_new_reward_proof',...(typeof claim?.submitted==='boolean'?{submitted:claim.submitted}:{}),...(account.platform==='codearts'&&typeof claim?.newClaimSubmitted==='boolean'?{newClaimSubmitted:claim.newClaimSubmitted}:{}),...(typeof claim?.mutation==='boolean'?{mutation:claim.mutation}:{}),...(typeof claim?.automaticPerformed==='boolean'?{automaticPerformed:claim.automaticPerformed}:{}),...(typeof claim?.alreadyProcessed==='boolean'?{alreadyProcessed:claim.alreadyProcessed}:{}),...(claim?.operation?{operation:claim.operation}:{}),...(claim?.source?{operationSource:claim.source}:{})};
+      };
+      // Vidu's official daily-login endpoint returns the awarded integer itself,
+      // not a queryable task status. Only adapter-created, same-principal/day
+      // receipt objects are accepted; zero is not a new award or an "already".
+      const dailySettlement=officialVideoDailySettlement(account.platform,c.principalHash,claim,base.day,this.config.value.scheduler.timezone);
+      if(dailySettlement)return finish(dailySettlement.status,{...execution(),...dailySettlement.result});
+      if(INDEPENDENT_VIDEO_KINDS.includes(account.platform)){
+        if(claim?.submitted===false&&claim.alreadyClaimed===true)return finish('already',{reason:'official_independent_daily_already_available',claimed:true,serverConfirmed:true,benefitOutcome:'available_before_run',submitted:false,mutation:false,automaticPerformed:false});
+        const verified=independentVideoSettlement(account.platform,c.principalHash,claim,base.day);
+        if(verified)return finish(verified.status,{...execution(),...verified.result});
+        return finish('uncertain',{reason:'independent_daily_receipt_unconfirmed',...(submissionError?{error:errorView(submissionError)}:{})});
+      }
+      for(const delay of confirmationDelays){
+        if(delay)await sleep(delay);
+        try{after=await this.platforms.status(accountId,taskId);lastError=undefined;rememberWindow(after);}
+        catch(e){lastError=e;continue;}
+        if(account.platform==='codearts'&&base.campaignId&&after.campaignId!==base.campaignId)return finish('uncertain',{reason:'codearts_daily_campaign_changed',serverConfirmed:false});
+        if(observed(after)||confirmed(after))rememberConfirmationDay(after);
+        if(observed(after)&&(claim?.observed===true||previousUncertain||submissionError))return finishObserved({...execution(),reason:after.reason??claim?.reason??'server_auto_daily_quota',claimed:false,officialRefreshConfirmed:true,...(after.details??claim?.details?{details:{...claim?.details,...after.details}}:{}),...(submissionError?{reconciledAfterError:true}:{})});
+        if(confirmed(after)){
+          if(account.platform==='workbuddy')this.ledger.set('wb-pool-cooldown:'+accountId,{until:0,reason:'checkin_confirmed'});
+          return finish('success',{...execution(),credits:claim?.credit??after.credits,serverConfirmed:true,...(submissionError?{reconciledAfterError:true}:{}),...(claim?.unit?{unit:claim.unit}:{}),...(claim?.planId?{planId:claim.planId,details:claim.details}:{})});
+        }
+      }
+      return finish('uncertain',{reason:'claim_response_not_confirmed',...(submissionError||lastError?{error:errorView(submissionError??lastError)}:{}),confirmationChecks:confirmationDelays.length});
     }catch(e){
-      const beforeSubmission=!priorUncertain&&(!wrote||e.beforeSubmission===true);
-      // Retry only a known pre-submission failure. A timeout after a claim was
-      // sent remains uncertain and is never converted into a second POST.
-      const loginRequired=e.loginRequired===true||e.status===401;
-      const retryable=beforeSubmission&&!e.actionRequired&&!e.definitiveRejection&&(loginRequired||e.retryable===true||e.status===429||e.status>=500||/^(ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR_)/.test(e.code??'')||['TimeoutError','TypeError'].includes(e.name));
-      return finish(priorUncertain?'uncertain':e.actionRequired||loginRequired?'action_required':e.definitiveRejection?'rejected':beforeSubmission?'error':'uncertain',{reason:e.code??'upstream_error',error:errorView(e),beforeSubmission,retryable,...(e.retryAt?{retryAt:e.retryAt}:{})});
+      // A failure raised before this run wrote anything is provably pre-submission,
+      // so the scheduler may retry it. `wrote` is the only proof either way; an
+      // error that arrives after a write stays uncertain regardless of its code.
+      const preSubmission=!wrote&&e.beforeSubmission!==false;
+      if(preSubmission&&e.beforeSubmission!==true)e.beforeSubmission=true;
+      // A rejected credential needs a human, not a retry: it is actionable even
+      // though the run never wrote anything.
+      const actionRequired=e.actionRequired===true||e.loginRequired===true||e.status===401;
+      // Failed reads must never turn uncertainty into a retryable write.
+      const status=previousUncertain&&!reconcilableDaily?'uncertain':actionRequired?'action_required':e.definitiveRejection?'rejected':wrote&&!e.beforeSubmission?'uncertain':'error';
+      return finish(status,errorResult(e));
     }
   }
-  async all() {
+  async all({tasks}={},context={}) {
+    const selected=tasks===undefined?null:new Set(tasks.map(t=>JSON.stringify([t.accountId,t.task??t.taskId])));
     const accounts=this.config.value.accounts.filter(a=>a.enabled!==false),rows=new Array(accounts.length);let next=0;
-    // Accounts run concurrently (bounded to two); each account's tasks stay sequential.
-    const worker=async()=>{while(next<accounts.length){const i=next++,a=accounts[i];rows[i]=[];for(const t of a.tasks??[])if(t.enabled)rows[i].push(await this.run(a.id,t.id));}};
+    // Bounded account concurrency; tasks belonging to one account stay ordered.
+    const worker=async()=>{while(next<accounts.length){const i=next++,a=accounts[i];rows[i]=[];for(const t of a.tasks??[])if(t.enabled&&(!selected||selected.has(JSON.stringify([a.id,t.id]))))rows[i].push(await this.run(a.id,t.id,context));}};
     await Promise.all(Array.from({length:Math.min(2,accounts.length)},worker));return rows.flat();
   }
 }

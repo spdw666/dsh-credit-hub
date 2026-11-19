@@ -6,7 +6,7 @@ export const isRelayTransportFailure=error=>['provider_network_error','provider_
 const rateLimitKinds=new Set(['transient','long_window','usage_limit','unknown']);
 const rateLimitRetrySources=new Set(['official_header','official_body','local_default']);
 const transientRateCodes=new Set([6001,6002,6005,6006,14003]);
-const knownRateCodes=new Set([6000,...transientRateCodes,6003,6004,6007,6008,14001,14002,14012,14013,14014,14015,14016,14017,14018,14019,10105,15001,11115]);
+const knownRateCodes=new Set([6000,...transientRateCodes,6003,6004,6007,6008,14001,14002,14012,14013,14014,14015,14016,14017,14018,14019,10105,15001,11115,710022002,710022004,710022013]);
 const rateErrorCodes=new Set(['provider_chat_rejected','provider_http_error','provider_rate_limited','rate_limited','nvidia_rate_limited','upstream_error','upstream_sse_error']);
 // Persistent circuits contain only a typed diagnosis, never an upstream body,
 // message, URL or credential. A legacy rate-limit row remains unknown, not a
@@ -16,7 +16,10 @@ export function relayRateLimitMetadata(error={}){
  const rateLimitKind=rateLimitKinds.has(error.rateLimitKind)?error.rateLimitKind:'unknown';
  const supplied=typeof error.retryAfterSeconds==='number'&&Number.isFinite(error.retryAfterSeconds)&&error.retryAfterSeconds>=0&&error.retryAfterSeconds<=86400;
  const retryAfterSource=supplied&&rateLimitRetrySources.has(error.retryAfterSource)?error.retryAfterSource:'local_default';
- const retryAfterSeconds=supplied&&retryAfterSource!=='local_default'?error.retryAfterSeconds:30;
+ // 本地冷却默认 30 秒。provider 确知自己那一族限流需要更长冷却时（例如豆包账号级风控要人工过
+ // 验证码），用 error.localRetrySeconds 显式声明，不要让通用策略替所有平台猜一个长窗口。
+ const localDefault=Number.isFinite(error.localRetrySeconds)&&error.localRetrySeconds>=0&&error.localRetrySeconds<=86400?error.localRetrySeconds:30;
+ const retryAfterSeconds=supplied&&retryAfterSource!=='local_default'?error.retryAfterSeconds:localDefault;
  const rateLimitRetryable=rateLimitKind==='transient'&&transientRateCodes.has(upstreamCode)&&error.rateLimitRetryable===true;
  return {upstreamStatus:429,...(upstreamCode!==undefined?{upstreamCode}:{}),rateLimitKind,rateLimitRetryable,retryAfterSeconds,retryAfterSource};
 }
@@ -60,26 +63,49 @@ export class ModelRelay{
   for(const r of value.routes)if(r.enabled!==false&&modelFamily(r.targets[0]?.model)===family)for(const t of r.targets)if(modelFamily(t.model)===family)targets.push(t);
   const seen=new Set();return targets.filter(t=>{const key=t.upstreamId+'\0'+t.model;if(!this.enabled(t)||!this.relayStandby(t,route)||relayPartition(value,t)!==partition||seen.has(key))return false;seen.add(key);return ignoreCooldown||!this.cooldown(t);});
  }
- async discover(route,base,signal,{source='api',ignoreCooldown=false}={}){
+ discoveryIndex(){
+  const byPartition=new Map(),byFamily=new Map(),upstreams=new Map(this.config.value.upstreams.map(u=>[u.id,u]));
+  for(const r of this.config.value.routes)if(r.enabled!==false)for(const t of r.targets){
+   const partition=upstreams.get(t.upstreamId)?.kind==='workbuddy'?'workbuddy':'other',family=partition+'\0'+modelFamily(t.model);
+   if(!byPartition.has(partition))byPartition.set(partition,[]);byPartition.get(partition).push(t);
+   if(!byFamily.has(family))byFamily.set(family,[]);byFamily.get(family).push(t);
+  }
+  return {byPartition,byFamily};
+ }
+ async discover(route,base,signal,{source='api',ignoreCooldown=false,index,catalogRead,modelLookup}={}){
   base=base.filter(t=>relayPartition(this.config.value,t)===this.partition(route)&&(relayPartition(this.config.value,t)!=='workbuddy'||this.enabled(t)));
   if(!this.active(route,source))return {targets:base,catalogs:new Map(),family:modelFamily(route.targets[0].model),partition:this.partition(route)};
-  const partition=this.partition(route),all=[...base,...this.config.value.routes.filter(r=>r.enabled!==false).flatMap(r=>r.targets)].filter(t=>relayPartition(this.config.value,t)===partition),catalogs=new Map();
   const rawFamily=modelFamily(route.targets[0].model),mayUseOpaqueAlias=rawFamily==='gmodel'||/^glm-\d+(?:\.\d+)+(?:-flashx?)?$/i.test(rawFamily);
+  const partition=this.partition(route),configured=index?(mayUseOpaqueAlias?index.byPartition.get(partition):index.byFamily.get(partition+'\0'+rawFamily))??[]:this.config.value.routes.filter(r=>r.enabled!==false).flatMap(r=>r.targets),all=[...base,...configured].filter(t=>relayPartition(this.config.value,t)===partition),catalogs=new Map();
   const qoderIds=mayUseOpaqueAlias?[...new Set(all.filter(t=>this.enabled(t)&&t.model==='gmodel'&&this.config.value.upstreams.find(u=>u.id===t.upstreamId)?.kind==='qoder').map(t=>t.upstreamId))]:[];
-  const read=this.catalogRead??this.platforms.models.bind(this.platforms);
+  const read=catalogRead??this.catalogRead??this.platforms.models.bind(this.platforms);
   await Promise.all(qoderIds.map(async id=>{try{catalogs.set(id,await read(id,{signal}));}catch{if(signal?.aborted)throw new AppError('Request cancelled',499,'request_cancelled');catalogs.set(id,[]);}}));
-  const familyOf=t=>catalogModelFamily(t.model,catalogs.get(t.upstreamId)?.find(m=>m.id===t.model)),family=familyOf(route.targets[0]),seen=new Set();
+  const familyOf=t=>{const rows=catalogs.get(t.upstreamId);return catalogModelFamily(t.model,rows&&(modelLookup?modelLookup(rows,t.model):rows.find(m=>m.id===t.model)));},family=familyOf(route.targets[0]),seen=new Set();
   const targets=all.filter(t=>{const key=t.upstreamId+'\0'+t.model;if(!this.enabled(t)||!this.relayStandby(t,route)||seen.has(key)||familyOf(t)!==family)return false;seen.add(key);return ignoreCooldown||!this.cooldown(t);});
   return {targets,catalogs,family,partition};
  }
  async balance(target,signal){
+  const interrupted=()=>new AppError(signal?.reason?.name==='TimeoutError'?'Gateway request deadline exceeded':'Request cancelled',signal?.reason?.name==='TimeoutError'?504:499,signal?.reason?.name==='TimeoutError'?'request_timeout':'request_cancelled');
+  if(signal?.aborted)throw interrupted();
   const u=this.config.value.upstreams.find(u=>u.id===target.upstreamId);if(!u?.accountId)return null;
   const policy=relayPolicy(this.config.value),fresh=r=>{const age=Date.now()-Date.parse(r?.checkedAt);return r&&!r.stale&&!r.error&&Number.isFinite(age)&&age>=0&&age<policy.balanceMaxAgeSeconds*1000;};
   const supplied=this.balanceSource?.()?.get(u.accountId);if(fresh(supplied))return supplied;
   if(typeof this.platforms.health!=='function')return null;
   const key=u.accountId+'\0'+JSON.stringify(this.config.value.accounts?.find(a=>a.id===u.accountId)?.credentials);const cached=this.balances.get(key);if(cached&&Date.now()-cached.at>=0&&Date.now()-cached.at<policy.balanceMaxAgeSeconds*1000)return cached.row;
-  if(this.flights.has(key))return this.flights.get(key);
-  const operation=(async()=>{let timer;try{const timeout=AbortSignal.timeout(3000),combined=signal?AbortSignal.any([signal,timeout]):timeout;const health=await Promise.race([this.platforms.health(u.accountId,{signal:combined}),new Promise(resolve=>{timer=setTimeout(()=>resolve(null),3000);})]);if(!health)return null;const row={...normalizeBalance(u.kind,health),checkedAt:new Date().toISOString(),stale:false,...(u.kind==='trae'?{totalValue:health.snapshot?.summary?.totalAmount}:{})};this.balances.set(key,{at:Date.now(),row});return row;}catch{return null;}finally{clearTimeout(timer);}})();this.flights.set(key,operation);try{return await operation;}finally{this.flights.delete(key);}
+  let operation=this.flights.get(key);
+  if(!operation){
+   // The lookup belongs to the shared flight, not its first consumer. A closed
+   // HTTP request must neither abort other consumers nor delete their flight.
+   const controller=new AbortController();let timer;
+   operation=(async()=>{try{
+    const health=await Promise.race([Promise.resolve().then(()=>this.platforms.health(u.accountId,{signal:controller.signal})),new Promise(resolve=>{timer=setTimeout(()=>{resolve(null);controller.abort(new DOMException('Balance lookup timed out','TimeoutError'));},3000);})]);
+    if(!health)return null;
+    const row={...normalizeBalance(u.kind,health),checkedAt:new Date().toISOString(),stale:false,...(u.kind==='trae'?{totalValue:health.snapshot?.summary?.totalAmount}:{})};this.balances.set(key,{at:Date.now(),row});return row;
+   }catch{return null;}finally{clearTimeout(timer);}})().finally(()=>{if(this.flights.get(key)===operation)this.flights.delete(key);});
+   this.flights.set(key,operation);
+  }
+  let abort;try{return await(signal?Promise.race([operation,new Promise((_,reject)=>{abort=()=>reject(interrupted());signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();})]):operation);}
+  finally{if(abort)signal.removeEventListener('abort',abort);}
  }
  lowReason(row){
   if(!row||row.stale||row.error)return null;const p=relayPolicy(this.config.value),q=row.quota;
@@ -119,6 +145,10 @@ export class ModelRelay{
   if(previous.upstreamId!==target.upstreamId){const value=this.config.value,row={day:new Date().toISOString().slice(0,10),platform:value.upstreams.find(u=>u.id===target.upstreamId)?.kind??'',accountId:value.upstreams.find(u=>u.id===target.upstreamId)?.accountId??'',task:'model-relay',status:'switched',routeId:route.id,modelFamily:modelFamily(target.model),requestId,fromPlatform:value.upstreams.find(u=>u.id===previous.upstreamId)?.kind??'',toPlatform:value.upstreams.find(u=>u.id===target.upstreamId)?.kind??'',reasonCode:trigger??'available_same_model'};this.ledger?.record?.(row);}
  }
  failure(route,target,error,{source='api'}={}){
+  // A request's rejected channel is neither an account ban nor a persistent
+  // supplier outage. The router owns request-local same-channel deduplication.
+  if(['workbuddy_channel_rejected','workbuddy_channel_skipped'].includes(error.code))return this.active(route,source)?'channel_unavailable':null;
+  if(error.code==='zcode_upstream_blocked')return null; // Adapter owns the account-level block; never call it a transient outage.
   if(error.code==='wb_inference_disabled')return null; // A local user switch is not a supplier outage.
   if(error.code==='reasoning_budget_exhausted')return null; // Caller budget too small for the reasoning tier; the supplier is healthy.
   if(!this.active(route,source))return null;const v=errorView(error),status=Number(error.status??v.status),context=isContextWindowError(error),depleted=!context&&isCreditExhausted(error);let reason=context||['relay_capacity_incompatible','relay_context_incompatible','tools_not_supported','images_not_supported','reasoning_effort_not_supported','reasoning_parameter_not_supported'].includes(error.code)?'capability_unavailable':depleted?'credits_exhausted':[401,403].includes(status)?'authentication_unavailable':status===404?'model_unavailable':status===429?'rate_limited':[408,500,502,503,504].includes(status)?'upstream_unavailable':null;

@@ -1,10 +1,11 @@
+import {compactExpandedSchema} from './codearts-schema-compact.mjs';
+import {normalizeLocalRefs} from './codearts-schema.mjs';
 import {desktopSseResponse,desktopCompletionLimit} from './provider-sse.mjs';
-import {join,dirname} from 'node:path';
-import {readFile,writeFile,mkdir,rename,open,unlink} from 'node:fs/promises';
+import {join,dirname,resolve} from 'node:path';
+import {readFile,writeFile,mkdir,rename,open,unlink,realpath} from 'node:fs/promises';
 import {createHash,createHmac,createDecipheriv,createPrivateKey,sign,randomBytes} from 'node:crypto';
 import {dpapiUnprotect} from './windows-crypto.mjs';
 import {redact,rememberSecret,AppError,dayIn} from './util.mjs';
-import {setTimeout as wait} from 'node:timers/promises';
 
 // Huawei Cloud CodeArts Agent (码道) adapter, now with the real IAM request signing.
 //
@@ -21,9 +22,11 @@ import {setTimeout as wait} from 'node:timers/promises';
 export const CODEARTS_ORIGIN = 'https://snap-access.cn-north-4.myhuaweicloud.com';
 const MAX_BODY = 1024 * 1024;
 const SESSION_KEY = 'huaweicloud.codearts-snap';
+const NATIVE_AUTH_KEY = 'secret://' + JSON.stringify({extensionId:'huaweicloud.authentication',key:'HuaweiCloudSession'});
 const AGENT_TYPE = 'PromptCenter';
 const OPS_CHANNEL = 'IDE';
-// 「每日签到领1000 积分」的活动 ID；delivery 同时返回推荐码(3)/新用户(4)/学生认证(2)。
+// Legacy daily ID. Current delivery is authoritative: campaigns and amounts can
+// rotate (e.g. USER_LOGIN 34 / 100 CREDIT replaced 1 / 1000 CREDIT).
 const DAILY_CAMPAIGN_ID = 1;
 
 // Route table: the ONLY method+path(+exact query) pairs this adapter will sign. The query
@@ -77,6 +80,11 @@ export const CODEARTS_TRANSIENT_CODES = Object.freeze({
   APIG: {code: 'APIG.0301', meaning: 'IAM 认证失败；检查临时凭据有效期，不自动重试过期凭据', retryable: false},
   CONCURRENCY: {code: 'TM.00001041', meaning: '账号并发会话数上限（3）已满，HTTP 400', retryable: true},
   TOOL_CHOICE: {code: 'InferHub.001001005.400', meaning: '引擎拒绝 tool_choice 参数（HTTP 200 流内业务错误）', retryable: false},
+  // Whole-request rejection (HTTP 200 + SSE business error) whose only observed trigger is a
+  // history tool call carrying empty/whitespace/malformed `arguments`; normalizeCodeArtsToolArguments
+  // repairs those shapes before the body is signed, so a still-reachable 81001 means some OTHER
+  // field is invalid and must be bisected rather than retried.
+  INVALID_ARGUMENT: {code: 'InferHub.ModelArts.81001.400', meaning: '引擎判定请求参数非法（只观察到一个成因：历史 tool_calls.arguments 为空/非法 JSON，已在构造请求体时归一化）', retryable: false},
 });
 
 /**
@@ -86,21 +94,84 @@ export const CODEARTS_TRANSIENT_CODES = Object.freeze({
  * (unproven ≠ unsupported).
  */
 export const CODEARTS_TOOLS_VERIFIED = Object.freeze({
-  'GLM-5.2': 'dsh-codearts-model-tools.jsonl',
-  'Qwen3-VL-235B': 'dsh-codearts-model-tools.jsonl',
-  'kimi-k2.6-vl': 'dsh-codearts-model-tools.jsonl',
-  'glm-5.2-sft-harmony': 'dsh-codearts-model-tools.jsonl',
+  'GLM-5.2': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'Qwen3-VL-235B': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'kimi-k2.6-vl': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'openpangu-2.0-flash': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'openpangu-2.0-pro': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'glm-5.3': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'glm-5.2-sft-harmony': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'deepseek-v4.1-flash': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'kimi-k3': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'deepseek-v4.1-flash-1017': 'codearts-1017-20261031/PROBE.json',
 });
 
 /** Models with observed native output; callability still requires a declared local capacity. */
 export const CODEARTS_CHAT_VERIFIED = Object.freeze({
-  'GLM-5.2': 'codearts-four-links.json 普通/SSE 通过 + dsh-codearts-tools-probe.jsonl',
-  'Qwen3-VL-235B': 'dsh-codearts-model-tools.jsonl (HTTP 200 + tool_calls)',
-  'kimi-k2.6-vl': 'dsh-codearts-model-tools.jsonl (HTTP 200 + tool_calls)',
-  'glm-5.2-sft-harmony': 'dsh-codearts-model-tools.jsonl (HTTP 200 + tool_calls)',
+  'GLM-5.2': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'Qwen3-VL-235B': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'kimi-k2.6-vl': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'openpangu-2.0-flash': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'openpangu-2.0-pro': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'glm-5.3': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'glm-5.2-sft-harmony': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'deepseek-v4.1-flash': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'kimi-k3': 'codearts-all-models-20261024/FORMAL-AUDIT.json',
+  'deepseek-v4.1-flash-1017': 'codearts-1017-20261031/PROBE.json',
+});
+
+// Conservative local request contracts, not invented official output limits.
+// Supplier context reference (2026-10-31):
+// https://support.huaweicloud.com/usermanual-codeartsagent/codeartsagent_ug_0009.html
+// Published windows: GLM-5.2 / GLM-5.2-ArkTS-SPARK 202.8K; openpangu-2.0-* 524.3K;
+// GLM-5.3 / GLM-5.3-Flash / Kimi-K3 / Kimi-K3.1-Pro / DeepSeek-V4.1-Flash(-1017) 1.05M.
+// Local contracts stay below those windows; GLM-5.2 keeps its deployed 512K contract and
+// the two hidden VL models use explicit local 256K contracts. The builtin catalog publishes
+// no exact context/output numbers: official* stays null.
+// 实测档位（_probe/ds-eff3.mjs，2026-11-17）：八档全部被上游接受且都产出思考内容。
+export const CODEARTS_EFFORTS = Object.freeze(['none','minimal','low','medium','high','xhigh','max']);
+
+export const CODEARTS_CONFIGURED_LIMITS = Object.freeze({
+  'GLM-5.2': Object.freeze({contextWindow:524288,maxTokens:65536}),
+  'Qwen3-VL-235B': Object.freeze({contextWindow:262144,maxTokens:65536}),
+  'kimi-k2.6-vl': Object.freeze({contextWindow:262144,maxTokens:65536}),
+  'openpangu-2.0-flash': Object.freeze({contextWindow:524288,maxTokens:65536}),
+  'openpangu-2.0-pro': Object.freeze({contextWindow:524288,maxTokens:65536}),
+  'glm-5.3': Object.freeze({contextWindow:1048576,maxTokens:65536}),
+  'glm-5.2-sft-harmony': Object.freeze({contextWindow:202752,maxTokens:65536,defaultMaxTokens:8192}),
+  // DeepSeek-V4.1-Flash / -1017 sit in the supplier's 1.05M row alongside glm-5.3 and
+  // kimi-k3, so they keep the same 1M local contract; the earlier 202752 copy came from
+  // GLM-5.2's row and silently truncated long sessions at the preflight check.
+  'deepseek-v4.1-flash': Object.freeze({contextWindow:1048576,maxTokens:65536,defaultMaxTokens:8192}),
+  'kimi-k3': Object.freeze({contextWindow:1048576,maxTokens:65536}),
+  'deepseek-v4.1-flash-1017': Object.freeze({contextWindow:1048576,maxTokens:65536,defaultMaxTokens:8192}),
 });
 
 export const defaultCodeArtsStateDb = () => join(process.env.APPDATA ?? '', 'codearts-agent', 'User', 'globalStorage', 'state.vscdb');
+function codeartsCredentialFile(account={},config={}) {
+ const ref=account?.credentials?.file??account?.credentials?.path??account.file;
+ return ref&&ref!=='auto'?(typeof config.path==='function'?config.path(ref):ref):defaultCodeArtsStateDb();
+}
+
+// Internal scheduler wake-up hint only. Hash the two actual login records in one
+// read-only SQLite statement, not the database mtime (unrelated extensions write
+// that file). No decryption, credential renewal, claim or private-cache mutation.
+// Unknown/unreadable sources stay null: read failures are not new login events.
+export async function codeartsCredentialSourceVersion(account={},config={}) {
+ let db;
+ try {
+  const {DatabaseSync}=await import('node:sqlite');
+  db=new DatabaseSync(codeartsCredentialFile(account,config),{readOnly:true});
+  const rows=db.prepare('select key,value from ItemTable where key in (?,?)').all(SESSION_KEY,NATIVE_AUTH_KEY);
+  if(!rows.length)return null;
+  const values=[SESSION_KEY,NATIVE_AUTH_KEY].map(key=>{
+   const value=rows.find(row=>row.key===key)?.value;
+   return [key,value===undefined||value===null?null:typeof value==='string'?value:Buffer.from(value).toString('utf8')];
+  });
+  return sha256Hex(Buffer.from(JSON.stringify(values)));
+ } catch {return null;}
+ finally {try{db?.close();}catch{}}
+}
 
 // ------------------------------------------------------------------ signature
 
@@ -259,7 +330,7 @@ export async function refreshCodeArtsAuth(auth,{fetchImpl=fetch,now=Date.now(),s
 
 async function nativeCodeArtsStored(file) {
  const {DatabaseSync}=await import('node:sqlite');const db=new DatabaseSync(file,{readOnly:true});
- try {const value=db.prepare('select value from ItemTable where key=?').get('secret://'+JSON.stringify({extensionId:'huaweicloud.authentication',key:'HuaweiCloudSession'}))?.value;
+ try {const value=db.prepare('select value from ItemTable where key=?').get(NATIVE_AUTH_KEY)?.value;
   if(!value)return null;const text=typeof value==='string'?value:Buffer.from(value).toString('utf8');return {text,sourceHash:sha256Hex(Buffer.from(text))};
  }finally{db.close();}
 }
@@ -277,18 +348,41 @@ function credentialFromCodeArtsAuth(base,auth,source) {
  return {...base,accessKey:auth.accessKey,secretKey:auth.secretKey,securityToken:auth.securitytoken,accessToken:auth.securitytoken,expiresAt:auth.expires_at,expiresAtMs:Date.parse(auth.expires_at),source};
 }
 async function publishCodeArtsCache(file,data){const temp=file+'.'+randomBytes(6).toString('hex')+'.tmp';await writeFile(temp,JSON.stringify(data),{mode:0o600});await rename(temp,file);}
+async function migrateCodeArtsCache(cacheFile,legacyFiles,matches) {
+ const read=async file=>{try{const text=await readFile(file,'utf8');return {value:JSON.parse(text),digest:sha256Hex(Buffer.from(text))};}catch(error){if(error.code==='ENOENT')return null;throw new AppError('CodeArts 私有续期缓存需核验',409,'codearts_refresh_cache_invalid');}};
+ const files=[...new Set(legacyFiles??[])].filter(file=>file!==cacheFile);
+ const legacy=[];for(const file of files){const row=await read(file);if(row&&matches(row.value))legacy.push({file,...row});}
+ if(!legacy.length)return;
+ const first=await read(cacheFile),known=new Set(first?.value?.legacyCacheDigests??[]);
+ if(first&&matches(first.value)&&legacy.every(row=>known.has(row.digest)))return;
+ await mkdir(dirname(cacheFile),{recursive:true});const locks=[];
+ try{
+  for(const file of [cacheFile,...legacy.map(row=>row.file)]){try{locks.push({file,handle:await open(file+'.lock','wx',0o600)});}catch{throw new AppError('CodeArts 续期正在处理或需核对上次结果',409,'codearts_refresh_pending');}}
+  const current=await read(cacheFile),digests=new Set(current?.value?.legacyCacheDigests??[]);let selected=current&&matches(current.value)?current.value:null;
+  const identity=value=>JSON.stringify([value.auth??null,value.refreshFailure??null,value.loginRequired??null,value.retryAt??null]);
+  for(const {file} of legacy){const row=await read(file);if(!row||!matches(row.value)||digests.has(row.digest))continue;
+   if(selected&&identity(selected)!==identity(row.value))throw new AppError('CodeArts 同源续期缓存存在冲突，等待原生登录更新',409,'codearts_refresh_cache_conflict');
+   selected??=row.value;digests.add(row.digest);
+  }
+  if(selected)await publishCodeArtsCache(cacheFile,{...selected,legacyCacheDigests:[...digests]});
+ }finally{for(const {file,handle} of locks.reverse()){await handle.close();await unlink(file+'.lock').catch(()=>{});}}
+}
 function codeartsBlockedRefresh(cached){const pending=cached?.loginRequired===false||/(?:unconfirmed|invalid|pending)$/.test(cached?.refreshFailure??'');return Object.assign(new AppError(pending?'CodeArts 续期结果待核验；检测到新本机登录态后自动恢复':'CodeArts 上次续期未确认；等待本机登录态更新',pending?503:401,'codearts_refresh_needs_login'),{loginRequired:!pending,refreshPending:pending});}
 async function resolveCodeArtsFresh(base,file,options={}) {
  const stored=await nativeCodeArtsStored(file);if(!stored)return base;
  const cacheFile=options.cacheFile??join(process.env.LOCALAPPDATA??dirname(file),'AI Credit Gateway','private-cache','codearts-'+sha256Hex(Buffer.from(file)).slice(0,16)+'.json');
- const now=options.now??Date.now();
+ const now=options.now??Date.now(); const freshFor=Number.isFinite(options.renewWithinMs)?Math.max(60000,Math.min(options.renewWithinMs,3600000)):60000;
  const localState=options.localState??join(dirname(dirname(dirname(file))),'Local State');
  const original=await (options.decryptAuthImpl??decryptCodeArtsAuth)(stored,localState);
  const sourceCredentialHash=sha256Hex(Buffer.from(JSON.stringify([base.principal,original.refresh_token??null,original.loginContext?.pkcePair?.codeVerifier??null,['kty','crv','x','y'].map(k=>original.loginContext?.dpopKeyPair?.publicKeyJwk?.[k]??null)])));
  const matches=value=>value?.sourceCredentialHash?value.sourceCredentialHash===sourceCredentialHash:value?.sourceHash===stored.sourceHash;
+ await migrateCodeArtsCache(cacheFile,options.legacyCacheFiles,matches);
  let cached;
  try{cached=JSON.parse(await readFile(cacheFile,'utf8'));if(!matches(cached))cached=null;}catch(error){if(error.code==='ENOENT')cached=null;else throw new AppError('CodeArts 私有续期缓存需核验',409,'codearts_refresh_cache_invalid');}
- if(Date.parse(original.expires_at)>now+60000&&cached?.auth?.accessKey!==original.accessKey)return credentialFromCodeArtsAuth(base,original,'ide_secret_storage');
+ // An AK difference is not a new login: the gateway itself rotates AKs. A
+ // matching successful newer cache must never downgrade to the older native AK.
+ if(Date.parse(original.expires_at)>now+freshFor&&cached?.auth?.accessKey!==original.accessKey&&
+   !(cached?.auth&&!cached.refreshFailure&&Date.parse(cached.auth.expires_at)>=Date.parse(original.expires_at)))return credentialFromCodeArtsAuth(base,original,'ide_secret_storage');
  // An uncertain early renewal does not revoke an access credential that is
  // still valid. Keep it usable while waiting for native login synchronization.
  const current=cached?.auth??original;
@@ -296,9 +390,9 @@ async function resolveCodeArtsFresh(base,file,options={}) {
  if(cached?.refreshFailure&&Date.parse(current.expires_at)>now+5000)return {...credentialFromCodeArtsAuth(base,current,cached?.auth?'gateway_private_refresh_cache':'ide_secret_storage'),refreshPending:true};
  if(cached?.retryAt&&now<cached.retryAt)throw Object.assign(new AppError('CodeArts 续期暂缓，稍后自动重试',429,'codearts_refresh_deferred'),{retryAt:cached.retryAt});
  if(cached?.refreshFailure&&(!cached.retryAt||now<cached.retryAt))throw codeartsBlockedRefresh(cached);
- if(cached?.auth && Date.parse(cached.auth.expires_at)>now+60000)return credentialFromCodeArtsAuth(base,cached.auth,'gateway_private_refresh_cache');
+ if(cached?.auth && Date.parse(cached.auth.expires_at)>now+freshFor)return credentialFromCodeArtsAuth(base,cached.auth,'gateway_private_refresh_cache');
  let auth=cached?.auth??original;
- if(Date.parse(auth.expires_at)>now+60000)return credentialFromCodeArtsAuth(base,auth,'ide_secret_storage');
+ if(Date.parse(auth.expires_at)>now+freshFor)return credentialFromCodeArtsAuth(base,auth,'ide_secret_storage');
  if(!auth.refresh_token||!auth.loginContext)return base;
  await mkdir(dirname(cacheFile),{recursive:true});let lock;
  try{lock=await open(cacheFile+'.lock','wx',0o600);}catch{throw new AppError('CodeArts 续期正在处理或需核对上次结果',409,'codearts_refresh_pending');}
@@ -309,27 +403,54 @@ async function resolveCodeArtsFresh(base,file,options={}) {
    if(latest.retryAt&&now<latest.retryAt)throw Object.assign(new AppError('CodeArts 续期暂缓，稍后自动重试',429,'codearts_refresh_deferred'),{retryAt:latest.retryAt});
    if(latest.refreshFailure&&(!latest.retryAt||now<latest.retryAt))throw codeartsBlockedRefresh(latest);
    if(latest.auth)auth=latest.auth;
-   if(Date.parse(auth.expires_at)>now+60000)return credentialFromCodeArtsAuth(base,auth,'gateway_private_refresh_cache');
+   if(Date.parse(auth.expires_at)>now+freshFor)return credentialFromCodeArtsAuth(base,auth,'gateway_private_refresh_cache');
   }
   if((await nativeCodeArtsStored(file))?.sourceHash!==stored.sourceHash)throw new AppError('CodeArts 原生会话已更新，将重新读取后续期',409,'codearts_refresh_source_changed');
   let refreshed;
-  await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth,refreshFailure:'codearts_refresh_pending'});
+  const legacyCacheDigests=latest?.legacyCacheDigests??cached?.legacyCacheDigests;
+  await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth,legacyCacheDigests,refreshFailure:'codearts_refresh_pending'});
   try{refreshed=await refreshCodeArtsAuth(auth,options);}catch(error){
    // Keep a marker tied to the source login so polling does not replay a rotating token.
-   await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth,refreshFailure:error.code??'codearts_refresh_unconfirmed',failedAt:now,loginRequired:error.loginRequired===true,...(error.retryable?{retryAt:error.retryAt}:{})});
+   await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth,legacyCacheDigests,refreshFailure:error.code??'codearts_refresh_unconfirmed',failedAt:now,loginRequired:error.loginRequired===true,...(error.retryable?{retryAt:error.retryAt}:{})});
    if(Date.parse(auth.expires_at)>now+5000)return {...credentialFromCodeArtsAuth(base,auth,'gateway_private_refresh_cache'),refreshPending:true};
    throw error;
   }
-  await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth:refreshed});
+  await publishCodeArtsCache(cacheFile,{sourceHash:stored.sourceHash,sourceCredentialHash,auth:refreshed,legacyCacheDigests});
   return credentialFromCodeArtsAuth(base,refreshed,'gateway_private_refresh_cache');
  }finally{await lock.close();await unlink(cacheFile+'.lock').catch(()=>{});}
 }
 export async function resolveCodeArtsCredential(account={},config={},options={}) {
- const ref=account?.credentials?.file??account?.credentials?.path??account.file;
- const file=ref&&ref!=='auto'?(typeof config.path==='function'?config.path(ref):ref):defaultCodeArtsStateDb();
- const owned={};for(const key of ['cacheFile','localState'])if(account?.credentials?.[key])owned[key]=typeof config.path==='function'?config.path(account.credentials[key]):account.credentials[key];options={...options,...owned};
- const flightKey=file+'|'+(options.cacheFile??'default');if(codeartsRefreshFlights.has(flightKey))return codeartsRefreshFlights.get(flightKey);
- const pending=(async()=>resolveCodeArtsFresh(await readCodeArtsLocalSession({file}),file,options))();codeartsRefreshFlights.set(flightKey,pending);
+ // The same Windows SQLite file may be reached through case/dot/symlink
+ // aliases. All callers must share the same rotating-token cache, lock and
+ // flight; realpath preserves the existing default cache identity on Windows.
+ const requested=codeartsCredentialFile(account,config);
+ let file;try{file=await realpath(requested);}catch{file=requested;}
+ // One SQLite source is one rotating-token chain, so the flight key is the file
+ // alone: two callers must share a renewal rather than fork a one-use token.
+ const flightKey=file;
+ if(codeartsRefreshFlights.has(flightKey))return codeartsRefreshFlights.get(flightKey);
+ const pending=(async()=>{
+  const source=await codeartsCredentialSourceVersion({credentials:{file}});
+  // All consumers of one gateway config share its data directory. Per-process
+  // desktop LocalAppData views must not fork a one-use token's renewal chain.
+  const cacheFile=options.cacheFile??account.credentials?.cacheFile??(typeof config.dataDir==='string'?join(config.dataDir,'private-cache','codearts-'+sha256Hex(Buffer.from(file)).slice(0,16)+'.json'):undefined);
+  const legacyCacheFiles=options.cacheFile?[]:[requested,resolve(requested),file].map(alias=>join(process.env.LOCALAPPDATA??dirname(alias),'AI Credit Gateway','private-cache','codearts-'+sha256Hex(Buffer.from(alias)).slice(0,16)+'.json'));
+  // Explicit references replace only the derived fallback branch, for exactly
+  // these two fields. A configured Local State file wins over the derived one: a
+  // portable or isolated deployment keeps its key file beside its own data, and
+  // silently reading the machine-wide copy would decrypt with the wrong key.
+  const explicit={};
+  for(const key of ['cacheFile','localState']){
+    const value=options[key]??account.credentials?.[key];
+    if(value)explicit[key]=typeof config.path==='function'?config.path(value):value;
+  }
+  const result=await resolveCodeArtsFresh(await readCodeArtsLocalSession({file}),file,{...options,cacheFile,legacyCacheFiles,...(explicit.localState?{localState:explicit.localState}:{})});
+  // Cover every early return too: snap and encrypted secret are separate reads.
+  // A native login switch during either read must be re-read, never accepted
+  // as a mixed principal/credential snapshot.
+  if(source!==await codeartsCredentialSourceVersion({credentials:{file}}))throw new AppError('CodeArts 原生会话已更新，将重新读取后续期',409,'codearts_refresh_source_changed');
+  return result;
+ })();codeartsRefreshFlights.set(flightKey,pending);
  try{return await pending}finally{codeartsRefreshFlights.delete(flightKey);}
 }
 
@@ -473,19 +594,27 @@ export async function codeartsModels(credential, {limit = 500, ...options} = {})
     const enabled = row?.enable === true;
     const toolsVerified = CODEARTS_TOOLS_VERIFIED[id] !== undefined;
     const chatVerified = CODEARTS_CHAT_VERIFIED[id] !== undefined;
+    const limits = CODEARTS_CONFIGURED_LIMITS[id];
     models.push({
       id,
       name: typeof row?.model_name === 'string' && row.model_name ? row.model_name : id,
       // The upstream catalog carries NO context/output fields (verified: the raw row set has no
-      // length keys); GLM uses conservative configured limits, other capacities remain null.
-      contextWindow: id === 'GLM-5.2' ? 524288 : null, contextWindowSource: id === 'GLM-5.2' ? 'configured_limit' : 'not_published_by_catalog', officialContextWindow: null,
-      maxTokens: id === 'GLM-5.2' ? 65536 : null, maxTokensSource: id === 'GLM-5.2' ? 'configured_limit' : 'not_published_by_catalog', officialMaxTokens: null,
+      // length keys); supported models use explicit configured limits, future models stay null.
+      contextWindow: limits?.contextWindow ?? null, contextWindowSource: limits ? 'configured_limit' : 'not_published_by_catalog', officialContextWindow: null,
+      defaultMaxTokens: limits ? (limits.defaultMaxTokens ?? limits.maxTokens) : null, defaultMaxTokensSource: limits ? 'configured_limit' : 'not_published_by_catalog',
+      maxTokens: limits?.maxTokens ?? null, maxTokensSource: limits ? 'configured_limit' : 'not_published_by_catalog', officialMaxTokens: null,
       tools: toolsVerified,
       toolsSource: toolsVerified ? 'live_tool_calls_verified' : 'unproven',
-      toolChoiceModes: ['auto','none'], auditToolChoice: 'auto', toolRoundtripVerified: id === 'GLM-5.2',
+      toolChoiceModes: ['auto','none'], auditToolChoice: 'auto', toolRoundtripVerified: toolsVerified && chatVerified && !!limits,
       multimodal: row?.supports_images === true,
-      callable: enabled && chatVerified && id === 'GLM-5.2',
-      callableReason: !enabled ? 'disabled_upstream' : id === 'GLM-5.2' ? null : 'context_window_unknown',
+      // 2026-11-17 实测（_probe/ds-eff3.mjs）：base/none/minimal/low/medium/high/xhigh/max 八档
+      // 全部 200、正文一致、reasoning_content 均有内容（40–67 字符）。上游接受任意 reasoning_effort，
+      // 之前目录里 eff=null 只是网关没声明，不是模型没有思考档位。
+      reasoning: {supportedEfforts: [...CODEARTS_EFFORTS], defaultEffort: 'medium', canDisableThinking: true},
+      reasoningEfforts: Object.fromEntries(CODEARTS_EFFORTS.map(e => [e, e])),
+      reasoningSource: 'gateway_live_effort_sweep_2026-11-17',
+      callable: enabled && chatVerified && !!limits,
+      callableReason: !enabled ? 'disabled_upstream' : !limits ? 'context_window_unknown' : !chatVerified ? 'chat_unverified' : null,
       enabled,
       displayEnabled: row?.display_enabled === true,
       category: typeof row?.model_category === 'string' ? row.model_category : null,
@@ -503,26 +632,48 @@ export async function codeartsCampaigns(credential, options = {}) {
   return {items: Array.isArray(items) ? items : [], serverTime: firstNumber(data?.data, 'serverTime'), ended: Array.isArray(data?.data?.endedCampaigns) ? data.data.endedCampaigns.length : 0};
 }
 
-export const findDailyCampaign = items => (Array.isArray(items) ? items.find(item => item?.campaignId === DAILY_CAMPAIGN_ID) ?? null : null);
+export function findDailyCampaign(items, {now = Date.now()} = {}) {
+  const inPeriod = item => {
+    for (const [field, lower] of [['startTime', true], ['endTime', false]]) {
+      const value = item?.extra?.[field];
+      if (value === undefined || value === null) continue;
+      const at = typeof value === 'string' ? Date.parse(value) : NaN;
+      if (!Number.isFinite(at) || (lower ? at > now : at <= now)) return false;
+    }
+    return true;
+  };
+  const rows = (Array.isArray(items) ? items : []).filter(item => Number.isSafeInteger(item?.campaignId) && item.campaignId > 0 && inPeriod(item));
+  // Select the actual official manual daily-login contract, never another
+  // campaign merely because it is claimable or advertises a familiar amount.
+  const daily = rows.filter(item => item.type === 'USER_LOGIN' && item.extra?.triggerEvent === 'user.login' && item.extra?.triggerMode === 'MANUAL_CLAIM' && item.benefitUnit === 'CREDIT' && /每日(?:签到|登录)|daily\s*(?:check.?in|login)/i.test(item.title ?? ''));
+  if (daily.length) return daily.length === 1 ? daily[0] : null;
+  // Old delivery fixtures/servers did not include the type/trigger contract.
+  // The historical known ID remains usable only without contradictory metadata.
+  const legacy = rows.filter(item => item.campaignId === DAILY_CAMPAIGN_ID && item.type === undefined && item.extra?.triggerEvent === undefined && item.extra?.triggerMode === undefined);
+  return legacy.length === 1 ? legacy[0] : null;
+}
 
 /** Contract `status`: real service state, never inferred from HTTP status alone. */
 export async function codeartsStatus(credential, task = 'daily-checkin', options = {}) {
   if (task !== 'daily-checkin') throw new AppError('CodeArts 任务未登记', 400, 'codearts_task_unknown');
   const {items} = await codeartsCampaigns(credential, options);
-  const campaign = findDailyCampaign(items);
+  const campaign = findDailyCampaign(items, {now: options.now ?? Date.now()});
   const status = typeof campaign?.status === 'string' ? campaign.status : null;
   const claimable = campaign?.claimable === true;
   const claimed = status === 'CONFIRMED' || status === 'CONSUMED';
   return {
     known: campaign !== null,
-    task, campaignId: DAILY_CAMPAIGN_ID,
+    task, campaignId: campaign?.campaignId ?? null,
     title: typeof campaign?.title === 'string' ? campaign.title : null,
     status, claimable, claimed, pendingConfirmation:status==='CLAIMED', active:claimable||status==='CLAIMED', credits:firstNumber(campaign,'benefitAmount'), confirmed:status === "CONFIRMED" || status === "CONSUMED",
     pendingAmount: firstNumber(campaign, 'pendingTotalAmount'),
     credit: firstNumber(campaign, 'benefitAmount'),
     unit: typeof campaign?.benefitUnit === 'string' ? campaign.benefitUnit : null,
     endsAt: typeof campaign?.extra?.endTime === 'string' ? campaign.extra.endTime : null,
-    day: dayIn(new Date(), 'Asia/Shanghai'),
+    day: dayIn(new Date(options.now??Date.now()), 'Asia/Shanghai'),
+    // The scheduler's global noon plan must not defer this daily account until
+    // midday. Its existing per-task window also handles sleep/resume catch-up.
+    ...(campaign?{nextClaimAt:new Date(Date.parse(dayIn(new Date(options.now??Date.now()),'Asia/Shanghai')+'T00:00:00+08:00')+86400000).toISOString()}:{}),
     source: codeartsCheckinSource.endpoint,
   };
 }
@@ -530,46 +681,26 @@ export async function codeartsStatus(credential, task = 'daily-checkin', options
 /** Contract `claim`: submit, then re-read delivery and require the server to have moved the state. */
 export async function codeartsClaim(credential, task = 'daily-checkin', options = {}) {
   const before = await codeartsStatus(credential, task, options);
+  if (Number.isSafeInteger(options.expectedCampaignId) && before.campaignId !== options.expectedCampaignId)
+    return {...before, submitted: false, newClaimSubmitted: false, reason: 'daily_campaign_changed'};
   if (options.confirmOnly === true && !before.claimed && !(before.known && before.pendingConfirmation))
-    return {...before, submitted: false, reason: 'pending_confirmation_changed'};
-  if (!before.known) return {...before, submitted: false, reason: 'campaign_absent'};
-  if (before.claimed) return {...before, submitted: false, alreadyClaimed: true};
-  if (!before.claimable && !before.pendingConfirmation) return {...before, submitted: false, reason: 'not_claimable'};
-  const body = {campaignId: DAILY_CAMPAIGN_ID, idempotentKey: `claim_${DAILY_CAMPAIGN_ID}_${Date.now()}`, channel: OPS_CHANNEL};
-  let claimFailure = null;
-  if(!before.pendingConfirmation){
-    try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options}); }
-    catch(error){ claimFailure=error; }
-  }
-  // A disconnected response can still have committed the claim. Inspect delivery before
-  // deciding what failed; never issue a second claim to recover a missing acknowledgement.
-  if(claimFailure){
-    const observed=await codeartsCheckinRecheck(credential,task,options,state=>state.claimed||state.pendingConfirmation);
-    if(observed.claimed)return {...observed,submitted:true,confirmed:true,rechecked:true,submissionResponseLost:true};
-    if(!observed.pendingConfirmation)throw claimFailure;
-  }
+    return {...before, submitted: false, newClaimSubmitted: false, reason: 'pending_confirmation_changed'};
+  if (!before.known) return {...before, submitted: false, newClaimSubmitted: false, reason: 'campaign_absent'};
+  if (before.claimed) return {...before, submitted: false, newClaimSubmitted: false, alreadyClaimed: true};
+  if (!before.claimable && !before.pendingConfirmation) return {...before, submitted: false, newClaimSubmitted: false, reason: 'not_claimable'};
+  const campaignId = before.campaignId;
+  const body = {campaignId, idempotentKey: `claim_${campaignId}_${Date.now()}`, channel: OPS_CHANNEL};
+  let newClaimSubmitted = false;
+  if(!before.pendingConfirmation){await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/claim', body, ...options});newClaimSubmitted = true;}
   // claim alone is not a receipt: the upstream has a CLAIMED (claimed-but-unconfirmed) state,
   // and only /v1/ops/confirm pushes it to CONFIRMED.
   let confirmed = false;
-  try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/confirm', body: {campaignId: DAILY_CAMPAIGN_ID}, ...options}); confirmed = true; }
+  try { await codeartsRequest(credential, {method: 'POST', path: '/v1/ops/confirm', body: {campaignId}, ...options}); confirmed = true; }
   catch { confirmed = false; }
-  const after = await codeartsCheckinRecheck(credential,task,options,state=>state.claimed);
-  const settled = after.status === 'CONFIRMED' || after.status === 'CONSUMED';
+  const after = await codeartsStatus(credential, task, options);
+  const settled = after.campaignId === campaignId && (after.status === 'CONFIRMED' || after.status === 'CONSUMED');
   if (!settled) throw new AppError('CodeArts 领取结果尚未得到服务端确认', 502, 'codearts_claim_unconfirmed');
-  return {...after, submitted: true, confirmed:after.confirmed === true, rechecked: true,
-    ...(claimFailure?{submissionResponseLost:true}:{}),...(!confirmed?{confirmationResponseLost:true}:{})};
-}
-
-// Official delivery may lag a successful write. Retries are bounded and read-only:
-// neither a claim nor a confirm is replayed by this helper.
-async function codeartsCheckinRecheck(credential,task,options,done){
-  let state=await codeartsStatus(credential,task,options);
-  for(const milliseconds of [100,300]){
-    if(done(state))break;
-    await wait(milliseconds,undefined,{signal:options.signal});
-    state=await codeartsStatus(credential,task,options);
-  }
-  return state;
+  return {...after, submitted: true, newClaimSubmitted, confirmed:confirmed && after.confirmed === true, rechecked: true};
 }
 
 /** Contract `health`: live identity + real credit balance + real campaign state (all read-only). */
@@ -586,11 +717,34 @@ export async function codeartsHealth(credential, options = {}) {
 }
 
 /**
+ * A history tool call whose `arguments` is empty, whitespace, `null` or malformed JSON makes the
+ * ModelArts engine reject the WHOLE request with `InferHub.ModelArts.81001.400 Invalid Argument`
+ * (HTTP 200, failure arrives as an SSE business error). A no-argument call is semantically `{}`,
+ * so normalize only those broken shapes and leave every real payload byte-identical.
+ */
+export function normalizeCodeArtsToolArguments(messages) {
+  if(!Array.isArray(messages))return messages;
+  let touched=false;
+  const normalized=messages.map(message=>{
+    if(!Array.isArray(message?.tool_calls)||!message.tool_calls.length)return message;
+    let changed=false;
+    const tool_calls=message.tool_calls.map(call=>{
+      const args=call?.function?.arguments;
+      if(typeof args!=='string')return call;
+      if(args.trim().startsWith('{')){try{JSON.parse(args);return call;}catch{}}
+      changed=true;return {...call,function:{...call.function,arguments:'{}'}};
+    });
+    if(!changed)return message;touched=true;return {...message,tool_calls};
+  });
+  return touched?normalized:messages;
+}
+
+/**
  * Preserve native tools and supported auto semantics. none removes tool definitions, while
  * forced modes fail explicitly rather than being silently downgraded or prompt-emulated.
  */
 export function buildCodeArtsChatBody(input, model, chatId) {
-  const body = {model, stream: true, messages: Array.isArray(input?.messages) ? input.messages : [],
+  const body = {model, stream: true, messages: normalizeCodeArtsToolArguments(Array.isArray(input?.messages) ? input.messages : []),
     chat_id: chatId, prompt_cache_key: chatId, tool_stream: true};
   for (const key of CODEARTS_PASSTHROUGH) if (input?.[key] !== undefined) body[key] = input[key];
   const choice=input?.tool_choice;
@@ -599,6 +753,16 @@ export function buildCodeArtsChatBody(input, model, chatId) {
   if(choice==='none') delete body.tools;
   else if(choice==='auto') body.tool_choice='auto';
   if (Array.isArray(body.tools) && body.tools.length === 0) delete body.tools;
+  // Moonshot's compiler mistakes shared local-ref DAG nodes for recursion.
+  // Inline only proven acyclic modern local references. Keep every tool,
+  // name, argument constraint and caller-side validation schema intact.
+  if(model==='kimi-k3'&&Array.isArray(body.tools))body.tools=body.tools.map(tool=>{
+    const parameters=tool?.function?.parameters;if(!parameters||typeof parameters!=='object')return tool;
+    const normalized=normalizeLocalRefs(parameters);
+    if(normalized.status!=='expanded')return tool;
+    const compacted=compactExpandedSchema(normalized.schema);
+    return normalized.changed||compacted.report.savedBytes>0?{...tool,function:{...tool.function,parameters:compacted.schema}}:tool;
+  });
   body.max_tokens = desktopCompletionLimit(input, 65536, 2048);
   return body;
 }
@@ -620,7 +784,7 @@ async function trackCodeArtsTools(response,credential,model,chatId,stream) {
   codeartsToolSessions.set(chatSessionKey(credential,model,t.id),{id:chatId,until:Date.now()+600000});
   while(codeartsToolSessions.size>512)codeartsToolSessions.delete(codeartsToolSessions.keys().next().value);
  }};
- if(!stream){record(await response.clone().json());return response;}
+ if(!stream){const value=await response.json();record(value);return Response.json(value,{status:response.status,headers:response.headers});}
  const decoder=new TextDecoder();let pending='';
  return new Response(response.body.pipeThrough(new TransformStream({transform(chunk,controller){
   pending+=decoder.decode(chunk,{stream:true});let index;
@@ -644,6 +808,11 @@ export async function codeartsChat(upstream, credential, input, signal, options 
     'x-auth-token': credential.securityToken,
     'x-snap-traceid': traceId ?? createHash('sha256').update(`${chatId}:${now ?? Date.now()}`).digest('hex').slice(0, 32),
     'app-id': 'CodeAgent3.0', is_confidential: 'false',
+    // The IDE transport session is stable per credential, not per conversation.
+    // Distinct chat_id values still isolate actual conversation/tool history.
+    'x-ot-session-id': 'ses_' + sha256Hex(Buffer.from('codearts\0' + (credential.principal ?? '') + '\0' + credential.accessKey)).slice(0, 24),
+    'user-session-id': 'ses_' + sha256Hex(Buffer.from('codearts\0' + (credential.principal ?? '') + '\0' + credential.accessKey)).slice(0, 24),
+    'model-id': model, 'model-name': model,
   };
   const signed = signCodeArtsRequest(credential, {method: 'POST', path: CODEARTS_CHAT_PATH, rawQuery: '', headers, payload, xSdkDate: sdkDate(now)});
   const response = await fetchImpl(`${CODEARTS_ORIGIN}${CODEARTS_CHAT_PATH}`, {method: 'POST', redirect: 'error', headers: signed, body: payload, signal:signal??AbortSignal.timeout(120000)});
@@ -679,7 +848,7 @@ export const codeartsBalance = () => ({status: 'available', ...CODEARTS_BALANCE_
 export const codeartsCheckin = () => ({status: 'available', checkinSupported: true, ...codeartsCheckinSource, source: codeartsDescriptor.checkinSource});
 
 export const codeartsProvider = {
-  resolve: resolveCodeArtsCredential, supportsCheckin:true, descriptor:codeartsDescriptor, models: codeartsModels, health: codeartsHealth,
+  resolve: resolveCodeArtsCredential, credentialSourceVersion:codeartsCredentialSourceVersion, supportsCheckin:true, descriptor:codeartsDescriptor, models: codeartsModels, health: codeartsHealth,
   status: codeartsStatus, claim: codeartsClaim, chat: codeartsChat,
 };
 

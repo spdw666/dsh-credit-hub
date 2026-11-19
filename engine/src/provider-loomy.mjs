@@ -26,6 +26,10 @@ export const descriptor = Object.freeze({
   checkinSupported: true, // daily mechanic = pet-work (宠物打工) snapshot + rewards; confirmed in shipped source
   checkinKind: 'pet_work',
   checkinTasks: ['pet-work', 'daily-quota'],
+  // Native completeFirstLogin is repeatable: the official server returns an
+  // alreadyProcessed receipt. This exception never covers pet-work rewards.
+  dailyReconciliationTasks: Object.freeze(['daily-quota']),
+  dailyReconciliationMode: 'idempotent-first-login',
   claimSupported: true, // guarded: submits only official preconditions and re-verifies the snapshot
   underlyingProvider: 'xfyun imodel production gateway (openai-compatible, session-auth)',
   billing: 'official_points',

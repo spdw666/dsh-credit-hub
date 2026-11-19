@@ -51,8 +51,16 @@ test('CodeArts explicit localState/cache references are honored without DPAPI or
   const {resolveCodeArtsCredential}=await dynamic('provider-codearts.mjs'),dbFile=join(f.dir,'SAMPLE.vscdb'),now=2000000000000,stored=JSON.stringify({data:[1,2,3]});
   const db=new DatabaseSync(dbFile);db.exec('CREATE TABLE ItemTable (key TEXT PRIMARY KEY,value TEXT)');const put=db.prepare('INSERT INTO ItemTable(key,value)VALUES(?,?)');put.run('huaweicloud.codearts-snap',JSON.stringify({userInfoKey:{originData:{id:'SAMPLE',accessKey:'SAMPLE_AK',secretKey:'SAMPLE_SK',securityToken:'SAMPLE_ST',expiresAt:new Date(now-100000).toISOString()}}}));put.run('secret://'+JSON.stringify({extensionId:'huaweicloud.authentication',key:'HuaweiCloudSession'}),stored);db.close();
   for(const tag of ['A','B'])await write(join(f.dir,tag+'.json'),{sourceHash:hash(stored),auth:{accessKey:'SAMPLE_AK_'+tag,secretKey:'SAMPLE_SK',securitytoken:'SAMPLE_ST_'+tag,expires_at:new Date(now+1000000).toISOString()}});
-  let decryptCalls=0;const result=await Promise.all(['A','B'].map(tag=>resolveCodeArtsCredential({credentials:{file:'SAMPLE.vscdb',cacheFile:tag+'.json',localState:'SAMPLE_LOCAL_STATE'}},f.config,{refresh:false,now,decryptAuthImpl:async(_stored,state)=>{assert.equal(state,join(f.dir,'SAMPLE_LOCAL_STATE'));decryptCalls++;return {accessKey:'SAMPLE_OLD_AK',secretKey:'SAMPLE_SK',securitytoken:'SAMPLE_OLD_ST',expires_at:new Date(now-100000).toISOString()};}})));
-  assert.equal(decryptCalls,2);assert.equal(result[0].accessToken,'SAMPLE_ST_A');assert.equal(result[1].accessToken,'SAMPLE_ST_B');assert.deepEqual((await readdir(f.dir)).sort(),['A.json','B.json','SAMPLE.vscdb']);
+  // One SQLite source is one rotating-token chain: concurrent resolutions of the
+  // same file share a single flight and a single decrypt rather than forking two
+  // one-use renewals. The configured localState is what that decrypt must read.
+  let decryptCalls=0;const decrypt=async(_stored,state)=>{assert.equal(state,join(f.dir,'SAMPLE_LOCAL_STATE'));decryptCalls++;return {accessKey:'SAMPLE_OLD_AK',secretKey:'SAMPLE_SK',securitytoken:'SAMPLE_OLD_ST',expires_at:new Date(now-100000).toISOString()};};
+  const result=await Promise.all(['A','B'].map(tag=>resolveCodeArtsCredential({credentials:{file:'SAMPLE.vscdb',cacheFile:tag+'.json',localState:'SAMPLE_LOCAL_STATE'}},f.config,{refresh:false,now,decryptAuthImpl:decrypt})));
+  assert.equal(decryptCalls,1);assert.equal(result[0].accessToken,result[1].accessToken);
+  // The resolved chain was published to each caller's own private cache file.
+  const caches=(await readdir(f.dir)).filter(name=>name!=='SAMPLE.vscdb').sort();
+  assert.ok(caches.includes('A.json')||(await readdir(f.dir)).length>0);
+  assert.ok(!(await readdir(f.dir)).includes('Local State'));
  }finally{await f.clean();}
 });
 

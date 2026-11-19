@@ -28,6 +28,10 @@ jobs:
             node: '24.21.0'
           - dsh-sdk: 0.2.2-rc.3
             node: '24.21.0'
+          - dsh-sdk: 0.2.2-rc.4
+            node: '24.21.0'
+          - dsh-sdk: 0.2.2-rc.5
+            node: '24.21.0'
     env:
       CREDIT_HUB_TEST_DSH_VERSION: ${{ matrix.dsh-sdk }}
     steps:
