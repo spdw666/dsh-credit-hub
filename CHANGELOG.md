@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+- 适配 DSH 0.2.2-rc.5：把 `0.2.2-rc.5` 与 `0.2.2-rc.4` 加进三条精确可选宿主 peer 范围（`@deepseek-ai/dsh-llm`、`dsh-llm-pi-ai`、`dsh-typert-protocol`），保留此前审计过的全部预发布版本；不声明 `engines.dsh`，兼容判定继续走精确 peer 清单，不会放宽到任意未来版本。
+- 判定依据：0.2.2-rc.4 / rc.5 的 llm、typert、llm-pi-ai 适配器源码与 rc.3 逐字节相同（与上游审计结论一致），升级指南中 rc.3→rc.5 的两条变更（网页搜索默认模型、`CONTENT_REFUSED` 拒绝码）都不涉及本插件使用的接口；本机以真实 rc.5 宿主包对 `plugin/index.mjs` 做过导入冒烟（导出 `Config`、`CreditHubRemote`、`apply`、`inject: ['llm']`），并复算 `evaluatePluginCompatibility` 的未满足需求为空。
+- 运行时行为无改动：适配器协议、注册接缝、sidebar 槽位与 0.4.1 完全一致，本次只移动版本号、兼容清单与本条说明。
+
 ## 0.4.1
 
 - **网页授权的模型路由改名，以便和桌面账号的同名模型区分**：0.4.0 给 oauth 账号建路由时用的默认名是 `小浣熊 · <model>`，与桌面账号复用登录态时建的路由名**完全相同**；而模型列表只显示名称（`plugin/provider.mjs` 只暴露 `{id,name}`），两个账号在「模型」下拉里不可区分。0.4.1 起 oauth 路由的默认名改为 `小浣熊(网页) · <model>`（桌面账号仍是 `小浣熊 · <model>`）。
