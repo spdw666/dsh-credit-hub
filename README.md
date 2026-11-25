@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.4**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.5**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -104,6 +104,15 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 ![账号管理](docs/screenshots/accounts-sample.png)
 
 ![额度预测](docs/screenshots/forecast-sample.png)
+
+## 排查：插件显示「未运行」
+
+DSH 插件页对 `dsh-credit-hub` 显示「未运行」时，实际只有两类原因，互不重叠，按顺序查两分钟能定位：
+
+1. **宿主版本不在审计范围**。本插件只声明经过实测的宿主版本（当前 41 个官方 tag，0.1.0-rc.7 到 0.2.3-alpha.2）。DSH 升级后页面会把插件声明的完整版本列表打印出来并提示不兼容 —— 这说明是版本问题，把插件升到适配新宿主的那一版即可，每个 Release 说明都写明它适配的 DSH 版本。
+2. **profile 的 `cordis.patch.yml` 里有重复的禁用条目**。同一个 `id: dsh-credit-hub` 如果出现两次，后一条 `disabled: true` 会覆盖前面 `DSH_CREDIT_HUB_BEGIN/END` 之间的 `disabled: false`。查法：`grep -n -A2 "id: dsh-credit-hub" <profile>/cordis.patch.yml`，只应保留 BEGIN/END 之间那一条。
+
+区分的判据是日志而不是猜：看 `runtime/logs/credit-hub-worker.log` 最后一条 `READY`／`STOPPED` 的时间。若它停在很久以前、而 DSH 最近刚启动过，说明插件根本没被加载（原因 2）；若日志里有紧跟启动时间的失败原因，按那条错误处理。
 
 ## 兼容证据
 

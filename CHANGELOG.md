@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.5
+
+Documentation only. Add a troubleshooting section for the "plugin shows 未运行"
+symptom, because that symptom has exactly two causes and both were hit during
+the DSH 0.2.3-alpha.2 upgrade:
+
+- the host version sits outside the audited range (the plugin page prints every
+  declared range), or
+- the profile's `cordis.patch.yml` carries a second `- id: dsh-credit-hub` with
+  `disabled: true` after `DSH_CREDIT_HUB_END`, which overrides the
+  `disabled: false` inside the BEGIN/END block.
+
+The new section gives the `grep` that exposes the second case, and names the
+worker log line (`runtime/logs/credit-hub-worker.log`) that separates "never
+loaded" from "loaded and failed". No code change.
+
 ## 0.3.4
 
 Follow the host to DSH 0.2.3-alpha.2, the first 0.2.3 line. This is an alpha
