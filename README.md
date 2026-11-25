@@ -2,7 +2,7 @@
 
 [![Plugin CI](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/spdw666/dsh-credit-hub/actions/workflows/ci.yml)
 
-**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.3**。
+**DSH 原生多平台账号、模型路由、错峰签到、事件通知与额度预测插件。** 当前正式发布版 **0.3.4**。
 
 Native DSH account and model routing management with staggered check-ins, event notifications, and measured quota forecasts.
 
@@ -107,9 +107,9 @@ DSH 隐藏/失焦时保留通知，聚焦显示后确认；这是应用内通知
 
 ## 兼容证据
 
-已审计 40 个已知官方 tag（0.1.0-rc.7～0.2.2-rc.5）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
+已审计 41 个已知官方 tag（0.1.0-rc.7～0.2.3-alpha.2）的源码/API，并逐版执行真实 Typert、LLM、PiAiAdapter 模块契约，保留旧 stream 与新版 snapshot/prepare 分支。13 个早期 tag 使用设置页入口。
 
-这不是 38 个完整历史桌面安装验收。0.2.2-rc.2 已执行固定 tag 官方模块契约：与 rc.1 相比导出面只增不减——llm 66→68（新增 `LLM_FAILURE_CODES`、`RETRY_CODE_CHOICES`），typert 16、cordis 26 不变，llm-pi-ai 适配器入口仍导出 `PiAiAdapter`（源码仅多一处 debug 级 `onThinkingOmitted` 日志），18 项审计接缝全部为真。0.2.2-rc.3 同样执行了固定 tag 官方模块契约：未改任何 llm／typert／适配器源码，66 个 llm、16 个 typert 导出与 18 项审计接缝同 rc.2 一致，已用固定 tag 的真实 Typert、LLM、PiAiAdapter 契约复核（context 1000000、retry 1、工具定义与 64000 token 预算均保留）。rc.3 唯一的客户端契约增量是新增 `sidebar.session.action` 槽位（kind `hoc`、scope root）及其 `SidebarSessionActionOwnerProps`，并给 `SidebarFooterActionOwnerProps` 增加 `wide` 字段；本插件占用的 keyed `main`、list `sidebar.panellist`、list `settings.section` 三者契约未变，故客户端代码零改动。 rc.2 与 rc.1 共用同一套 vendor 依赖（cordis 4.1.0、schemastery 3.19.0、pi-ai 1.3.0），开发 SDK 按宿主版本分别锁定，不跨版本复用。rc.5 曾以本机现装官方运行层启动独立空白 Host 完成注册与心跳验收；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。0.2.2-rc.4 与 rc.5 同样执行了固定 tag 官方模块契约：25 条官方源码路径 sha256 与 rc.3 逐一相同（llm／typert／llm-pi-ai 三份源码字节未变），18 项审计接缝与 sidebar 槽位契约不变，vendor mix 仍为 4.1.0／3.19.0／1.1.0／1.3.0 → 客户端与适配器代码零改动。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
+这不是 38 个完整历史桌面安装验收。0.2.2-rc.2 已执行固定 tag 官方模块契约：与 rc.1 相比导出面只增不减——llm 66→68（新增 `LLM_FAILURE_CODES`、`RETRY_CODE_CHOICES`），typert 16、cordis 26 不变，llm-pi-ai 适配器入口仍导出 `PiAiAdapter`（源码仅多一处 debug 级 `onThinkingOmitted` 日志），18 项审计接缝全部为真。0.2.2-rc.3 同样执行了固定 tag 官方模块契约：未改任何 llm／typert／适配器源码，66 个 llm、16 个 typert 导出与 18 项审计接缝同 rc.2 一致，已用固定 tag 的真实 Typert、LLM、PiAiAdapter 契约复核（context 1000000、retry 1、工具定义与 64000 token 预算均保留）。rc.3 唯一的客户端契约增量是新增 `sidebar.session.action` 槽位（kind `hoc`、scope root）及其 `SidebarSessionActionOwnerProps`，并给 `SidebarFooterActionOwnerProps` 增加 `wide` 字段；本插件占用的 keyed `main`、list `sidebar.panellist`、list `settings.section` 三者契约未变，故客户端代码零改动。 rc.2 与 rc.1 共用同一套 vendor 依赖（cordis 4.1.0、schemastery 3.19.0、pi-ai 1.3.0），开发 SDK 按宿主版本分别锁定，不跨版本复用。rc.5 曾以本机现装官方运行层启动独立空白 Host 完成注册与心跳验收；此项不冒充原用户窗口激活。历史完整桌面验收为 0.2.1-rc.2。0.2.2-rc.4 与 rc.5 同样执行了固定 tag 官方模块契约：25 条官方源码路径 sha256 与 rc.3 逐一相同（llm／typert／llm-pi-ai 三份源码字节未变），18 项审计接缝与 sidebar 槽位契约不变，vendor mix 仍为 4.1.0／3.19.0／1.1.0／1.3.0 → 客户端与适配器代码零改动。0.2.3-alpha.2 是 alpha 线：llm／typert／适配器源码重写后**删除了 `assertUsableApiKey`、`normalizeApiKey`、`recordKeyFor` 三个导出**（llm 68→66、llm-pi-ai 7→6），本插件不引用它们；cordis 升到 4.2.0-alpha.1、schemastery 3.20.0-alpha.1、loader 1.2.0-alpha.1，宿主 `engines.node` 抬到 `^24.22.3 || >=26.13.1`。已用**宿主真实安装包**实测本插件实际依赖面（resolveRetryPolicy／attributionHeaders／TypertRemoteService／Remote／PiAiAdapter 全链路，context 1000000、retry 1、maxTokens 64000）通过。未来版本按能力检测，不预先声称已实测。公开矩阵位于 `test-fixtures/compatibility-matrix.json`。
 
 ## 开发
 
@@ -132,7 +132,7 @@ npm run test:engine
 npm run verify
 ```
 
-`sdk:install` 只用于开发/CI，默认安装锁定的 0.2.2-rc.5 官方 SDK；设置 CREDIT_HUB_TEST_DSH_VERSION=0.2.2-rc.4（或更早的 0.2.2-rc.3／0.2.1-rc.5）可回归上一宿主版本。每个宿主版本的 vendor 依赖（cordis／schemastery／loader／pi-ai）各自精确锁定，不跨版本借用。CI 对 rc.2／rc.3／rc.5／0.2.2-rc.1／0.2.2-rc.2／0.2.2-rc.3／0.2.2-rc.4／0.2.2-rc.5 分别构建、测试和打包，其中 0.2.2 线五版跑 Node 24（`engines.node` 均为 `>=24.9.0`），旧版仍跑 Node 22.23.3；生产宿主提供这些接口。Qwen 离线编码测试可设置 `CREDIT_HUB_TEST_PYTHON` 为装有 cryptography/wasmtime 的 Python；未配置的额外平台测试会明确跳过。CI 会安装这些依赖并执行。
+`sdk:install` 只用于开发/CI，默认安装锁定的 0.2.3-alpha.2 官方 SDK；设置 CREDIT_HUB_TEST_DSH_VERSION=0.2.2-rc.5（或更早的 0.2.2-rc.4／0.2.1-rc.5）可回归上一宿主版本。每个宿主版本的 vendor 依赖（cordis／schemastery／loader／pi-ai）各自精确锁定，不跨版本借用。CI 对 rc.2／rc.3／rc.5／0.2.2-rc.1／rc.2／rc.3／rc.4／rc.5／0.2.3-alpha.2 分别构建、测试和打包，其中 0.2.2 线五版跑 Node 24.21.0（`engines.node` 均为 `>=24.9.0`），0.2.3-alpha.2 跑 Node 24.22.3（`engines.node` 为 `^24.22.3 || >=26.13.1`），旧版仍跑 Node 22.23.3；生产宿主提供这些接口。Qwen 离线编码测试可设置 `CREDIT_HUB_TEST_PYTHON` 为装有 cryptography/wasmtime 的 Python；未配置的额外平台测试会明确跳过。CI 会安装这些依赖并执行。
 
 `lib/client.js` 使用官方 `__ModuleLoader__`、slots 与 Connection RPC/Typert，无 iframe。发布包保留预构建客户端和 vendor 核心。构建/测试不需要真实账号或上游生成。
 

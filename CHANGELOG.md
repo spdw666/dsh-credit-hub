@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.4
+
+Follow the host to DSH 0.2.3-alpha.2, the first 0.2.3 line. This is an alpha
+surface change, not a packaging-only bump.
+
+- The host rewrote the llm entry, the typert protocol and the pi-ai adapter, and
+  removed three exports: `assertUsableApiKey` and `normalizeApiKey` (llm 68→66)
+  and `recordKeyFor` (llm-pi-ai 7→6). This plugin imports none of them; it binds
+  only `resolveRetryPolicy`, `attributionHeaders`, `PiAiAdapter`,
+  `TypertRemoteService` and `Remote`, and every one of those remains.
+- The vendored mix moved to cordis 4.2.0-alpha.1, schemastery 3.20.0-alpha.1 and
+  cordis-plugin-loader 1.2.0-alpha.1, and the host now declares
+  `engines.node ^24.22.3 || >=26.13.1`. The plugin's own worker floor stays
+  22.23.3 as always — the worker is not the host.
+- Verified against the host's own installed packages rather than a re-compiled
+  historical tree: the real `TypertRemoteService` on cordis 4.2, the real
+  `PiAiAdapter` (listModels / resolveModel / providerRetryPolicy / stream with
+  the 64000-token budget, request untouched) and the two llm helpers all pass.
+- Audited tag matrix 40 → 41 (last tag `dsh-v0.2.3-alpha.2`, sha `4b399c39…`);
+  the development SDK defaults to 0.2.3-alpha.2; CI adds a Node 24.22.3 job.
+- No plugin runtime change.
+
 ## 0.3.3
 
 Stop a client-update regression from depending on the machine it runs on. The
